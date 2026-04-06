@@ -96,6 +96,7 @@ Pro edition specification files are available in the [n3mc-pro repository](https
 3. Say: "Please implement this."
 
 That's it. Claude Code writes the code, configures the hooks, and sets everything up.
+Setup takes roughly 15–30 minutes (varies by environment and model).
 Memory kicks in from the next session.
 
 ### What to expect after setup
