@@ -158,6 +158,11 @@ N3MemoryCore is built from a specification, so extending it is as simple as aski
 
 Just load the specification into Claude Code and say what you want to add.
 
+## ⚠️ Disclaimer
+
+- **Use at your own risk**: This system runs on AI-generated code. The author is not responsible for any data changes or issues caused by its use.
+- **Backup first**: Always back up your current environment before running this on important projects.
+
 ---
 
 MIT License — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
