@@ -1,0 +1,15 @@
+{
+  "owner_id": "372117bf-2575-4acc-8bc7-69ff22d225ea",
+  "local_id": "76298a36-5d98-4e56-aedc-3ca77250c394",
+  "is_pro": true,
+  "server_port": 18520,
+  "dedup_threshold": 0.95,
+  "half_life_days": 90,
+  "retention_days": 365,
+  "min_time_decay": 0.2,
+  "bm25_min_threshold": 0.1,
+  "search_result_limit": 20,
+  "context_char_limit": 3000,
+  "min_score": 0.2,
+  "search_query_max_chars": 2000
+}

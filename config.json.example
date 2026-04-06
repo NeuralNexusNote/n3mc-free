@@ -1,0 +1,12 @@
+{
+  "owner_id": "<UUIDv4 auto-generated on first run>",
+  "local_id": "<UUIDv4 auto-generated on first run>",
+  "server_port": 18520,
+  "dedup_threshold": 0.95,
+  "half_life_days": 90,
+  "bm25_min_threshold": 0.1,
+  "search_result_limit": 20,
+  "context_char_limit": 3000,
+  "min_score": 0.2,
+  "search_query_max_chars": 2000
+}
