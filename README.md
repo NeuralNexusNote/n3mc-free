@@ -1,5 +1,11 @@
-# N3MemoryCore
+# N3MemoryCore (N3MC)
 > A NeuralNexusNote™ product
+
+🛡️ AI-Native Development Policy
+This project prioritizes Instructions over Static Code. Please read our Development Philosophy to understand why you should let AI generate your execution environment.
+
+> 🇯🇵 **[Click here for the Japanese Documentation (日本語版)](./README_JP.md)**
+> 🛡️ **[Development Philosophy & AI-Native Policy](./PHILOSOPHY.md)**
 
 > I know Java and C#, but Python is completely new to me.
 > The code Claude Code generated — I built it without fully understanding it.
