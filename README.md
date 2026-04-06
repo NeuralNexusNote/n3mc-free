@@ -89,6 +89,9 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 
 Pro edition specification files are available in the [n3mc-pro repository](https://github.com/NeuralNexusNote/n3mc-pro).
 
+> 💡 **A note on annotations in the specification**
+> Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
+
 ## Setup
 
 1. Pick a specification file from the table above
@@ -161,6 +164,7 @@ Just load the specification into Claude Code and say what you want to add.
 
 ## ⚠️ Disclaimer
 
+- **No support, no claims**: This project is provided as-is with no support. Questions, bug reports, and feature requests are not guaranteed a response. Use entirely at your own discretion.
 - **Use at your own risk**: This system runs on AI-generated code. The author is not responsible for any data changes or issues caused by its use.
 - **Backup first**: Always back up your current environment before running this on important projects.
 
