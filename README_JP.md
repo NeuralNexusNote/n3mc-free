@@ -91,7 +91,7 @@ Pro版の指示書は [n3mc-pro リポジトリ](https://github.com/NeuralNexusN
 ## セットアップ
 
 1. 上の表から指示書を1つ選ぶ
-2. Claude Codeに読み込ませる
+2. Claude Codeのプロンプトにファイルをドロップする
 3. 「指示書通りに実装してください」と伝える
 
 これだけです。コードの記述、フックの設定、初期設定のすべてをClaude Codeが行います。

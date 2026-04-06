@@ -92,7 +92,7 @@ Pro edition specification files are available in the [n3mc-pro repository](https
 ## Setup
 
 1. Pick a specification file from the table above
-2. Load it into Claude Code
+2. Drop the file into the Claude Code prompt
 3. Say: "Please implement this."
 
 That's it. Claude Code writes the code, configures the hooks, and sets everything up.
