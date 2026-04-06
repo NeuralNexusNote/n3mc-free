@@ -53,6 +53,20 @@ User's message
 
 Powered by Claude Code's hook system. Everything happens automatically — no user action required.
 
+### Relationship with Claude's built-in auto-memory
+
+Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`). N3MemoryCore **complements it rather than competing with it**.
+
+| | Claude auto-memory | N3MemoryCore RAG |
+|---|---|---|
+| **Strengths** | Reliable, loads every session, great for fixed facts | Conversation context, detailed history |
+| **Weaknesses** | Cannot capture conversation flow or context | Depends on search quality; not guaranteed to surface |
+| **Best for** | User profile, folder paths, stable settings | Conversation threads, past decisions, reasoning |
+
+**Recommended usage:**
+- **Fixed information needed every session** (folder paths, user preferences) → save to auto-memory
+- **Conversation context and history** (discussion threads, past decisions) → N3MemoryCore accumulates automatically
+
 ## Free vs Pro
 
 | | Free | Pro |
