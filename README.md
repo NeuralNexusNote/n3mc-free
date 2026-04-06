@@ -98,6 +98,25 @@ Pro edition specification files are available in the [n3mc-pro repository](https
 That's it. Claude Code writes the code, configures the hooks, and sets everything up.
 Memory kicks in from the next session.
 
+### What to expect after setup
+
+Once setup is complete, everything works automatically from the next session:
+- Past conversations relevant to your current message are retrieved and injected automatically
+- Claude responds with full context ("Regarding what we discussed last time...")
+- Saving and searching happen in the background — no action needed on your part
+
+### Backup and restore
+
+To migrate memories to another environment or keep a safe backup, save these 2 files:
+- `n3memory.db` — the memory database
+- `config.json` — contains `owner_id` and `local_id` UUIDv4 keys
+
+These 2 files must be kept together. If the keys don't match, owner verification will fail.
+
+### Uninstall
+
+Do not delete the folder directly. Instead, ask Claude Code: "Please uninstall N3MemoryCore." It will safely remove hooks and clean up the configuration.
+
 ## ID Hierarchy
 
 N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
@@ -141,5 +160,5 @@ Just load the specification into Claude Code and say what you want to add.
 
 ---
 
-Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
-All names and logos associated with N3MemoryCore and NeuralNexusNote are trademarks of the author.
+MIT License — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
+See [LICENSE](./LICENSE) for details.

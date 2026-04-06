@@ -25,7 +25,7 @@ Static code is transient and disposable. The true asset is the **N3MemoryCore_v1
 ## Project Details
 - **Architecture:** AI-Generated implementation of the N3 Protocol.
 - **Focus:** Long-term project continuity and persistent developer context.
-- **License:** All rights reserved (unless otherwise specified).
+- **License:** MIT License — free to use, modify, and redistribute (including commercial use).
 
 
 ----------------------------------------------------------------------------------------------------------------
@@ -55,4 +55,4 @@ Static code is transient and disposable. The true asset is the **N3MemoryCore_v1
 ## プロジェクトの詳細
 - **アーキテクチャ：** N3プロトコルのAI生成による実装。
 - **重点：** プロジェクトの長期的な継続性と、開発者環境の永続性。
-- **ライセンス：** すべての権利を留保（特に指定のない限り）。
+- **ライセンス：** MIT License — 使用・改変・再配布（商用含む）を自由に許可。

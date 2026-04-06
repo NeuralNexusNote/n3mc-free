@@ -97,6 +97,25 @@ Pro版の指示書は [n3mc-pro リポジトリ](https://github.com/NeuralNexusN
 これだけです。コードの記述、フックの設定、初期設定のすべてをClaude Codeが行います。
 次のセッションから記憶が有効になります。
 
+### セットアップ後の体験
+
+セットアップが完了すると、次のセッションから自動的に動作します：
+- あなたの発言に関連する過去の会話が、自動で検索・注入されます
+- Claudeは過去の文脈を踏まえて回答します（「前回話した○○ですが…」）
+- 保存も検索もバックグラウンドで行われるため、操作は不要です
+
+### バックアップと復元
+
+記憶を別の環境に移行する場合や、安全のためにバックアップする場合は以下の2ファイルを保管してください：
+- `n3memory.db` — 記憶データ本体
+- `config.json` — `owner_id`・`local_id` のUUIDv4キー
+
+この2ファイルはセットで保管する必要があります。キーが一致しないと記憶の所有者検証が正しく機能しません。
+
+### アンインストール
+
+フォルダを直接削除せず、Claude Codeに「N3MemoryCoreを削除してください」と依頼してください。フック設定の解除も含めて安全に処理されます。
+
 ## ID 階層構造
 
 N3MemoryCore は 5 つの ID フィールドで各レコードの出所と文脈を識別します：
@@ -140,5 +159,5 @@ N3MemoryCoreは指示書（仕様書）を読ませて作るため、拡張もCl
 
 ---
 
-Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
-All names and logos associated with N3MemoryCore and NeuralNexusNote are trademarks of the author.
+MIT License — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
+詳細は [LICENSE](./LICENSE) をご覧ください。
