@@ -141,7 +141,7 @@ owner_id  (one user)
 
 - **Claude Code** (required)
 - **Python 3.10+**
-- **OS**: Windows / macOS / Linux
+- **OS**: Windows 11 (tested) / macOS and Linux (designed for, but not yet verified)
 
 > To check if Python is installed, run `python --version` in your terminal.
 > If missing, Claude Code will guide you during setup.
