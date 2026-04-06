@@ -207,3 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 config.json
+
+# N3MC local memory (personal data)
+.memory/
