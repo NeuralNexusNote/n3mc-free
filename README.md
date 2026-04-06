@@ -86,10 +86,8 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 |---|---|
 | `N3MemoryCore_v1.0.0_Free_JP.md` | Free edition (Japanese) |
 | `N3MemoryCore_v1.0.0_Free_EN.md` | Free edition (English) |
-| `N3MemoryCore_v1.0.0_Pro_JP_Complete.md` | Pro edition, full (Japanese) |
-| `N3MemoryCore_v1.0.0_Pro_EN_Complete.md` | Pro edition, full (English) |
-| `N3MemoryCore_v1.0.0_Pro_JP_Upgrade.md` | Free-to-Pro upgrade (Japanese) |
-| `N3MemoryCore_v1.0.0_Pro_EN_Upgrade.md` | Free-to-Pro upgrade (English) |
+
+Pro edition specification files are available in the [n3mc-pro repository](https://github.com/NeuralNexusNote/n3mc-pro).
 
 ## Setup
 
