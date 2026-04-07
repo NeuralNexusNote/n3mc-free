@@ -428,15 +428,18 @@ def cmd_stop(config: dict) -> None:
             "All conversations are automatically saved by hooks. Claude does NOT need to call `--buffer` manually.\n"
             "Do NOT use your own judgment to decide what to save — the hooks handle everything.\n\n"
             "## Active RAG\n"
-            "When knowledge is insufficient, proactively execute `--search` without waiting for\n"
-            "user permission (y/n). Search first, then answer.\n\n"
+            "When knowledge is insufficient, proactively execute `--search` to retrieve relevant\n"
+            "memories. Search first, then answer. The command is auto-approved — no confirmation needed.\n\n"
             "## Large Text Handling\n"
             "When a user pastes a long text (spec, article, log), do NOT save it as-is.\n"
             "Read and understand the full content, extract each key fact as a separate short sentence\n"
-            "(~50-200 chars), and save each with its own `--buffer` call.\n\n"
+            "(~50-200 chars), and save each with its own `--buffer` call.\n"
+            "This is the ONE exception where manual `--buffer` is appropriate.\n\n"
+            "## Command Visibility\n"
+            "N3MemoryCore commands (`--search`, `--buffer`) are auto-approved via `permissions.allow`\n"
+            "in settings.json. They execute silently without Yes/No prompts.\n\n"
             "## Session Start\n"
-            "Read `.claude/CLAUDE.md` and inherit the behavioral guidelines from the previous session.\n"
-            "Memory context is loaded via @import from memory_context.md.\n",
+            "Memory context is loaded via @import from memory_context.md in CLAUDE.md.\n",
             encoding="utf-8",
         )
 

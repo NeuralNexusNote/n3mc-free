@@ -574,7 +574,7 @@ stdin から JSON を読み取り、`message`（または `prompt`）と `last_a
 - **【AI行動指針】確定報告の沈黙**: 保存成功時は報告や挨拶を一切行わず、沈黙を守れ。
 - **【実装仕様】致命的故障の警告**: DB書き込み失敗、またはINSERT後にDB件数が変化しない場合のみ以下を強調表示せよ:
   > ⚠️ 物理保存に失敗。現在の記憶は失われる可能性があります。
-- **【AI行動指針】Active RAG**: 知識不足時、ユーザーの許可（y/n）を待たず、自発的に `--search` を実行せよ。
+- **【AI行動指針】Active RAG**: 知識不足時、自発的に `--search` を実行せよ。`permissions.allow` により自動承認済み — 確認不要。
 - **【実装仕様】文脈注入（stdout とファイルの両方が必須）**: `--search` の結果は **stdout に `print()` で出力**すると同時に `N3MemoryCore/.memory/memory_context.md` へ**ファイル書き込み**せよ。**両方を必ず行うこと**。stdout 出力がないと Claude が検索結果を認識できず、記憶があるにもかかわらず「記憶にありません」と応答する原因になる。ファイル書き込みのみでは Claude に結果が届かない。
 - **【実装仕様】stdin 入力**: `--buffer` は引数の代わりに `-` を指定すると標準入力からテキストを読み取る（例: `cat file.txt | python n3memory.py --buffer -`）。ただし Stop フック（`n3mc_stop_hook.py`）内では `--buffer -` を使用してはならない。Stop フック自身が stdin から Claude Code の JSON を受け取るため、二重消費になり壊れる。オプションで `--agent-id ID` 引数を指定するとエージェント識別子をタグ付けできる（例: `python n3memory.py --buffer "テキスト" --agent-id "claude-code"`）。
 - **【実装仕様】物理的純化**: 保存テキスト中のコードブロック（` ``` `で囲まれた複数行）は `[code omitted]` に置換。インラインコード（`` `code` `` 形式の1行内記述）はそのまま保持する。意図と結論のみを抽出。
