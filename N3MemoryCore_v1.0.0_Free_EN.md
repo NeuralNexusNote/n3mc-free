@@ -599,7 +599,7 @@ Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` 
 ## 6. Autonomous Evaluation ([N3MC v1.0.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
-1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: approximately 0.7s on GPU, up to 2.0s acceptable on CPU). Verify that PID file creation, deletion, and restart function correctly.
+1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
 
 2. **Force-termination Test (Proof of Durability)**: Save one record via `--buffer`, immediately force-terminate the process (Ctrl+C), then physically prove that the record remains in the DB after restart by running `--list`. The output format for `--list` is as follows (one record per line, tab-separated):
 
@@ -732,7 +732,10 @@ python -m pytest tests/ -v -k "not TestEmbedding"
 
 ---
 
-## 💡 GPU Acceleration (Optional)
+## 📎 Reference: GPU Acceleration
+
+> With the current default configuration (384-dim model, 1 embedding per prompt), CPU performance is sufficient. GPU is not required.
+> Consider GPU acceleration only if switching to a 1024-dim model or if latency is a concern.
 
 If you have an NVIDIA CUDA-compatible GPU, the following command may speed up embeddings:
 
@@ -742,8 +745,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 - `sentence-transformers` uses PyTorch internally — if GPU-enabled PyTorch is installed, embedding inference automatically runs on the GPU (no code changes needed)
 - Cold start (first call after server startup): ~1–1.5 s/call on CPU → ~0.03–0.06 s/call once warm
-- GPU may reduce this to ~0.02–0.05 s/call, though for small models GPU transfer overhead may negate the benefit
-- Each user prompt triggers 3 embedding computations, so GPU acceleration significantly reduces per-turn latency
+- GPU may reduce this to ~0.02–0.05 s/call
 
 ---
 
