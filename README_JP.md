@@ -169,5 +169,5 @@ N3MemoryCoreは指示書（仕様書）を読ませて作るため、拡張もCl
 
 ---
 
-MIT License — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
+Apache License 2.0 — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
 詳細は [LICENSE](./LICENSE) をご覧ください。

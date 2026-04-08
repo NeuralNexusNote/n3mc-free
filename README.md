@@ -170,5 +170,5 @@ Just load the specification into Claude Code and say what you want to add.
 
 ---
 
-MIT License — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
+Apache License 2.0 — Copyright (C) 2026 NeuralNexusNote™ / ArnolfJp019
 See [LICENSE](./LICENSE) for details.
