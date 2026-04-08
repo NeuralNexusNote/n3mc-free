@@ -18,7 +18,7 @@ This software and specification are provided **"AS-IS"** without warranty of any
 
 By using this software, you agree to the terms above.
 
-- **License**: This specification may be freely used, modified, and redistributed, including for commercial purposes. A mention of N3MemoryCore when redistributing would be appreciated.
+- **License**: Apache License 2.0. See the LICENSE file for details.
 
 > **Removal (Uninstall)**: To remove N3MemoryCore, do not delete the folder directly. Instead, ask Claude Code: "Please delete N3MemoryCore." This ensures the hook configuration is also properly removed.
 > **Backup before removal**: To carry over your memories, save the following two files before deletion: `n3memory.db` (memory data) and `config.json` (contains the `owner_id` and `local_id` UUIDv4 keys). These must be kept together — without the matching keys, owner verification and environment classification will not function correctly.
