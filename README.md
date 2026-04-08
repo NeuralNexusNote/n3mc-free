@@ -32,7 +32,7 @@ N3MemoryCore gives Claude Code long-term memory across sessions.
 - ⚡ **Works automatically** — Saving and searching happen automatically. No manual steps needed.
 - 🤖 **Multi-agent ready** — Multiple AI agents share one memory DB. Each agent prioritizes its own memories while accessing the team's collective knowledge.
 - 🏢 **Team & organization support** — Deploy the server on your network and share memories across your entire team.
-- 🔗 **DB merge ready** — Databases built from the same specification share an identical schema, embedding model, and vector format. Merge memories from different environments seamlessly — the DB structure is designed for integration from the ground up.
+- 🔗 **DB merge ready** — Databases built from the same specification are fully compatible. Transfer knowledge when handing off roles, or import memories accumulated in other environments — the DB structure is designed for integration from the ground up.
 
 ## How It Works
 
