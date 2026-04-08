@@ -88,8 +88,6 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 | `N3MemoryCore_v1.0.0_Free_JP.md` | Free edition (Japanese) |
 | `N3MemoryCore_v1.0.0_Free_EN.md` | Free edition (English) |
 
-Pro edition specification files are available in the [n3mc-pro repository](https://github.com/NeuralNexusNote/n3mc-pro).
-
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
 
