@@ -159,6 +159,7 @@ N3MemoryCore is built from a specification, so extending it is as simple as aski
 - **Alternative embedding models** — Swap in a different model to suit your use case
 - **Custom ID fields** — Add fields like `project_id` or `tag` to organize memories your way
 - **PDF import** — Extract text from PDF files and store them as searchable memories
+- **Hashtag support** — Append `#tags` to memories for filtered search (e.g. `--search "#AWS"`) — works with existing FTS, no DB changes needed
 
 Just load the specification into Claude Code and say what you want to add.
 
