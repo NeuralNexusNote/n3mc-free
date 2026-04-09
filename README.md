@@ -158,6 +158,7 @@ N3MemoryCore is built from a specification, so extending it is as simple as aski
 - **Custom search logic** — Tune bias coefficients and ranking formulas
 - **Alternative embedding models** — Swap in a different model to suit your use case
 - **Custom ID fields** — Add fields like `project_id` or `tag` to organize memories your way
+- **PDF import** — Extract text from PDF files and store them as searchable memories
 
 Just load the specification into Claude Code and say what you want to add.
 
