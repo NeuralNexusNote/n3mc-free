@@ -86,8 +86,8 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 
 | File | Description |
 |---|---|
-| `N3MemoryCore_v1.0.0_Free_JP.md` | Free edition (Japanese) |
-| `N3MemoryCore_v1.0.0_Free_EN.md` | Free edition (English) |
+| `N3MemoryCore_v1.1.0_Free_JP.md` | Free edition (Japanese) |
+| `N3MemoryCore_v1.1.0_Free_EN.md` | Free edition (English) |
 
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
@@ -129,14 +129,14 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 |---|---|---|---|---|
 | `id` (PK) | DB record | Per record (UUIDv7, time-ordered) | **One record** | Unique identifier for each memory — used for deletion and dedup |
 | `owner_id` | `config.json` | First startup (UUIDv4) | **Owner** | Identifies whose data this is — for shared/multi-user scenarios |
-| `local_id` | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups |
+| `local_id` (agent_id) | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups |
 | `session_id` | In-memory | Per server startup (UUIDv4) | **Server process** | Identifies which server session (stored for compatibility; not used in Free edition ranking) |
-| `agent_id` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for `local_id` (e.g. `"claude-code"`) |
+| `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for (agent_id) (e.g. `"claude-code"`) |
 
 ```
 owner_id  (one user)
   └── local_id  (agent's UUIDv4 identifier)
-        ├── agent_id  (its display name: "claude-code", etc.)
+        ├── agent_name  (its display name: "claude-code", etc.)
         └── session_id  (one server startup)
               └── id  (one memory record)
 ```

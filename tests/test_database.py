@@ -37,7 +37,7 @@ class TestSchema:
     def test_migrate_schema_adds_missing_columns(self, tmp_db):
         info = {r[1] for r in tmp_db.execute("PRAGMA table_info(memories)")}
         assert "local_id" in info
-        assert "agent_id" in info
+        assert "agent_name" in info
 
 
 class TestInsertAndRetrieve:

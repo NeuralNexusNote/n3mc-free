@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.0.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.1.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -52,7 +52,7 @@ All memory data is stored in `N3MemoryCore/.memory/n3memory.db`. To fully preser
 
 ### Upgrading to Pro
 
-Load the Pro specification (`N3MemoryCore_v1.0.0_Pro_*_Complete.md`) into Claude Code and ask: "Please implement N3MemoryCore according to this specification." Your existing DB will be carried over as-is.
+Load the Pro specification (`N3MemoryCore_v1.1.0_Pro_*_Complete.md`) into Claude Code and ask: "Please implement N3MemoryCore according to this specification." Your existing DB will be carried over as-is.
 
 ---
 
@@ -116,16 +116,16 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 |---|---|---|---|---|
 | `id` (PK) | DB record | Per record (UUIDv7, time-ordered) | **One record** | Unique identifier for each memory — used for deletion and dedup |
 | `owner_id` | `config.json` | First startup (UUIDv4) | **Owner** | Identifies whose data this is — for shared/multi-user scenarios |
-| `local_id` | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups. Used for `b_local` search bias |
+| `local_id` (agent_id) | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups. Used for `b_local` search bias |
 | `session_id` | In-memory | Per server startup (UUIDv4) | **Server process** | Identifies which server session (stored for compatibility; not used in ranking in the Free edition) |
-| `agent_id` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for `local_id` (e.g. `"claude-code"`) |
+| `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for (agent_id) (e.g. `"claude-code"`) |
 
 **Hierarchy relationship:**
 
 ```
 owner_id  (one user)
   └── local_id  (agent's UUIDv4 identifier)
-        ├── agent_id  (its display name: "claude-code", etc.)
+        ├── agent_name  (its display name: "claude-code", etc.)
         └── session_id  (one server startup)
               └── id  (one memory record)
 ```
@@ -271,7 +271,7 @@ CREATE TABLE memories (
     timestamp TEXT NOT NULL,
     owner_id  TEXT NOT NULL,
     local_id  TEXT,             -- N3MC install identifier (from config.json; can be overridden via API for multi-agent scenarios)
-    agent_id  TEXT              -- Identifies the AI agent that wrote the record (e.g. "claude-code"). NULL for records written before v1.1 or without agent tagging
+    agent_name  TEXT              -- Identifies the AI agent that wrote the record (e.g. "claude-code"). NULL for records written before v1.1 or without agent tagging
     -- SQLite automatically assigns an implicit INTEGER rowid to every table
 );
 
@@ -297,12 +297,12 @@ CREATE VIRTUAL TABLE memories_vec USING vec0(
 
 ```sql
 ALTER TABLE memories ADD COLUMN local_id  TEXT;
-ALTER TABLE memories ADD COLUMN agent_id  TEXT;
+ALTER TABLE memories ADD COLUMN agent_name  TEXT;
 ```
 
 Additionally, `migrate_schema()` detects if the existing `memories_fts` table was created with `tokenize='trigram'` and automatically drops and recreates it with `tokenize='porter unicode61'`, re-indexing all records. This one-time migration ensures existing databases benefit from improved English search precision.
 
-`agent_id TEXT` — identifies the AI agent that wrote the record (e.g. `"claude-code"`). `NULL` for records written before v1.1 or without agent tagging.
+`agent_name TEXT` — identifies the AI agent that wrote the record (e.g. `"claude-code"`). `NULL` for records written before v1.1 or without agent tagging.
 
 **Rationale for FTS5 Tokenizer Selection**: `porter unicode61` is adopted for English-optimized stemming. Porter stemming normalizes word forms (e.g., "running" → "run", "memories" → "memori"), giving significantly better BM25 precision for English text compared to `trigram` substring matching. Word-boundary tokenization (`unicode61`) is more meaningful than character-level trigrams for English.
 
@@ -524,10 +524,10 @@ The CLI sends HTTP requests to the FastAPI server. All endpoints are issued to `
 | Method | Path | Corresponding CLI Command | Description |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | (internal health check) | Returns `{"status": "ok"}` |
-| `POST` | `/buffer` | `--buffer` | Receives `{"content": str, "agent_id": str (optional)}` and saves |
+| `POST` | `/buffer` | `--buffer` | Receives `{"content": str, "agent_name": str (optional)}` and saves |
 | `POST` | `/search` | `--search` | Receives `{"query": str}` and returns results |
 | `POST` | `/repair` | `--repair` | Repairs unindexed records |
-| `GET` | `/list` | `--list` | Returns all records (each record includes `agent_id`) |
+| `GET` | `/list` | `--list` | Returns all records (each record includes `agent_name`) |
 
 ### `--hook-submit` (UserPromptSubmit Hook Entry Point)
 
@@ -535,7 +535,7 @@ The CLI sends HTTP requests to the FastAPI server. All endpoints are issued to `
 echo '{"message":"user input","last_assistant_message":"Claude response"}' | python n3memory.py --hook-submit
 ```
 
-Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` fields. Performs all UserPromptSubmit operations in a single process via HTTP requests to the server: `--repair` → `--buffer` (save Claude's response) → `--search` → `--buffer` (save user message). Called by `n3mc_hook.py`; the AI does not need to run this manually. All records saved by this hook are automatically tagged with `agent_id = "claude-code"`.
+Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` fields. Performs all UserPromptSubmit operations in a single process via HTTP requests to the server: `--repair` → `--buffer` (save Claude's response) → `--search` → `--buffer` (save user message). Called by `n3mc_hook.py`; the AI does not need to run this manually. All records saved by this hook are automatically tagged with `agent_name = "claude-code"`.
 
 ### Response Format
 
@@ -554,7 +554,7 @@ Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` 
 // GET /list — on success
 {
   "records": [
-    {"id": "...", "content": "...", "timestamp": "...", "agent_id": "..."},
+    {"id": "...", "content": "...", "timestamp": "...", "agent_name": "..."},
     ...
   ],
   "total": <count>
@@ -596,7 +596,7 @@ Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` 
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.0.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.1.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
@@ -604,7 +604,7 @@ After implementation is complete, autonomously resolve the following tests and r
 2. **Force-termination Test (Proof of Durability)**: Save one record via `--buffer`, immediately force-terminate the process (Ctrl+C), then physically prove that the record remains in the DB after restart by running `--list`. The output format for `--list` is as follows (one record per line, tab-separated):
 
    ```
-   [UUIDv7]  [timestamp]  [agent_id]  [first 80 characters of content]
+   [UUIDv7]  [timestamp]  [agent_name]  [first 80 characters of content]
    ```
 
    Output the total record count `Total: N records` at the end. Statically confirm during code review that `write_buffer`, `batch_insert`, asynchronous writes, and deferred COMMITs are absent.
@@ -697,7 +697,7 @@ N3MemoryCore/
 | Test Class | Tests | Coverage |
 |---|---|---|
 | `TestHealth` | `health_ok` | Server status |
-| `TestBuffer` | `saves_record`, `empty_content`, `with_agent_id`, `exact_dedup`, `purifies_code_blocks` | Save endpoint |
+| `TestBuffer` | `saves_record`, `empty_content`, `with_agent_name`, `exact_dedup`, `purifies_code_blocks` | Save endpoint |
 | `TestSearch` | `empty_db`, `buffer_and_search_roundtrip`, `empty_query`, `returns_score` | Search endpoint |
 | `TestRepair` | `repair_fixes_unindexed` | Repair endpoint |
 | `TestList` | `list_empty`, `list_after_buffer` | List endpoint |

@@ -93,7 +93,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             timestamp TEXT NOT NULL,
             owner_id  TEXT NOT NULL,
             local_id  TEXT,
-            agent_id  TEXT,
+            agent_name  TEXT,
             session_id TEXT
         )
     """)
@@ -118,9 +118,20 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     """Idempotently add missing columns and migrate FTS tokenizer if needed."""
     # Add missing columns
     existing = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
-    for col, typedef in [("local_id", "TEXT"), ("agent_id", "TEXT"), ("session_id", "TEXT")]:
+    for col, typedef in [("local_id", "TEXT"), ("agent_name", "TEXT"), ("session_id", "TEXT")]:
         if col not in existing:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {typedef}")
+
+    # v1.0.0 → v1.1.0 migration: field renamed agent_id → agent_name.
+    # Copy any legacy data so rows saved under v1.0.0 remain usable.
+    # The old agent_id column is left in place (orphaned) to avoid a SQLite table rebuild.
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
+    if "agent_id" in existing and "agent_name" in existing:
+        conn.execute(
+            "UPDATE memories SET agent_name = agent_id "
+            "WHERE agent_name IS NULL AND agent_id IS NOT NULL"
+        )
+
     conn.commit()
 
     # Check FTS tokenizer — migrate from trigram to porter unicode61 if needed
@@ -162,7 +173,7 @@ def insert_memory(
     owner_id: str,
     embedding: Optional[list],
     local_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
+    agent_name: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> int:
     """
@@ -170,9 +181,9 @@ def insert_memory(
     Returns the implicit SQLite rowid of the inserted record.
     """
     cursor = conn.execute(
-        """INSERT INTO memories(id, content, timestamp, owner_id, local_id, agent_id, session_id)
+        """INSERT INTO memories(id, content, timestamp, owner_id, local_id, agent_name, session_id)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (record_id, content, timestamp, owner_id, local_id, agent_id, session_id),
+        (record_id, content, timestamp, owner_id, local_id, agent_name, session_id),
     )
     rowid = cursor.lastrowid
 
@@ -213,7 +224,7 @@ def delete_memory(conn: sqlite3.Connection, record_id: str) -> bool:
 
 def get_all_memories(conn: sqlite3.Connection) -> list:
     return conn.execute(
-        "SELECT id, content, timestamp, owner_id, local_id, agent_id, session_id, rowid FROM memories ORDER BY timestamp DESC"
+        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, rowid FROM memories ORDER BY timestamp DESC"
     ).fetchall()
 
 
@@ -288,6 +299,6 @@ def search_fts(conn: sqlite3.Connection, query: str, limit: int = 50) -> list:
 
 def get_memory_by_rowid(conn: sqlite3.Connection, rowid: int) -> Optional[sqlite3.Row]:
     return conn.execute(
-        "SELECT id, content, timestamp, owner_id, local_id, agent_id, session_id, rowid FROM memories WHERE rowid = ?",
+        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, rowid FROM memories WHERE rowid = ?",
         (rowid,),
     ).fetchone()

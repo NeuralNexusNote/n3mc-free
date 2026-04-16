@@ -274,7 +274,7 @@ def _truncate_at_sentence(text: str, max_chars: int) -> str:
     return chunk
 
 
-def _buffer_direct(content: str, config: dict, agent_id: Optional[str] = None) -> bool:
+def _buffer_direct(content: str, config: dict, agent_name: Optional[str] = None) -> bool:
     """Fallback: write directly to DB without embedding (server offline)."""
     sys.path.insert(0, str(_THIS_DIR / "core"))
     from database import get_connection, init_db, insert_memory, check_exact_duplicate, count_memories
@@ -304,7 +304,7 @@ def _buffer_direct(content: str, config: dict, agent_id: Optional[str] = None) -
             conn, record_id, content, ts,
             config["owner_id"], None,
             config.get("local_id"),
-            agent_id,
+            agent_name,
         )
         after = count_memories(conn)
         conn.close()
@@ -318,7 +318,7 @@ def _buffer_direct(content: str, config: dict, agent_id: Optional[str] = None) -
         return False
 
 
-def cmd_buffer(text: str, config: dict, agent_id: Optional[str] = None) -> None:
+def cmd_buffer(text: str, config: dict, agent_name: Optional[str] = None) -> None:
     """Save a memory record."""
     if not text or not text.strip():
         return
@@ -327,13 +327,13 @@ def cmd_buffer(text: str, config: dict, agent_id: Optional[str] = None) -> None:
     url = f"{_get_server_url(port)}/buffer"
 
     data = {"content": text}
-    if agent_id:
-        data["agent_id"] = agent_id
+    if agent_name:
+        data["agent_name"] = agent_name
 
     result = _post(url, data)
     if result is None:
         # Server offline — direct write
-        _buffer_direct(text, config, agent_id)
+        _buffer_direct(text, config, agent_name)
     elif result.get("status") != "ok":
         print(f"⚠️ Physical save failed. Current memories may be lost. {result}", file=sys.stderr)
 
@@ -403,7 +403,7 @@ def cmd_list(config: dict) -> None:
     for r in records:
         rec_id = r.get("id", "")
         ts = r.get("timestamp", "")[:19]
-        agent = r.get("agent_id") or ""
+        agent = r.get("agent_name") or ""
         content = r.get("content", "")[:80]
         print(f"{rec_id}\t{ts}\t{agent}\t{content}")
     print(f"Total: {result.get('total', len(records))} records")
@@ -497,7 +497,7 @@ def cmd_hook_submit(config: dict) -> None:
     if last_claude:
         claude_content = _prepare_claude_buffer(last_claude)
         if claude_content:
-            cmd_buffer(claude_content, config, agent_id="claude-code")
+            cmd_buffer(claude_content, config, agent_name="claude-code")
 
     # 3. search
     if user_text and len(user_text.strip()) >= 2:
@@ -510,7 +510,7 @@ def cmd_hook_submit(config: dict) -> None:
     if user_text:
         user_content = _prepare_user_buffer(user_text)
         if user_content:
-            cmd_buffer(user_content, config, agent_id="claude-code")
+            cmd_buffer(user_content, config, agent_name="claude-code")
 
 
 def _extract_text(msg) -> str:
@@ -620,7 +620,7 @@ def run_server():
 
     class BufferRequest(BaseModel):
         content: str
-        agent_id: Optional[str] = None
+        agent_name: Optional[str] = None
         local_id: Optional[str] = None
 
     class SearchRequest(BaseModel):
@@ -668,7 +668,7 @@ def run_server():
                 config["owner_id"],
                 qvec,
                 local_id_val,
-                req.agent_id,
+                req.agent_name,
                 session_id,
             )
             after = count_memories(conn)
@@ -720,7 +720,7 @@ def run_server():
                     "id": r["id"],
                     "content": r["content"],
                     "timestamp": r["timestamp"],
-                    "agent_id": r["agent_id"],
+                    "agent_name": r["agent_name"],
                 }
                 for r in rows
             ]
@@ -910,11 +910,11 @@ def main():
         ensure_server(config)
 
     if cmd == "--buffer":
-        agent_id = None
+        agent_name = None
         if "--agent-id" in sys.argv:
             idx = sys.argv.index("--agent-id")
             if idx + 1 < len(sys.argv):
-                agent_id = sys.argv[idx + 1]
+                agent_name = sys.argv[idx + 1]
 
         if len(sys.argv) > 2 and sys.argv[2] == "-":
             text = sys.stdin.read()
@@ -924,7 +924,7 @@ def main():
             text = sys.stdin.read()
 
         if text.strip():
-            cmd_buffer(text, config, agent_id=agent_id)
+            cmd_buffer(text, config, agent_name=agent_name)
 
     elif cmd == "--search":
         if len(sys.argv) > 2:

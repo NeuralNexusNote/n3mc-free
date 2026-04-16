@@ -67,7 +67,7 @@ def app_and_deps(tmp_path_factory):
 
     class BufferRequest(BaseModel):
         content: str
-        agent_id: Optional[str] = None
+        agent_name: Optional[str] = None
         local_id: Optional[str] = None
 
     class SearchRequest(BaseModel):
@@ -99,7 +99,7 @@ def app_and_deps(tmp_path_factory):
             before = count_memories(conn)
             ts = datetime.now(tz=timezone.utc).isoformat()
             insert_memory(conn, str(_gen_uuid7()), text, ts, config["owner_id"], qvec,
-                          req.local_id or config["local_id"], req.agent_id, session_id)
+                          req.local_id or config["local_id"], req.agent_name, session_id)
             after = count_memories(conn)
             conn.close()
             return {"status": "ok", "count": after - before}
@@ -125,7 +125,7 @@ def app_and_deps(tmp_path_factory):
         conn = gc(str(db_path))
         rows = get_all_memories(conn)
         conn.close()
-        records = [{"id": r["id"], "content": r["content"], "timestamp": r["timestamp"], "agent_id": r["agent_id"]} for r in rows]
+        records = [{"id": r["id"], "content": r["content"], "timestamp": r["timestamp"], "agent_name": r["agent_name"]} for r in rows]
         return {"records": records, "total": len(records)}
 
     @app.post("/repair")
@@ -207,8 +207,8 @@ class TestBuffer:
         r = client.post("/buffer", json={"content": ""})
         assert r.json().get("status") == "error"
 
-    def test_with_agent_id(self, client):
-        r = client.post("/buffer", json={"content": "agent tagged record", "agent_id": "claude-code"})
+    def test_with_agent_name(self, client):
+        r = client.post("/buffer", json={"content": "agent tagged record", "agent_name": "claude-code"})
         assert r.json()["status"] == "ok"
 
     def test_exact_dedup(self, client):
