@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.1.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.2.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -52,7 +52,7 @@ All memory data is stored in `N3MemoryCore/.memory/n3memory.db`. To fully preser
 
 ### Upgrading to Pro
 
-Load the Pro specification (`N3MemoryCore_v1.1.0_Pro_*_Complete.md`) into Claude Code and ask: "Please implement N3MemoryCore according to this specification." Your existing DB will be carried over as-is.
+Load the Pro specification (`N3MemoryCore_v1.2.0_Pro_*_Complete.md`) into Claude Code and ask: "Please implement N3MemoryCore according to this specification." Your existing DB will be carried over as-is.
 
 ---
 
@@ -73,12 +73,12 @@ pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7
 > **⚠️ First-run download**: `sentence-transformers` downloads the `e5-base-v2` model (~440 MB) on first server start. This can take **2–10 minutes** — the server will appear unresponsive during this time, which is expected. Subsequent startups complete in seconds once cached.
 
 > **Important: Character Limits (Design Constraints for Implementation)**
-> - Hook auto-save: **300 characters** per record (truncated at sentence boundary)
+> - Hook auto-save: **Complete preservation guaranteed**. Long content is chunked via `core.processor.chunk_text(max_chars=400, overlap=40)` (paragraph → sentence → hard window) and saved as multiple records (`[claude 1/N]`..`[claude N/N]` / `[user 1/N]`..`[user N/N]`). No truncation.
 > - Search query: **2,000 characters** (configurable via `search_query_max_chars` in config.json)
 > - Vector search: Only the first **~2,000 characters** of any record are semantically searchable (embedding model limit: 512 tokens). Text beyond this is stored in the DB and searchable via FTS keyword search, but invisible to vector similarity search.
 > - FTS query: Limited to **30 terms** to prevent slow scans
 > - For best results, save records as **small chunks (~50–200 characters each, one fact per record)**.
-> - **Large text handling**: When a user pastes a long text (spec, article, log, etc.), Claude must NOT save it as-is. Instead: read and understand the full content, extract each key fact as a separate short sentence (~50–200 chars), and save each with its own `--buffer` call. Raw pasted text will be truncated and lose information.
+> - **Large text handling**: When a user pastes a long text (spec, article, log, etc.), Claude must NOT save it as-is. Instead: read and understand the full content, extract each key fact as a separate short sentence (~50–200 chars), and save each with its own `--buffer` call. Although auto-save preserves the full raw text via chunking, manually extracted key facts produce higher-quality, more searchable records.
 
 ## 2. Directory Structure (Strictly Enforced)
 ```
@@ -86,7 +86,7 @@ project_root/
 ├── N3MemoryCore/            # Main program
 │   ├── core/
 │   │   ├── database.py      # DB layer: schema definitions, CRUD, PRAGMA settings, migrations
-│   │   └── processor.py     # Processing layer: embedding generation, ranking calculation, text purification
+│   │   └── processor.py     # Processing layer: embedding generation, ranking calculation, purify (fenced-code substitution per documented design)
 │   ├── .memory/             # N3MC database storage (hidden folder)
 │   │   ├── n3memory.db      # SQLite DB (vec0 + FTS5)
 │   │   ├── n3mc.pid         # FastAPI server PID file (exists only while running)
@@ -570,22 +570,33 @@ Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` 
 
 > **Audience distinction**: The instructions below are classified as **[AI Behavioral Guidelines]** (instructions to Claude itself) and **[Implementation Specs]** (processing to be implemented as a program).
 
-- **[Automated] Auto-repair, search, and conversation saving**: The `UserPromptSubmit` hook (`n3mc_hook.py`) calls `--hook-submit`, which performs all operations in a single process: `--repair` (fix unindexed data), `--buffer` (auto-save Claude's previous response with `[claude]` prefix, skip under 3 chars, truncate at sentence boundary within 300 chars), `--search` (retrieve memories), and `--buffer` (auto-save user message with `[user]` prefix, skip under 10 chars or routine responses, truncate at sentence boundary within 300 chars). This ensures **every turn of conversation** (both user and Claude) is recorded. The AI does not need to run these manually. When Claude Code passes an image+text prompt, the `prompt` field may be a JSON array; `_extract_text()` extracts only `type=="text"` parts and discards image data. If the result is empty (image-only prompt), both buffer and search are skipped.
+### Complete-Recording Contract
+
+N3MC is marketed as **complete preservation** (完全保存). The hook write path therefore honors these six guarantees:
+
+1. Every user message and every Claude response is recorded in FULL, character-for-character, with no truncation.
+2. Long content is split into overlapping chunks by `chunk_text` (max_chars=400, overlap=40, paragraph → sentence → hard-window hierarchy). Each chunk is tagged `[user]` / `[claude]` for single-chunk content, or `[user i/N]` / `[claude i/N]` for multi-chunk content.
+3. NO length filter, NO skip-pattern filter. Fenced code blocks ARE substituted with `[code omitted]` per documented product design; this is the single documented exception and applies to conversation records only (source code is not in scope of complete recording). N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved.
+4. An append-only JSONL audit log at `<N3MC-root>/.memory/audit.log` is written BEFORE anything can fail. This is the last-resort authoritative transcript. Every hook invocation (UserPromptSubmit + Stop) writes one JSON record: `{"ts", "hook", "raw", "payload"}`.
+5. On HTTP POST failure to the embedding server, writes fall back to `_buffer_direct` (direct SQLite insert without an embedding; re-indexed by the next `--repair`). Silent drops are forbidden; every failure path either succeeds via fallback or emits to stderr.
+6. Image-only prompts still trigger repair + search + Claude-turn save + audit-log entry. Only Step 4 (user save) is skipped because there is no user text to record.
+
+- **[Automated] Auto-repair, search, and conversation saving**: The `UserPromptSubmit` hook (`n3mc_hook.py`) calls `--hook-submit`, which performs the following steps in a single process. **Step 0 — audit log (always first)**: before anything else, every hook invocation appends one JSON record `{"ts", "hook", "raw", "payload"}` to the append-only `<N3MC-root>/.memory/audit.log`. This is the last-resort authoritative transcript; it is written BEFORE anything can fail, so even if every later step errors out, the raw input is preserved. Then: `--repair` (fix unindexed data), `--buffer` (auto-save Claude's previous response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records), `--search` (retrieve memories), and `--buffer` (auto-save the user message with complete preservation — chunked and saved as `[user]` / `[user i/N]` records). **No length filter, no skip-pattern filter**: every non-empty input is recorded character-for-character with no truncation. When Claude Code passes an image+text prompt, the `prompt` field may be a JSON array; `_extract_text()` extracts only `type=="text"` parts. If the result is empty (image-only prompt), only Step 4 (user save) is skipped because there is no user text to record — repair, Claude-turn save, search, and the audit-log entry still run. The raw multimodal payload is captured in `audit.log`.
 - **[Implementation Spec] Hook subprocess execution method (must not be changed)**: Subprocess calls within `n3mc_hook.py` and `n3mc_stop_hook.py` must use **`subprocess.run` (synchronous/blocking)**, waiting for each command to complete before proceeding to the next. **Do not use `Popen` (async/fire-and-forget).** **Reason**: `--repair` → `--search` has an execution order dependency (search results are incomplete if repair hasn't finished). Additionally, if control returns to Claude before `--search` finishes writing to `memory_context.md`, the search results cannot be read. Asynchronizing for speed destroys data integrity and search accuracy. Note: only the FastAPI server startup (§3 Clean CLI) uses `Popen` (since it does not need to wait for startup to complete).
-- **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3mc_stop_hook.py`) automatically saves Claude's last response (skip under 3 chars, truncate at sentence boundary within 300 chars). It also executes `--stop` (@import setup in CLAUDE.md). Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (buffer + stop) = 3 calls.
+- **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3mc_stop_hook.py`) first writes its Step 0 audit-log record, then automatically saves Claude's last response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records. No length filter is applied; every non-empty response is recorded. It also executes `--stop` (@import setup in CLAUDE.md). Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (buffer + stop) = 3 calls.
 - **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records. Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired.
-- **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. Note: The auto-save hooks intentionally apply minimal noise filters — responses under 3 characters and user messages under 10 characters or matching routine acknowledgment patterns are skipped to prevent DB pollution.
+- **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. **Every non-empty user message and every non-empty Claude response is recorded in FULL, character-for-character, with no truncation.** There is no length filter (the previous `len(text) >= 10` / `>= 3` thresholds are REMOVED) and no skip-pattern filter (the previous `_SKIP_PATTERNS` "ok / yes / thanks" routine-response filter is REMOVED). Short acknowledgements such as `ok` or `yes` are now recorded like any other input.
 - **[AI Behavioral Guidelines] Silence on successful save**: When a save succeeds, make no report or acknowledgment — maintain silence.
 - **[Implementation Specs] Fatal failure warning**: Only when a DB write fails, or the DB record count does not change after INSERT, display the following prominently:
   > ⚠️ Physical save failed. Current memories may be lost.
 - **[AI Behavioral Guidelines] Active RAG**: When knowledge is insufficient, proactively execute `--search` to retrieve relevant memories. The command is auto-approved via `permissions.allow` — no confirmation needed.
 - **[Implementation Spec] Context injection (both stdout and file are required)**: `--search` results must be **printed to stdout via `print()`** and simultaneously **written to file** `N3MemoryCore/.memory/memory_context.md`. **Both must be performed.** Without stdout output, Claude cannot see the search results and will respond "I don't have that memory" even when the data exists in the DB. File write alone does not deliver results to Claude.
-- **[Implementation Specs] Physical purification**: In text to be saved, replace code blocks (multi-line content enclosed in ` ``` `) with `[code omitted]`. Inline code (single-line `` `code` `` format) is preserved as-is. Extract only intent and conclusions.
+- **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
 - **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | python n3memory.py --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id ID` argument to tag the record with the agent identifier (e.g., `python n3memory.py --buffer "text" --agent-id "claude-code"`).
-- **[Customization] Language localization**: The skip patterns (`_SKIP_PATTERNS`) in `n3mc_hook.py` default to English routine responses. To optimize for your language, ask Claude Code: "Optimize the skip patterns for [your language]".
-- **[Implementation Specs] Deduplication**:
+- **[Customization] Language localization**: Not applicable. Skip patterns (`_SKIP_PATTERNS`) have been REMOVED in favor of the complete-recording contract; there is nothing language-specific to localize in the hook filter layer.
+- **[Implementation Specs] Deduplication & HTTP-failure fallback**:
   - While server is running: Skip saving if cos_sim ≥ `dedup_threshold` (0.95) or exact string match.
-  - While server is stopped: Skip deduplication check and proceed with saving, excluding only **exact string matches** (saving must not be blocked). This fallback (`_buffer_direct()`) writes directly to the DB without generating an embedding vector — the missing vec index entry is repaired on the next `--repair` call.
+  - On HTTP POST failure to the embedding server (server stopped, timeout, or non-2xx): the write falls back to `_buffer_direct()`, which inserts the record directly into SQLite without an embedding vector. The missing vec-index entry is repaired on the next `--repair` call. **Silent drops are forbidden**: every failure path either succeeds via `_buffer_direct` or emits a message to stderr. Combined with the Step 0 audit log, this guarantees that no user or Claude turn can be lost.
 - **[Implementation Specs] HTTP timeout**: `_post()` uses a 30-second timeout for HTTP requests to the server. This accommodates CPU-based embedding inference which can take 4–5 seconds under load.
 - **[Implementation Specs] ensure_server() concurrent startup wait**: When a PID file conflict is detected (another process is starting the server), wait up to 60 seconds (120 × 0.5s) before failing. This matches the normal 60-second startup timeout and accommodates first-run model download.
 - **[Implementation Specs] _load_vec_extension idempotency**: Loading the sqlite-vec extension twice on the same connection is a no-op — if the extension is already loaded, the load call raises an exception containing "already" or "duplicate" in its message. Catch such exceptions and continue; re-raise all others.
@@ -594,9 +605,19 @@ Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` 
 - **[Implementation Specs] Vector re-index migration**: When upgrading the embedding model from `multilingual-e5-base` to `e5-base-v2`, a one-time vector re-index migration (`_run_vec_reindex`) is triggered on the first `--repair` call after upgrade, controlled by a marker file `vec_e5v2_migrated`.
 - **[AI Behavioral Guidelines] Utilizing CLAUDE.md**: At the start of the next session, read `.claude/CLAUDE.md` and inherit the behavioral guidelines from the previous session. Memory context is loaded via `@import` from `memory_context.md` (see §4).
 
+### Q-A Pairing Contract
+Every [user] and [claude i/N] row recorded for the same conversational turn shares a `turn_id` (UUID4). This lets N3MemoryCore reassemble the full previous exchange when a similar question returns later, instead of surfacing only isolated chunks.
+
+1. **Turn identifier**: When the UserPromptSubmit hook saves the user's message U_k, it generates a new turn_id T_k, attaches T_k to every [user i/N] chunk, and persists T_k to `.memory/turn_id.txt`.
+2. **Claude-side pairing**: When the Stop hook saves Claude's response C_k, it reads T_k from `.memory/turn_id.txt` and attaches it to every [claude i/N] chunk. After the save loop the file is cleared.
+3. **Recovery path**: If the Stop hook is skipped, the next UserPromptSubmit's Step 2 (save previous Claude response) reads the file and reuses T_k, so U_k and C_k still share the same turn_id.
+4. **Pair reconstruction**: `/search` returns two fields — `results` (score-ranked hits) and `pairs` (for every hit with a turn_id, the full ordered list of sibling rows). Ordering is: [user] rows first, then [claude] rows, each group by chunk index "i/N", then by rowid.
+5. **Rendering**: The memory context emits a "Previous matching exchange(s)" block BEFORE the "Other memories" block. Rows that already appear in a pair are suppressed from the ranked list to avoid duplication.
+6. **Schema**: `memories.turn_id TEXT` with index `idx_memories_turn_id`. `insert_memory(..., turn_id=None)` is the keyword-only parameter. `get_memories_by_turn_id(conn, turn_id)` is the helper used by retrieval.
+
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.1.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.2.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
@@ -613,7 +634,7 @@ After implementation is complete, autonomously resolve the following tests and r
    - Japanese example: "坂本龍馬" (Sakamoto Ryoma)
    - English example: "Abraham Lincoln"
 
-4. **Fictional Setting Test (Creative Fictional Settings)**: After saving text containing a fictional setting with no code blocks (e.g., character names, world-building, proper nouns), retrieve it via `--search` and confirm that **all fields of the saved text are restored verbatim** as the pass criterion. Note: if the text contains code blocks, physical purification per §5 replaces them with `[code omitted]`, so the restored result will differ (this is expected behavior by design).
+4. **Fictional Setting Test (Creative Fictional Settings)**: After saving text containing a fictional setting (e.g., character names, world-building, proper nouns), retrieve it via `--search` and confirm that **all fields of the saved text are restored verbatim** as the pass criterion. Fictional setting text (non-code) is preserved verbatim per the Complete-Recording Contract; code blocks in Claude's response are still substituted with `[code omitted]` by documented design.
    - Japanese example: "ソラニア (fictional floating city)"
    - English example: Any fictional character, location, or proper noun
 
@@ -632,17 +653,17 @@ After implementation is complete, autonomously resolve the following tests and r
 
 8. **memory_context.md dual output test**: Run `--search` and confirm that results are **printed to stdout** AND **written to `N3MemoryCore/.memory/memory_context.md`**. If only one output channel works, the test fails.
 
-9. **Noise filter test**: Verify that the following inputs are correctly filtered:
-    - Pass a 2-character string with `[claude]` prefix via `--hook-submit` and confirm the **save is skipped** (under 3 chars filter).
-    - Pass a 5-character string with `[user]` prefix via `--hook-submit` and confirm the **save is skipped** (under 10 chars filter).
-    - Pass a routine response (e.g., `ok`, `yes`) as `[user]` and confirm the **save is skipped**.
-    - For all cases above, confirm that calling `--buffer` directly **saves without applying any filter** (manual saves bypass filters).
+9. **Complete-Recording Test (replaces the old Noise-Filter test)**: Verify that the filters described below are REMOVED and that every non-empty input is recorded:
+    - Pass a 2-character string with `[claude]` prefix via `--hook-submit` and confirm the **record IS saved**. (Old `len(text) >= 3` filter no longer exists.)
+    - Pass a 5-character string with `[user]` prefix via `--hook-submit` and confirm the **record IS saved**. (Old `len(text) >= 10` filter no longer exists.)
+    - Pass a routine response (e.g., `ok`, `yes`, `thanks`) as `[user]` and confirm the **record IS saved**. (Old `_SKIP_PATTERNS` filter no longer exists.)
+    - Verify that an `audit.log` entry is written for every hook invocation, independent of whether the buffer write succeeds.
 
 10. **Fully Automatic Saving Test**: Verify that hooks save all conversations automatically without Claude's manual intervention.
     1. Record the current DB record count via `--list`.
     2. Conduct **3 or more turns** of conversation within a Claude Code session (user messages + Claude responses). Claude must **not call `--buffer` manually** at any point during this test.
     3. Re-check the DB record count via `--list` and confirm that both user messages (`[user]` prefix) and Claude responses (`[claude]` prefix) have been auto-saved.
-    4. **Pass criteria**: Each conversation turn has one user message and one Claude response saved (excluding trivial messages skipped by noise filters). No evidence of Claude manually calling `--buffer`.
+    4. **Pass criteria**: **Every** conversation turn has its user message and its Claude response saved — nothing is dropped for being short or matching a routine pattern (per the Complete-Recording Contract). No evidence of Claude manually calling `--buffer`.
 
 ---
 
@@ -661,9 +682,9 @@ N3MemoryCore/
 └── tests/
     ├── conftest.py          # Shared fixtures: isolated DB, config, dummy vectors
     ├── test_database.py     # Layer 1: DB unit tests (CRUD, schema, transactions)
-    ├── test_processor.py    # Layer 2: Ranking math, purification, Refresh
+    ├── test_processor.py    # Layer 2: Ranking math, purify `[code omitted]` substitution, Refresh
     ├── test_api.py          # Layer 3: FastAPI endpoint tests (TestClient)
-    └── test_hooks.py        # Layer 4: Hook integration (truncation, image strip, skip patterns)
+    └── test_hooks.py        # Layer 4: Hook integration (complete-preservation chunking, image strip, audit log)
 ```
 
 ### Layer 1: `test_database.py` (27 tests)
@@ -687,7 +708,7 @@ N3MemoryCore/
 | `TestCosineSim` | `identical_vectors`, `orthogonal_vectors`, `clamp_negative`, `intermediate_value` | L2→cosine conversion |
 | `TestTimeDecay` | `now_returns_one`, `half_life`, `floor_value`, `invalid_timestamp_returns_one` | Half-life decay |
 | `TestKeywordRelevance` | `below_threshold`, `perfect_match`, `partial_match`, `zero_max` | BM25 normalization |
-| `TestPurification` | `code_block_replaced`, `inline_code_preserved`, `multiple_code_blocks`, `no_code_blocks` | Physical purification |
+| `TestPurification` | `code_block_replaced_with_omitted`, `inline_code_preserved`, `multiple_code_blocks_replaced`, `no_code_blocks_unchanged` | Fenced code blocks are substituted with `[code omitted]` per documented design; inline code preserved |
 | `TestEmbedding` | `passage_prefix`, `query_prefix`, `embed_passage_function`, `embed_query_function`, `same_text_similar_vectors` | Embedding model |
 | `TestRefresh` | `refresh_replaces_record`, `refresh_updates_timestamp` | Knowledge Refresh |
 | `TestBiasScoring` | `session_bias_match/mismatch`, `local_bias_match/mismatch`, `full_scoring_formula` | Ranking formula |
@@ -697,7 +718,7 @@ N3MemoryCore/
 | Test Class | Tests | Coverage |
 |---|---|---|
 | `TestHealth` | `health_ok` | Server status |
-| `TestBuffer` | `saves_record`, `empty_content`, `with_agent_name`, `exact_dedup`, `purifies_code_blocks` | Save endpoint |
+| `TestBuffer` | `saves_record`, `empty_content`, `with_agent_name`, `exact_dedup`, `preserves_code_blocks_verbatim` | Save endpoint |
 | `TestSearch` | `empty_db`, `buffer_and_search_roundtrip`, `empty_query`, `returns_score` | Search endpoint |
 | `TestRepair` | `repair_fixes_unindexed` | Repair endpoint |
 | `TestList` | `list_empty`, `list_after_buffer` | List endpoint |
@@ -709,10 +730,10 @@ N3MemoryCore/
 
 | Test Class | Tests | Coverage |
 |---|---|---|
-| `TestTruncateAtSentence` | `short_text_unchanged`, `truncate_at_period`, `truncate_at_exclamation`, `fallback_hard_cut` | Sentence-boundary truncation |
+| `TestChunkText` | `short_text_single_record`, `long_text_multi_chunk`, `chunk_prefix_numbering`, `paragraph_split`, `sentence_split`, `hard_window_fallback` | Complete-preservation chunking |
 | `TestStripImages` | `no_images_unchanged`, `strips_base64_image`, `image_only_becomes_empty`, `non_json_passthrough` | Image payload stripping |
 | `TestExtractText` | `plain_string`, `multimodal_json`, `image_only_returns_empty`, `empty_returns_empty` | Multimodal text extraction |
-| `TestSkipPatterns` | `routine_skipped`, `meaningful_not_skipped`, `length_filter_claude`, `length_filter_user` | Noise filtering |
+| `TestCompleteRecording` | `routine_ok_is_saved`, `short_claude_response_is_saved`, `short_user_message_is_saved`, `audit_log_entry_written` | Complete-Recording Contract (filters removed) |
 | `TestStopIdempotency` | `import_line_not_duplicated`, `rules_file_created` | --stop idempotency |
 
 ### Running

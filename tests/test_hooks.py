@@ -1,5 +1,9 @@
 """
-Layer 4: Hook integration (truncation, image strip, skip patterns)
+Layer 4: Hook integration (complete-preservation chunking, multimodal extract).
+
+The complete-recording contract forbids all length filters, skip-pattern
+filters, and code-block stripping from the buffer write path. These tests
+assert that EVERY non-empty input produces at least one tagged record.
 """
 import os
 import sys
@@ -10,36 +14,53 @@ _N3MC_DIR = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _N3MC_DIR)
 
 from n3memory import (
-    _truncate_at_sentence,
     _extract_text,
     _prepare_user_buffer,
     _prepare_claude_buffer,
     purify_text,
 )
+from core.processor import chunk_text
 
 
-class TestTruncateAtSentence:
-    def test_short_text_unchanged(self):
-        text = "Hello world."
-        assert _truncate_at_sentence(text, 300) == text
+class TestCompletePreservation:
+    """Ensures full content is preserved via chunking (no truncation)."""
 
-    def test_truncate_at_period(self):
-        # Sentence boundary at ~200 chars (> max_chars//2=150) ensures it's found
-        text = "x" * 190 + ". " + "y" * 200
-        result = _truncate_at_sentence(text, 300)
-        assert result.endswith(".")
-        assert len(result) <= 300
+    def test_short_text_single_chunk(self):
+        pieces = chunk_text("Hello world.", max_chars=400, overlap=40)
+        assert pieces == ["Hello world."]
 
-    def test_truncate_at_exclamation(self):
-        text = "x" * 190 + "! " + "y" * 200
-        result = _truncate_at_sentence(text, 300)
-        assert result.endswith("!")
+    def test_long_text_multiple_chunks(self):
+        long_text = "Sentence number " + ". Sentence number ".join(str(i) for i in range(100)) + "."
+        pieces = chunk_text(long_text, max_chars=400, overlap=40)
+        assert len(pieces) > 1
+        for p in pieces:
+            assert p.strip()
 
-    def test_fallback_hard_cut(self):
-        # No sentence boundary in first half → hard cut at max_chars
-        text = "a" * 400
-        result = _truncate_at_sentence(text, 300)
-        assert len(result) == 300
+    def test_claude_buffer_chunks_long_response(self):
+        long_response = "A" * 1000 + ". " + "B" * 1000 + ". " + "C" * 1000
+        contents = _prepare_claude_buffer(long_response)
+        assert len(contents) > 1
+        for c in contents:
+            assert c.startswith("[claude")
+        joined = " ".join(contents)
+        assert "A" in joined and "B" in joined and "C" in joined
+
+    def test_user_buffer_chunks_long_message(self):
+        long_message = "Please save the following: " + ("detail " * 200)
+        contents = _prepare_user_buffer(long_message)
+        assert len(contents) >= 1
+        for c in contents:
+            assert c.startswith("[user")
+
+    def test_short_claude_single_record_no_index(self):
+        contents = _prepare_claude_buffer("Short reply.")
+        assert len(contents) == 1
+        assert contents[0].startswith("[claude] ")
+
+    def test_short_user_single_record_no_index(self):
+        contents = _prepare_user_buffer("A meaningful user message.")
+        assert len(contents) == 1
+        assert contents[0].startswith("[user] ")
 
 
 class TestExtractText:
@@ -65,25 +86,46 @@ class TestExtractText:
         assert _extract_text("") == ""
 
 
-class TestSkipPatterns:
-    def test_routine_skipped(self):
-        assert _prepare_user_buffer("ok") is None
-        assert _prepare_user_buffer("yes") is None
-        assert _prepare_user_buffer("thanks") is None
+class TestNoSilentDrops:
+    """Complete-recording contract: nothing may be dropped from user or
+    Claude text before it reaches the DB.
+    """
+
+    def test_routine_words_saved_not_skipped(self):
+        for word in ("ok", "yes", "thanks", "thank you", "got it"):
+            contents = _prepare_user_buffer(word)
+            assert contents, f"routine word {word!r} must be preserved"
+            assert contents[0].startswith("[user")
+
+    def test_short_claude_saved(self):
+        contents = _prepare_claude_buffer("ok")
+        assert contents and contents[0].startswith("[claude")
+
+    def test_short_user_saved(self):
+        contents = _prepare_user_buffer("hi there")
+        assert contents and contents[0].startswith("[user")
 
     def test_meaningful_not_skipped(self):
         text = "Please implement N3MemoryCore according to this specification."
         result = _prepare_user_buffer(text)
-        assert result is not None
-        assert "[user]" in result
+        assert result
+        assert any("[user" in r for r in result)
 
-    def test_length_filter_claude(self):
-        # Under 3 chars → skip
-        assert _prepare_claude_buffer("ok") is None
 
-    def test_length_filter_user(self):
-        # Under 10 chars → skip
-        assert _prepare_user_buffer("hi there") is None
+class TestPurifyCodeBlocks:
+    """Code blocks are excluded from stored conversation by documented
+    product design: N3MC records conversation text, not source code.
+    """
+
+    def test_closed_fence_replaced(self):
+        text = "before\n```python\nprint('hi')\n```\nafter"
+        result = purify_text(text)
+        assert "[code omitted]" in result
+        assert "print" not in result
+
+    def test_plain_text_preserved(self):
+        text = "nothing special here"
+        assert purify_text(text) == text
 
 
 class TestStopIdempotency:

@@ -94,9 +94,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             owner_id  TEXT NOT NULL,
             local_id  TEXT,
             agent_name  TEXT,
-            session_id TEXT
+            session_id TEXT,
+            turn_id   TEXT
         )
     """)
+    # NOTE: turn_id index is created by migrate_schema() so that it runs AFTER
+    # ALTER TABLE on pre-turn_id DBs. Do NOT create it here, because on
+    # existing DBs the CREATE TABLE above is a no-op and the turn_id column
+    # may not exist yet, which would crash the index creation.
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             content,
@@ -118,9 +123,19 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     """Idempotently add missing columns and migrate FTS tokenizer if needed."""
     # Add missing columns
     existing = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
-    for col, typedef in [("local_id", "TEXT"), ("agent_name", "TEXT"), ("session_id", "TEXT")]:
+    for col, typedef in [
+        ("local_id", "TEXT"),
+        ("agent_name", "TEXT"),
+        ("session_id", "TEXT"),
+        ("turn_id", "TEXT"),
+    ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {typedef}")
+
+    # Idempotently ensure the turn_id index exists (for Q-A pair reconstruction).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)"
+    )
 
     # v1.0.0 → v1.1.0 migration: field renamed agent_id → agent_name.
     # Copy any legacy data so rows saved under v1.0.0 remain usable.
@@ -175,15 +190,20 @@ def insert_memory(
     local_id: Optional[str] = None,
     agent_name: Optional[str] = None,
     session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
 ) -> int:
     """
     Insert into memories + memories_fts + memories_vec (if embedding provided).
     Returns the implicit SQLite rowid of the inserted record.
+
+    ``turn_id`` groups records that belong to the same conversational turn
+    (one [user] record + one or more [claude i/N] records sharing the same
+    UUID). It enables Q-A pair reconstruction at search time.
     """
     cursor = conn.execute(
-        """INSERT INTO memories(id, content, timestamp, owner_id, local_id, agent_name, session_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (record_id, content, timestamp, owner_id, local_id, agent_name, session_id),
+        """INSERT INTO memories(id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (record_id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id),
     )
     rowid = cursor.lastrowid
 
@@ -224,7 +244,18 @@ def delete_memory(conn: sqlite3.Connection, record_id: str) -> bool:
 
 def get_all_memories(conn: sqlite3.Connection) -> list:
     return conn.execute(
-        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, rowid FROM memories ORDER BY timestamp DESC"
+        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id, rowid FROM memories ORDER BY timestamp DESC"
+    ).fetchall()
+
+
+def get_memories_by_turn_id(conn: sqlite3.Connection, turn_id: str) -> list:
+    """Return all records belonging to a single turn, ordered by rowid (insertion order)."""
+    if not turn_id:
+        return []
+    return conn.execute(
+        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id, rowid "
+        "FROM memories WHERE turn_id = ? ORDER BY rowid ASC",
+        (turn_id,),
     ).fetchall()
 
 
@@ -299,6 +330,6 @@ def search_fts(conn: sqlite3.Connection, query: str, limit: int = 50) -> list:
 
 def get_memory_by_rowid(conn: sqlite3.Connection, rowid: int) -> Optional[sqlite3.Row]:
     return conn.execute(
-        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, rowid FROM memories WHERE rowid = ?",
+        "SELECT id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id, rowid FROM memories WHERE rowid = ?",
         (rowid,),
     ).fetchone()

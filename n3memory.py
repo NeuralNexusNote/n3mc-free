@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -27,6 +28,27 @@ def _reconfigure_utf8():
     if hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(encoding='utf-8')
 
+
+def _sanitize_for_sqlite(text: str) -> str:
+    """Remove lone Unicode surrogates that would crash sqlite3 on UTF-8 encode.
+
+    Windows cp932 / surrogateescape paths can introduce \\udcXX halves into
+    strings that came through subprocess pipes or clipboard data. SQLite's
+    text encoder requires well-formed UTF-8 and raises UnicodeEncodeError on
+    such halves, which silently kills "complete preservation" writes for
+    Japanese users. This is the last-line defense immediately before any
+    DB call.
+    """
+    if not isinstance(text, str):
+        return text
+    try:
+        return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    except Exception:
+        return "".join(
+            ch if not (0xD800 <= ord(ch) <= 0xDFFF) else "\ufffd"
+            for ch in text
+        )
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -38,6 +60,29 @@ _CONTEXT_FILE = _MEMORY_DIR / "memory_context.md"
 _CONFIG_FILE = _THIS_DIR / "config.json"
 _VEC_MIGRATED_MARKER = _MEMORY_DIR / "vec_e5v2_migrated"
 _FTS_CLEANED_MARKER = _MEMORY_DIR / "fts_punct_cleaned"
+_TURN_ID_PATH = _MEMORY_DIR / "turn_id.txt"
+
+
+# ---------------------------------------------------------------------------
+# Turn-id state (cross-hook sharing — UserPromptSubmit writes, Stop reads)
+# ---------------------------------------------------------------------------
+def _read_turn_id() -> str:
+    """Return turn_id for the current open turn, or "" if none."""
+    try:
+        if _TURN_ID_PATH.exists():
+            return _TURN_ID_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _write_turn_id(turn_id: str) -> None:
+    """Persist T_k so the Stop hook can pair C_k with U_k."""
+    try:
+        _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        _TURN_ID_PATH.write_text(turn_id or "", encoding="utf-8")
+    except Exception:
+        sys.stderr.write(f"[N3MC TURN_ID WRITE ERROR] {traceback.format_exc()}\n")
 
 # ---------------------------------------------------------------------------
 # Config management
@@ -262,19 +307,12 @@ def _get(url: str, timeout: float = 30.0) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
-def _truncate_at_sentence(text: str, max_chars: int) -> str:
-    """Truncate at a sentence boundary within max_chars."""
-    if len(text) <= max_chars:
-        return text
-    chunk = text[:max_chars]
-    for end_char in ('.', '!', '?', '\n'):
-        idx = chunk.rfind(end_char)
-        if idx > max_chars // 2:
-            return chunk[:idx + 1]
-    return chunk
-
-
-def _buffer_direct(content: str, config: dict, agent_name: Optional[str] = None) -> bool:
+def _buffer_direct(
+    content: str,
+    config: dict,
+    agent_name: Optional[str] = None,
+    turn_id: Optional[str] = None,
+) -> bool:
     """Fallback: write directly to DB without embedding (server offline)."""
     sys.path.insert(0, str(_THIS_DIR / "core"))
     from database import get_connection, init_db, insert_memory, check_exact_duplicate, count_memories
@@ -288,6 +326,8 @@ def _buffer_direct(content: str, config: dict, agent_name: Optional[str] = None)
         conn = get_connection(str(_DB_PATH))
         init_db(conn)
 
+        # Strip lone surrogates before any SQLite call (Windows cp932 defense).
+        content = _sanitize_for_sqlite(content)
         # Purify (same as server endpoint) — strip code blocks
         content = purify_text(content)
 
@@ -305,6 +345,8 @@ def _buffer_direct(content: str, config: dict, agent_name: Optional[str] = None)
             config["owner_id"], None,
             config.get("local_id"),
             agent_name,
+            None,
+            turn_id,
         )
         after = count_memories(conn)
         conn.close()
@@ -318,7 +360,12 @@ def _buffer_direct(content: str, config: dict, agent_name: Optional[str] = None)
         return False
 
 
-def cmd_buffer(text: str, config: dict, agent_name: Optional[str] = None) -> None:
+def cmd_buffer(
+    text: str,
+    config: dict,
+    agent_name: Optional[str] = None,
+    turn_id: Optional[str] = None,
+) -> None:
     """Save a memory record."""
     if not text or not text.strip():
         return
@@ -329,11 +376,13 @@ def cmd_buffer(text: str, config: dict, agent_name: Optional[str] = None) -> Non
     data = {"content": text}
     if agent_name:
         data["agent_name"] = agent_name
+    if turn_id:
+        data["turn_id"] = turn_id
 
     result = _post(url, data)
     if result is None:
         # Server offline — direct write
-        _buffer_direct(text, config, agent_name)
+        _buffer_direct(text, config, agent_name, turn_id=turn_id)
     elif result.get("status") != "ok":
         print(f"⚠️ Physical save failed. Current memories may be lost. {result}", file=sys.stderr)
 
@@ -351,24 +400,50 @@ def cmd_search(query: str, config: dict) -> list:
         return []
 
     results = result.get("results", [])
-    _write_context(results)
+    pairs = result.get("pairs", [])
+    _write_context(results, pairs=pairs)
     return results
 
 
-def _write_context(results: list) -> None:
-    """Write search results to memory_context.md AND stdout."""
+def _write_context(results: list, pairs: Optional[list] = None) -> None:
+    """Write search results to memory_context.md AND stdout.
+
+    If ``pairs`` is provided (list of {turn_id, members}), the reconstructed
+    Q-A exchanges are emitted first as "Previous matching exchange(s)" and
+    any individual chunks already included in those pairs are suppressed
+    from the "Other memories" section to avoid duplication.
+    """
     _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    pairs = pairs or []
+    pair_ids: set = set()
+    for p in pairs:
+        for m in p.get("members", []) or []:
+            mid = m.get("id")
+            if mid:
+                pair_ids.add(mid)
+
     lines = []
-    if results:
-        lines.append("# N3MemoryCore — Relevant Memories\n")
-        for r in results:
+    if pairs:
+        lines.append("# N3MemoryCore — Previous matching exchange(s)\n")
+        for p in pairs:
+            tid = p.get("turn_id", "")
+            lines.append(f"## Turn {tid}")
+            for m in p.get("members", []) or []:
+                ts = m.get("timestamp", "")
+                content = m.get("content", "")
+                lines.append(f"- ({ts[:10]}) {content}")
+            lines.append("")
+
+    other = [r for r in (results or []) if r.get("id") not in pair_ids]
+    if other:
+        lines.append("# N3MemoryCore — Other memories\n" if pairs else "# N3MemoryCore — Relevant Memories\n")
+        for r in other:
             score = r.get("score", 0)
             content = r.get("content", "")
             ts = r.get("timestamp", "")
             lines.append(f"- [{score:.4f}] ({ts[:10]}) {content}")
-        output = "\n".join(lines)
-    else:
-        output = ""
+
+    output = "\n".join(lines) if lines else ""
 
     # Write to file
     try:
@@ -404,8 +479,9 @@ def cmd_list(config: dict) -> None:
         rec_id = r.get("id", "")
         ts = r.get("timestamp", "")[:19]
         agent = r.get("agent_name") or ""
+        tid = r.get("turn_id") or ""
         content = r.get("content", "")[:80]
-        print(f"{rec_id}\t{ts}\t{agent}\t{content}")
+        print(f"{rec_id}\t{ts}\t{agent}\t{tid}\t{content}")
     print(f"Total: {result.get('total', len(records))} records")
 
 
@@ -464,53 +540,121 @@ def cmd_stop(config: dict) -> None:
         claude_md.write_text(import_line + "\n", encoding="utf-8")
 
 
-def cmd_hook_submit(config: dict) -> None:
-    """
-    UserPromptSubmit hook entry point.
-    Reads JSON from stdin: {message/prompt, last_assistant_message}
-    Order: --repair -> --buffer(claude) -> --search -> --buffer(user)
-    """
+def _audit_append(hook: str, raw: str, payload) -> None:
+    """Append raw hook payload to `.memory/audit.log`. Must never raise."""
     try:
-        raw = sys.stdin.read()
-        data = json.loads(raw)
+        audit_path = _MEMORY_DIR / "audit.log"
+        _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "hook": hook,
+            "raw": raw,
+            "payload": payload,
+        }
+        with open(str(audit_path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
-        return
+        sys.stderr.write(f"[N3MC AUDIT LOG ERROR] {traceback.format_exc()}\n")
+
+
+def cmd_hook_submit(config: dict) -> None:
+    """UserPromptSubmit hook — complete-recording contract.
+
+    Step 0: append raw stdin payload to `.memory/audit.log` (JSONL).
+    Step 1: --repair (best-effort).
+    Step 2: save Claude's previous response in FULL (no filters).
+    Step 3: --search with user text.
+    Step 4: save user's message in FULL (no filters).
+
+    Silent drops are forbidden. `cmd_buffer` falls back to `_buffer_direct`
+    on POST failure so every turn is preserved either way.
+    """
+    # Step 0: audit log — FIRST, always.
+    raw = ""
+    data: dict = {}
+    try:
+        # Read stdin as bytes explicitly and decode UTF-8 to avoid Windows
+        # cp932 default that turns Japanese text into lone \\udcXX surrogates.
+        try:
+            raw_bytes = sys.stdin.buffer.read()
+            raw = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            raw = sys.stdin.read()
+        raw = _sanitize_for_sqlite(raw)
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        data = {}
+
+    _audit_append("UserPromptSubmit", raw, data)
 
     ensure_server(config)
 
-    # Extract user message
     user_msg = data.get("message") or data.get("prompt") or ""
     user_text = _extract_text(user_msg)
 
-    # Extract last assistant message
     last_claude = data.get("last_assistant_message") or ""
     if isinstance(last_claude, list):
         last_claude = _extract_text(last_claude)
 
-    # 1. repair
+    # Step 1: repair (best-effort).
     try:
         cmd_repair(config)
     except Exception:
-        pass
+        sys.stderr.write(
+            f"[N3MC HOOK] cmd_repair failed (non-fatal): {traceback.format_exc()}\n"
+        )
 
-    # 2. buffer: save Claude's previous response
+    # Step 2: save Claude's previous response in FULL, under the *previous*
+    # turn's turn_id (T_{k-1}) if the Stop hook was skipped (e.g. Claude Code
+    # bailed on the prior turn). If T_{k-1} was already consumed by the Stop
+    # hook, this file is absent and a fresh UUID is used so C_{k-1} still gets
+    # a consistent turn_id linking its own chunks together.
+    prior_turn_id = _read_turn_id()
+    claude_turn_id = prior_turn_id or str(uuid.uuid4())
     if last_claude:
-        claude_content = _prepare_claude_buffer(last_claude)
-        if claude_content:
-            cmd_buffer(claude_content, config, agent_name="claude-code")
+        for claude_content in _prepare_claude_buffer(last_claude):
+            try:
+                cmd_buffer(
+                    claude_content,
+                    config,
+                    agent_name="claude-code",
+                    turn_id=claude_turn_id,
+                )
+            except Exception:
+                sys.stderr.write(
+                    f"[N3MC HOOK] cmd_buffer(claude) failed: {traceback.format_exc()}\n"
+                )
 
-    # 3. search
-    if user_text and len(user_text.strip()) >= 2:
+    # Step 3: search.
+    if user_text and user_text.strip():
         try:
             cmd_search(user_text, config)
         except Exception:
-            pass
+            sys.stderr.write(
+                f"[N3MC HOOK] cmd_search failed: {traceback.format_exc()}\n"
+            )
 
-    # 4. buffer: save user message
+    # Step 4: save user's message in FULL under a fresh turn_id T_k. Persist
+    # T_k so the Stop hook of this turn can attach C_k (Claude's reply) to
+    # the same turn_id for Q-A pair reconstruction.
+    new_turn_id = str(uuid.uuid4())
     if user_text:
-        user_content = _prepare_user_buffer(user_text)
-        if user_content:
-            cmd_buffer(user_content, config, agent_name="claude-code")
+        wrote = False
+        for user_content in _prepare_user_buffer(user_text):
+            try:
+                cmd_buffer(
+                    user_content,
+                    config,
+                    agent_name="claude-code",
+                    turn_id=new_turn_id,
+                )
+                wrote = True
+            except Exception:
+                sys.stderr.write(
+                    f"[N3MC HOOK] cmd_buffer(user) failed: {traceback.format_exc()}\n"
+                )
+        if wrote:
+            _write_turn_id(new_turn_id)
 
 
 def _extract_text(msg) -> str:
@@ -535,38 +679,58 @@ def _extract_text(msg) -> str:
     return str(msg) if msg else ""
 
 
-_SKIP_PATTERNS = re.compile(
-    r'^(ok|yes|no|sure|thanks|thank you|got it|understood|sounds good|'
-    r'great|perfect|alright|okay|yep|nope|cool|noted|right|exactly|correct|'
-    r'i see|i understand|please|go ahead|proceed|continue|done|finish)[\.\!\?]*$',
-    re.IGNORECASE,
-)
+def _chunk_for_buffer(cleaned: str) -> list:
+    """Chunk text for complete preservation (no truncation)."""
+    try:
+        from core.processor import chunk_text
+        pieces = chunk_text(cleaned, max_chars=400, overlap=40)
+    except Exception:
+        pieces = [cleaned]
+    return pieces or [cleaned]
 
 
-def _prepare_user_buffer(text: str) -> Optional[str]:
-    """Prepare user message for buffering with noise filter."""
-    text = text.strip()
-    if len(text) < 10:
-        return None
-    if _SKIP_PATTERNS.match(text):
-        return None
-    cleaned = purify_text(text)
-    truncated = _truncate_at_sentence(cleaned, 300)
-    return f"[user] {truncated}" if truncated else None
+def _prepare_user_buffer(text: str) -> list:
+    """Prepare user message for buffering — conversation text, chunked.
+
+    Complete-recording contract: no length filter, no skip-pattern filter.
+    Fenced code blocks are replaced with ``[code omitted]`` per documented
+    product design (N3MC records conversation, not source code).
+    """
+    cleaned = purify_text(text or "").strip()
+    if not cleaned:
+        return []
+    pieces = _chunk_for_buffer(cleaned)
+    n = len(pieces)
+    return [
+        f"{'[user]' if n == 1 else f'[user {i+1}/{n}]'} {piece}"
+        for i, piece in enumerate(pieces)
+    ]
 
 
-def _prepare_claude_buffer(text: str) -> Optional[str]:
-    """Prepare Claude response for buffering with noise filter."""
-    text = text.strip()
-    if len(text) < 3:
-        return None
-    cleaned = purify_text(text)
-    truncated = _truncate_at_sentence(cleaned, 300)
-    return f"[claude] {truncated}" if truncated else None
+def _prepare_claude_buffer(text: str) -> list:
+    """Prepare Claude response for buffering — conversation text, chunked.
+
+    Complete-recording contract: no length filter, no skip-pattern filter.
+    Fenced code blocks are replaced with ``[code omitted]`` per documented
+    product design.
+    """
+    cleaned = purify_text(text or "").strip()
+    if not cleaned:
+        return []
+    pieces = _chunk_for_buffer(cleaned)
+    n = len(pieces)
+    return [
+        f"{'[claude]' if n == 1 else f'[claude {i+1}/{n}]'} {piece}"
+        for i, piece in enumerate(pieces)
+    ]
 
 
 def purify_text(text: str) -> str:
-    """Replace multi-line code blocks with [code omitted]."""
+    """Replace multi-line code blocks with [code omitted].
+
+    Code blocks are excluded from stored conversation by documented product
+    design: N3MemoryCore records conversation text only, not source code.
+    """
     return re.sub(r'```[\s\S]*?```', '[code omitted]', text)
 
 
@@ -622,6 +786,7 @@ def run_server():
         content: str
         agent_name: Optional[str] = None
         local_id: Optional[str] = None
+        turn_id: Optional[str] = None
 
     class SearchRequest(BaseModel):
         query: str
@@ -634,6 +799,12 @@ def run_server():
     def buffer_endpoint(req: BufferRequest):
         if not req.content or not req.content.strip():
             return {"status": "error", "message": "empty content"}
+
+        # Strip lone surrogates BEFORE any SQLite call. Windows cp932 subprocess
+        # pipes can inject \\udcXX halves that crash check_exact_duplicate /
+        # insert_memory with UnicodeEncodeError, silently breaking the
+        # complete-preservation guarantee for Japanese content.
+        req.content = _sanitize_for_sqlite(req.content)
 
         conn = get_connection(str(_DB_PATH))
         try:
@@ -670,6 +841,7 @@ def run_server():
                 local_id_val,
                 req.agent_name,
                 session_id,
+                req.turn_id,
             )
             after = count_memories(conn)
             conn.close()
@@ -687,13 +859,53 @@ def run_server():
     @app.post("/search")
     def search_endpoint(req: SearchRequest):
         if not req.query:
-            return {"results": []}
+            return {"results": [], "pairs": []}
         query = req.query[:config.get("search_query_max_chars", 2000)]
         conn = get_connection(str(_DB_PATH))
         try:
             results = hybrid_search(conn, query, config)
+
+            # Q-A pair reconstruction: for every unique turn_id hit in the
+            # top-ranked results, fetch *all* sibling records and emit them
+            # ordered by role ([user] → [claude i/N]) then chunk index.
+            from database import get_memories_by_turn_id
+            seen: set = set()
+            pairs: list = []
+            for r in results:
+                tid = r.get("turn_id")
+                if not tid or tid in seen:
+                    continue
+                seen.add(tid)
+                rows = get_memories_by_turn_id(conn, tid)
+                if not rows:
+                    continue
+
+                def _sort_key(row):
+                    c = row["content"] or ""
+                    role = 0 if c.startswith("[user") else (1 if c.startswith("[claude") else 2)
+                    idx = 0
+                    m_tag = re.match(r"^\[[a-z]+ (\d+)/\d+\]", c)
+                    if m_tag:
+                        try:
+                            idx = int(m_tag.group(1))
+                        except ValueError:
+                            idx = 0
+                    return (role, idx, row["rowid"])
+
+                ordered = sorted(rows, key=_sort_key)
+                members = [
+                    {
+                        "id": row["id"],
+                        "content": row["content"],
+                        "timestamp": row["timestamp"],
+                        "rowid": row["rowid"],
+                    }
+                    for row in ordered
+                ]
+                pairs.append({"turn_id": tid, "members": members})
+
             conn.close()
-            return {"results": results}
+            return {"results": results, "pairs": pairs}
         except Exception as e:
             conn.close()
             return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
@@ -721,6 +933,7 @@ def run_server():
                     "content": r["content"],
                     "timestamp": r["timestamp"],
                     "agent_name": r["agent_name"],
+                    "turn_id": r["turn_id"],
                 }
                 for r in rows
             ]
@@ -916,6 +1129,12 @@ def main():
             if idx + 1 < len(sys.argv):
                 agent_name = sys.argv[idx + 1]
 
+        turn_id_arg: Optional[str] = None
+        if "--turn-id" in sys.argv:
+            idx = sys.argv.index("--turn-id")
+            if idx + 1 < len(sys.argv):
+                turn_id_arg = sys.argv[idx + 1]
+
         if len(sys.argv) > 2 and sys.argv[2] == "-":
             text = sys.stdin.read()
         elif len(sys.argv) > 2 and not sys.argv[2].startswith("--"):
@@ -924,7 +1143,7 @@ def main():
             text = sys.stdin.read()
 
         if text.strip():
-            cmd_buffer(text, config, agent_name=agent_name)
+            cmd_buffer(text, config, agent_name=agent_name, turn_id=turn_id_arg)
 
     elif cmd == "--search":
         if len(sys.argv) > 2:

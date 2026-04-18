@@ -83,6 +83,10 @@ class TestKeywordRelevance:
 
 
 class TestPurification:
+    """Code blocks are excluded from stored conversation by documented
+    product design. All non-code content is preserved verbatim.
+    """
+
     def test_code_block_replaced(self):
         text = "before\n```python\nprint('hi')\n```\nafter"
         result = purify(text)

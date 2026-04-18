@@ -16,6 +16,7 @@ from database import (
     find_unindexed_memories, search_fts, search_vector,
     serialize_vector, deserialize_vector, strip_fts_punctuation,
     _quote_fts_query, get_all_memories, get_memory_by_rowid,
+    get_memories_by_turn_id,
 )
 
 
@@ -164,3 +165,73 @@ class TestSerialization:
         recovered = deserialize_vector(serialized)
         assert len(recovered) == 768
         assert abs(recovered[0] - v[0]) < 1e-5
+
+
+class TestTurnIdPairing:
+    """Q-A pair reconstruction: one [user] + N [claude i/N] share one turn_id."""
+
+    def test_schema_has_turn_id_column(self, tmp_db):
+        info = {r[1] for r in tmp_db.execute("PRAGMA table_info(memories)")}
+        assert "turn_id" in info
+
+    def test_turn_id_index_exists(self, tmp_db):
+        idx_rows = tmp_db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+        ).fetchall()
+        names = {r[0] for r in idx_rows}
+        assert "idx_memories_turn_id" in names
+
+    def test_insert_memory_persists_turn_id(self, tmp_db):
+        tid = "11111111-1111-1111-1111-111111111111"
+        insert_memory(
+            tmp_db, str(_gen_uuid7()), "[user] hi", "2025-01-01T00:00:00+00:00",
+            "owner1", None, None, "claude-code", None, tid,
+        )
+        row = tmp_db.execute("SELECT turn_id FROM memories").fetchone()
+        assert row["turn_id"] == tid
+
+    def test_get_memories_by_turn_id_orders_by_rowid(self, tmp_db):
+        tid = "22222222-2222-2222-2222-222222222222"
+        insert_memory(tmp_db, str(_gen_uuid7()), "[user] Q", "2025-01-01T00:00:00+00:00",
+                      "owner1", None, None, "claude-code", None, tid)
+        insert_memory(tmp_db, str(_gen_uuid7()), "[claude 1/2] A1", "2025-01-01T00:00:01+00:00",
+                      "owner1", None, None, "claude-code", None, tid)
+        insert_memory(tmp_db, str(_gen_uuid7()), "[claude 2/2] A2", "2025-01-01T00:00:02+00:00",
+                      "owner1", None, None, "claude-code", None, tid)
+        # Unrelated row
+        insert_memory(tmp_db, str(_gen_uuid7()), "[user] other", "2025-01-01T00:00:03+00:00",
+                      "owner1", None, None, "claude-code", None, "deadbeef")
+
+        rows = get_memories_by_turn_id(tmp_db, tid)
+        assert len(rows) == 3
+        contents = [r["content"] for r in rows]
+        assert contents == ["[user] Q", "[claude 1/2] A1", "[claude 2/2] A2"]
+
+    def test_get_memories_by_turn_id_empty_on_unknown(self, tmp_db):
+        assert get_memories_by_turn_id(tmp_db, "no-such-turn") == []
+
+    def test_get_memories_by_turn_id_empty_string(self, tmp_db):
+        assert get_memories_by_turn_id(tmp_db, "") == []
+
+    def test_get_all_memories_exposes_turn_id(self, tmp_db):
+        tid = "33333333-3333-3333-3333-333333333333"
+        insert_memory(tmp_db, str(_gen_uuid7()), "[user] x", "2025-01-01T00:00:00+00:00",
+                      "owner1", None, None, "claude-code", None, tid)
+        rows = get_all_memories(tmp_db)
+        assert rows
+        assert rows[0]["turn_id"] == tid
+
+    def test_get_memory_by_rowid_exposes_turn_id(self, tmp_db):
+        tid = "44444444-4444-4444-4444-444444444444"
+        rowid = insert_memory(
+            tmp_db, str(_gen_uuid7()), "[user] y", "2025-01-01T00:00:00+00:00",
+            "owner1", None, None, "claude-code", None, tid,
+        )
+        row = get_memory_by_rowid(tmp_db, rowid)
+        assert row["turn_id"] == tid
+
+    def test_insert_without_turn_id_stores_null(self, tmp_db):
+        insert_memory(tmp_db, str(_gen_uuid7()), "[user] no-turn", "2025-01-01T00:00:00+00:00",
+                      "owner1", None)
+        row = tmp_db.execute("SELECT turn_id FROM memories").fetchone()
+        assert row["turn_id"] is None

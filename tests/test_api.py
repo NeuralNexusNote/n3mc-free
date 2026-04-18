@@ -219,9 +219,9 @@ class TestBuffer:
         assert r2.json()["count"] == 0
 
     def test_purifies_code_blocks(self, client):
+        """Documented product design: code blocks are excluded from storage."""
         r = client.post("/buffer", json={"content": "result:\n```python\nprint('x')\n```"})
         assert r.json()["status"] == "ok"
-        # Check list to verify code omitted
         lr = client.get("/list")
         contents = [rec["content"] for rec in lr.json()["records"]]
         assert any("[code omitted]" in c for c in contents)

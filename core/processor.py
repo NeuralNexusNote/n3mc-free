@@ -7,7 +7,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from math import pow, log2
-from typing import Optional
+from typing import List, Optional
 
 # Required: explicit sys.path configuration for inter-module imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -64,9 +64,111 @@ def embed_query(text: str) -> list:
 _CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```', re.MULTILINE)
 
 
+def _sanitize_surrogates(text: str) -> str:
+    """Defense-in-depth: remove lone Unicode surrogates that crash sqlite3.
+
+    Primary sanitation happens at the hook entrypoints (n3memory.py), but
+    purify is called from every save path, so we repeat it here as
+    belt-and-suspenders for the complete-preservation contract.
+    """
+    if not isinstance(text, str):
+        return text
+    try:
+        return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    except Exception:
+        return "".join(
+            ch if not (0xD800 <= ord(ch) <= 0xDFFF) else "\ufffd"
+            for ch in text
+        )
+
+
 def purify(text: str) -> str:
-    """Replace multi-line code blocks with '[code omitted]'. Keep inline code as-is."""
+    """Replace multi-line code blocks with '[code omitted]'. Preserve inline code.
+
+    Code blocks are excluded from stored conversation by documented product
+    design: N3MemoryCore records conversation text only, not source code.
+    All non-code content is preserved verbatim (no length or skip-pattern
+    filtering) and long text is chunked by ``chunk_text``.
+    """
+    text = _sanitize_surrogates(text)
     return _CODE_BLOCK_RE.sub('[code omitted]', text)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical chunking for complete preservation (no truncation)
+# ---------------------------------------------------------------------------
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|(?<=[。！？])|\n+')
+_PARAGRAPH_SPLIT_RE = re.compile(r'\n\s*\n+')
+
+
+def _hard_window(text: str, max_chars: int, overlap: int) -> List[str]:
+    """Fixed-size sliding window with overlap. Last resort for very long sentences."""
+    if len(text) <= max_chars:
+        return [text]
+    step = max(1, max_chars - overlap)
+    out: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        out.append(text[i:i + max_chars])
+        if i + max_chars >= n:
+            break
+        i += step
+    return out
+
+
+def chunk_text(
+    text: str,
+    max_chars: int = 400,
+    overlap: int = 40,
+    min_chars: int = 30,
+) -> List[str]:
+    """Hierarchical splitter: paragraph -> sentence -> hard window.
+
+    Local-only (regex). No LLM, no model inference. CJK sentence terminators
+    included. Short fragments below `min_chars` are merged into the previous
+    chunk to avoid single-word records that carry no retrievable context.
+    Guarantees complete preservation — no character is dropped.
+    """
+    if not text or not text.strip():
+        return []
+    if len(text) <= max_chars:
+        return [text.strip()]
+
+    chunks: List[str] = []
+    paragraphs = _PARAGRAPH_SPLIT_RE.split(text)
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= max_chars:
+            chunks.append(para)
+            continue
+        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(para) if s.strip()]
+        buf = ""
+        for s in sentences:
+            if len(s) > max_chars:
+                if buf:
+                    chunks.append(buf)
+                    buf = ""
+                chunks.extend(_hard_window(s, max_chars, overlap))
+                continue
+            candidate = (buf + " " + s).strip() if buf else s
+            if len(candidate) <= max_chars:
+                buf = candidate
+            else:
+                chunks.append(buf)
+                buf = s
+        if buf:
+            chunks.append(buf)
+
+    merged: List[str] = []
+    for c in chunks:
+        if merged and len(c) < min_chars and len(merged[-1]) + len(c) + 1 <= max_chars:
+            merged[-1] = merged[-1] + " " + c
+        else:
+            merged.append(c)
+    return [m for m in merged if m]
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +292,19 @@ def hybrid_search(
         content = row["content"]
         rec_id = row["id"]
 
+        # Include turn_id so callers (server /search route) can reassemble
+        # Q-A pairs by fetching all siblings with the same turn_id.
+        try:
+            tid = row["turn_id"]
+        except (KeyError, IndexError):
+            tid = None
+
         results.append({
             "id": rec_id,
             "content": content,
             "score": round(score, 4),
             "timestamp": ts,
+            "turn_id": tid,
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
