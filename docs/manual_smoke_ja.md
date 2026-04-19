@@ -57,9 +57,4 @@ python scripts/smoke_ja.py --quick
 
 修正後は必ずスモークを再実行し、緑を確認してから作業を続けること。
 
-## SessionStart 自動実行 (層 4)
-
-`.claude/settings.json` の `hooks.SessionStart` で `smoke_ja.py --quick` が自動
-実行されます。セッション開始時にサーバ疎通と encoding 経路を +2〜3 秒で確認
-し、失敗すれば警告を surface します。Claude の判断を経由しないため、最も
-強固な再発防止層です。
+> **注記**: 以前は `.claude/settings.json` の `hooks.SessionStart` で本スモークを自動起動する「層 4」を推奨していましたが、Claude Code のセッション開始直後にサーバが未起動だと毎回赤字の起動エラーを吐いて使い勝手を損なうため、**自動起動は廃止**しました。スモークは開発者が `python scripts/smoke_ja.py --quick` を手動実行する運用に統一します。
