@@ -115,24 +115,24 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 | ID | Stored in | Generated | Granularity | Purpose |
 |---|---|---|---|---|
 | `id` (PK) | DB record | Per record (UUIDv7, time-ordered) | **One record** | Unique identifier for each memory — used for deletion and dedup |
-| `owner_id` | `config.json` | First startup (UUIDv4) | **Owner** | Identifies whose data this is — for shared/multi-user scenarios |
-| `local_id` (agent_id) | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups. Stored on every record. **In Free, `b_local` is unused (always 1.0)** — the local-bias multiplier is a Pro feature; see "Search ranking bias" below |
-| `session_id` | In-memory | Per server startup (UUIDv4) | **Server process** | Identifies which server session (stored for compatibility; not used in ranking in the Free edition) |
-| `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for (agent_id) (e.g. `"claude-code"`) |
+| `owner_id` | `config.json` | First startup (UUIDv4) | **Owner / N3MC server** | Identifies the N3MC FastAPI instance / data owner — used for shared/multi-user scenarios and import provenance |
+| `session_id` | In-memory or supplied by host | Per task / project / conversation (UUIDv4) | **Task / project / conversation** | Groups memories that belong to one task, project, or conversation thread so they surface together. Hosts that expose a session identifier (e.g. n3memory-lite assigns task numbers; an Ollama-style chat picker, etc.) pass it in via the API. Clients that cannot read a host session id (Claude Code) generate a fresh UUIDv4 at server startup as a per-process fallback. Drives the `b_session` ranking bias in Free and Pro |
+| `local_id` (agent_id) | `config.json` / API | First startup (UUIDv4), or per request | **Agent / install** | UUIDv4 identifier for the speaking agent (one Claude Code install = one `local_id`; different agents on the same DB get different UUIDs). Stored on every record. **In Free, `b_local` is unused (always 1.0)** — the per-agent ranking multiplier is a Pro feature; see "Search ranking bias" below |
+| `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for the agent (e.g. `"claude-code"`) |
 
 **Hierarchy relationship:**
 
 ```
-owner_id  (one user)
-  └── local_id  (agent's UUIDv4 identifier)
-        ├── agent_name  (its display name: "claude-code", etc.)
-        └── session_id  (one server startup)
+owner_id  (one N3MC server / data owner)
+  └── session_id  (one task / project / conversation)
+        └── local_id  (the speaking agent within that session)
+              ├── agent_name  (its display name: "claude-code", etc.)
               └── id  (one memory record)
 ```
 
 **Search ranking bias (Free edition):**
-- `session_id` — stored but **not used in Free edition ranking**. Session bias (`b_session`) is a Pro feature.
-- `local_id` — stored but **not used in Free edition ranking**. Local bias (`b_local`) is a Pro feature; in Free, `b_local` is always 1.0 regardless of match/mismatch. The Pro edition applies `b_local = 1.0` on match and `b_local = 0.6` on mismatch to prioritize same-environment memories.
+- `session_id` match → `b_session = 1.0` (mismatch or NULL: `0.6`) — **groups conversation by task / project**, so memories from the ongoing exchange rank above unrelated past sessions. This is Free's primary ranking signal beyond similarity and freshness.
+- `local_id` — stored but **not used in Free edition ranking**. Local bias (`b_local`) is a Pro feature; in Free, `b_local` is always 1.0 regardless of match/mismatch. The Pro edition applies `b_local = 1.0` on match and `b_local = 0.8` on mismatch to additionally prioritize the agent's own memories over those from other agents on the same DB.
 
 ### Embeddings
 - Model: `intfloat/e5-base-v2` / Vector: float[768]
@@ -204,6 +204,7 @@ On `--buffer` or API-based saves, complete INSERT and COMMIT at that instant.
 - **Local ID**: Generate a UUIDv4 on first launch (if absent from `config.json`) and save it persistently. Identifier for the N3MC installation (or agent). Stamp it on every record. For multi-agent scenarios, the `/buffer` API accepts a `local_id` parameter to specify an agent-specific UUIDv4 (falls back to config.json value when omitted).
   - **Use cases**: Multiple Claude Code installations (each machine or install gets its own `local_id`); different agents sharing the same N3MC DB (e.g., Claude Code + CordX each run as separate instances with distinct `local_id`s); separating memories by agent type or project environment.
   - **Note**: In Free, `local_id` is stored per-record but not used in ranking. The `B_local` bias multiplier that prioritizes same-environment memories is a Pro feature.
+- **Session ID**: A grouping key for one task / project / conversation. **Resolution order**: (1) explicit `session_id` argument on the `/buffer` and `/search` API calls (highest priority — used by hosts that already track sessions, e.g. n3memory-lite assigns task numbers, an Ollama-style chat picker can pass the chat id); (2) `N3MC_SESSION_ID` environment variable; (3) per-process UUIDv4 generated at server startup (fallback for clients like Claude Code that cannot read a host session id). Stored on every record but **not persisted to `config.json`** — `session_id` is meant to identify a transient task / project, not a persistent installation. Drives the `b_session` ranking bias (match=1.0 / mismatch=0.6) so memories from the current task surface above unrelated past sessions.
 
 Complete `config.json` schema (auto-initialize any missing fields with the default values below):
 
@@ -239,7 +240,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 ### Ranking Formula
 
 ```
-Final Score = (cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay
+Final Score = (cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay × b_session
 ```
 
 **cos_sim (Mathematical Correctness)**:
@@ -332,7 +333,7 @@ fts_query = _quote_fts_query(query)
 
 During `--repair`, detect existing FTS records that were indexed with punctuation and re-register them with stripped text. This FTS cleaning runs as a **one-time migration**: after completion, create a marker file (`.memory/fts_punct_cleaned`). If the marker exists, skip the scan to avoid a full-table scan on every session start.
 
-**Score for FTS-only Hits**: Records that appear in FTS results but not in vector search results should be included in results with `cos_sim = 0.0` for integrated score calculation. The score ceiling is `0.3 × time_decay`, but they must not be excluded from ranking.
+**Score for FTS-only Hits**: Records that appear in FTS results but not in vector search results should be included in results with `cos_sim = 0.0` for integrated score calculation. The score ceiling is `0.3 × time_decay × b_session`, but they must not be excluded from ranking.
 
 **Vector Search owner_id Filter**: Since `search_vector` is a single-user system, no filtering by `owner_id` is performed. KNN search targets all records. (This is a deliberate design decision; multi-user support would require rework.)
 
@@ -341,6 +342,24 @@ During `--repair`, detect existing FTS records that were indexed with punctuatio
 $$time\_decay = 2^{-\frac{days\_elapsed}{half\_life\_days}}$$
 
 `days_elapsed` is the elapsed days (floating point) since the record's creation timestamp. Use the `half_life_days` value from `config.json` (default 90).
+
+**Bias coefficients (Free edition)**:
+
+| Bias | Condition | Coefficient (fixed value) |
+| :--- | :--- | :---: |
+| **$b_{session}$** | Matches current `session_id` | **1.0** |
+| | Mismatch or NULL | **0.6** |
+
+- `b_session` is the **only** bias multiplier in Free. It groups memories that belong to the same task / project / conversation, so the ongoing exchange surfaces above unrelated past sessions. The stronger `0.6` mismatch penalty makes the current session the primary ranking signal beyond raw similarity and freshness.
+- Bias coefficients are fixed values and cannot be changed via the configuration file.
+- Compute using a SQL `CASE` expression to minimize post-processing on the Python side:
+
+```sql
+-- Skeleton for score calculation
+CASE WHEN session_id = :current_session THEN 1.0 ELSE 0.6 END AS b_session
+```
+
+- `b_local` (agent / installation grouping) is **not** applied in Free — every record is treated as `b_local = 1.0` regardless of match. The `B_local` multiplier that separates memories per agent / install is a **Pro feature**; in Pro it applies `b_local = 1.0` on match and `b_local = 0.8` on mismatch.
 
 ### Clean CLI
 Completely silence model load warnings and similar output. When launching the FastAPI server as a subprocess from `n3memory.py`, redirect `stderr` as follows (handled internally, not by the caller):
