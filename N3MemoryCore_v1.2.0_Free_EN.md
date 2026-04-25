@@ -442,6 +442,14 @@ Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) 
 
 Register hooks in the **global settings** using absolute paths so they apply to all sessions. Register permissions in the project settings.
 
+> **🛑 [Mandatory automated step] Hook registration is NOT optional and NOT user-deferred**
+>
+> The single most common reason cross-session RAG fails to work after a "successful" install is that the AI implementing this spec generated all the Python code, started the server, ran `--buffer` / `--search` smoke tests successfully — and then **left the `~/.claude/settings.json` hook block to the user** (or skipped it because it touches a global config file). When this happens, every subsequent Claude Code session running outside the project directory has **zero hooks firing**, so no conversation gets auto-saved and no `--search` runs at the start of each turn. The user sees the smoke test pass, believes the install is complete, and discovers months later that nothing they said to Claude was ever recorded.
+>
+> **The AI implementing this spec MUST write the hook block in §4 ① below into `~/.claude/settings.json` idempotently as part of the automated implementation, before reporting completion.** Do not ask the user to do it manually. Do not output the block as a "next step" instruction. Do not skip it because it modifies a global file. The merge is read-modify-write JSON with field preservation; see "Idempotent Hook Installation Algorithm" below.
+>
+> Verification gate (also see §6 test 7): the implementation is **not** complete until `python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook.py' in c.get('command','') for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook.py' in c.get('command','') for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"` prints `OK`.
+
 ### ① Global Settings (`~/.claude/settings.json`) — Hook Registration
 
 > Replace `{full path to N3MemoryCore}` with the actual installation path (e.g., `C:/Users/you/Claude Code/N3MemoryCore`).
@@ -478,6 +486,41 @@ Register hooks in the **global settings** using absolute paths so they apply to 
   }
 }
 ```
+
+#### Idempotent Hook Installation Algorithm (mandatory)
+
+The AI implementing this spec must execute logic equivalent to the following against `~/.claude/settings.json`. The merge **preserves all existing fields** (`permissions`, `autoUpdatesChannel`, anything else the user has) and only adds the two hook entries if they are missing. Re-running the algorithm on an already-installed environment is a no-op.
+
+```python
+# install_hooks.py — runnable equivalent of the mandatory step
+import json, os, pathlib
+
+N3MC_ROOT = "{full path to N3MemoryCore}"  # e.g. "E:/N3DEV/n3mc-free"  (forward slashes!)
+SETTINGS  = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
+
+settings = json.loads(SETTINGS.read_text(encoding="utf-8")) if SETTINGS.exists() else {}
+hooks = settings.setdefault("hooks", {})
+
+def ensure(event, script_basename):
+    entries = hooks.setdefault(event, [])
+    target_cmd = f"python '{N3MC_ROOT}/{script_basename}'"
+    # Already present (any matcher) → no-op
+    for entry in entries:
+        for h in entry.get("hooks", []):
+            if script_basename in h.get("command", ""):
+                return
+    entries.append({"matcher": "", "hooks": [{"type": "command", "command": target_cmd}]})
+
+ensure("UserPromptSubmit", "n3mc_hook.py")
+ensure("Stop",             "n3mc_stop_hook.py")
+
+SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+```
+
+- **Why match by script basename, not full command string**: the user may have moved the install root or fixed a path typo; matching on `n3mc_hook.py` / `n3mc_stop_hook.py` keeps the algorithm idempotent across path edits without creating duplicates.
+- **Do NOT use `git add`-style trust** (`if "hooks" not in settings: settings["hooks"] = {...}`): an empty `hooks: {}` key still passes that check and the user ends up with no hooks. Always inspect the inner arrays.
+- **Cross-platform path**: forward slashes only inside the `command` string, even on Windows. The bash shell Claude Code spawns interprets backslashes as escape sequences (`\n` → newline).
 
 ### ② Project Settings (`.claude/settings.json`) — Permission Registration
 
@@ -692,8 +735,13 @@ After implementation is complete, autonomously resolve the following tests and r
    - Running `--repair` again skips FTS cleaning (full-table scan is avoided due to the marker)
 
 7. **Hook integration test**: Verify the following within a Claude Code session:
-   1. **UserPromptSubmit**: After a user message, confirm that `--search` results are written to `memory_context.md`. Confirm that both the preceding Claude response and the user message are saved to the DB (check `--list` for records with `[claude]` and `[user]` prefixes).
-   2. **Stop**: After session termination, confirm that Claude's final response is saved to the DB. Confirm that `.claude/CLAUDE.md` contains an `@import` line pointing to `memory_context.md`.
+   1. **Global hook registration is in place** (mandatory gate — see §4 ① "Mandatory automated step"). Run:
+      ```bash
+      python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook.py' in c.get('command','') for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook.py' in c.get('command','') for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+      ```
+      Pass criterion: prints `OK`. If this assertion fails, **the implementation is not complete** — re-run the idempotent installer in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
+   2. **UserPromptSubmit**: From a Claude Code session running **outside the N3MemoryCore project directory** (e.g. `~`), send a user message and confirm that `--search` results are written to `memory_context.md`. Confirm that both the preceding Claude response and the user message are saved to the DB (check `--list` for records with `[claude]` and `[user]` prefixes). The "outside the project directory" stipulation is essential — running the test from inside the project would mask a missing global registration.
+   3. **Stop**: After session termination of that same outside-the-project session, confirm that Claude's final response is saved to the DB. Confirm that `.claude/CLAUDE.md` contains an `@import` line pointing to `memory_context.md`.
 
 8. **memory_context.md dual output test**: Run `--search` and confirm that results are **printed to stdout** AND **written to `N3MemoryCore/.memory/memory_context.md`**. If only one output channel works, the test fails.
 

@@ -438,6 +438,17 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 フックは**グローバル設定**に絶対パスで登録し、全セッションで有効化する。パーミッションはプロジェクト設定に登録する。
 
+> **🛑 【必須・自動実行ステップ】フック登録は省略不可・ユーザー保留不可**
+>
+> 「インストール成功したのにセッション間 RAG が機能しない」という症状の最大の原因は、本指示書を実装する AI が Python コード一式を生成し、サーバを起動し、`--buffer` / `--search` のスモークテストを通したところで**`~/.claude/settings.json` のフック登録だけユーザー任せにする**（あるいはグローバル設定ファイルに触れることを避けてスキップする）ケースである。これが起こると、プロジェクトディレクトリの外で起動した Claude Code セッションでは**フックが一切発火せず**、毎ターンの `--search` も、会話の自動保存も、何ひとつ走らない。ユーザーはスモークテストの成功画面を見て「セットアップ完了」だと信じ込み、数ヶ月後になって「Claude に話した内容がひとつも記録されていなかった」と気付くことになる。
+>
+> **本指示書を実装する AI は、§4 ① の hook ブロックを `~/.claude/settings.json` に冪等にマージする処理を、完了報告の前に必ず自動で実行すること。** ユーザーに手動編集を依頼してはならない。「次のステップとしてユーザーが追記」のような出力もしてはならない。「グローバル設定ファイルだから触れない」という理由でスキップしてもならない。マージは JSON の read-modify-write（既存フィールドは保全）で行う。具体は下記「冪等フック登録アルゴリズム」を参照。
+>
+> 検証ゲート（§6 テスト 7 と同等）: 以下が `OK` を出力するまで実装は**完了していない**:
+> ```bash
+> python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook.py' in c.get('command','') for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook.py' in c.get('command','') for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+> ```
+
 ### ① グローバル設定（`~/.claude/settings.json`）— フック登録
 
 > `{N3MemoryCoreのフルパス}` を実際のインストールパスに置き換えること（例: `C:/Users/you/Claude Code/N3MemoryCore`）。
@@ -474,6 +485,41 @@ db_path = base_dir + "\\data\\memory.db" # NG
   }
 }
 ```
+
+#### 冪等フック登録アルゴリズム（必須）
+
+本指示書を実装する AI は、`~/.claude/settings.json` に対して以下と等価な処理を実行すること。マージは**既存フィールド（`permissions`、`autoUpdatesChannel`、ユーザーが入れている任意のキー）をすべて保全**し、足りない 2 件のフックエントリのみを追記する。既に登録済みの環境で再実行しても何も変わらない（no-op）。
+
+```python
+# install_hooks.py — 必須ステップの実行可能版
+import json, os, pathlib
+
+N3MC_ROOT = "{N3MemoryCoreのフルパス}"  # 例: "E:/N3DEV/n3mc-free" （フォワードスラッシュ厳守）
+SETTINGS  = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
+
+settings = json.loads(SETTINGS.read_text(encoding="utf-8")) if SETTINGS.exists() else {}
+hooks = settings.setdefault("hooks", {})
+
+def ensure(event, script_basename):
+    entries = hooks.setdefault(event, [])
+    target_cmd = f"python '{N3MC_ROOT}/{script_basename}'"
+    # 既に登録済み（matcher 問わず）→ no-op
+    for entry in entries:
+        for h in entry.get("hooks", []):
+            if script_basename in h.get("command", ""):
+                return
+    entries.append({"matcher": "", "hooks": [{"type": "command", "command": target_cmd}]})
+
+ensure("UserPromptSubmit", "n3mc_hook.py")
+ensure("Stop",             "n3mc_stop_hook.py")
+
+SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+```
+
+- **なぜ完全コマンド文字列ではなくスクリプト basename で照合するのか**: ユーザーがインストール先を移動したりパスタイポを修正した場合に、`n3mc_hook.py` / `n3mc_stop_hook.py` での照合なら重複登録せず冪等性を保てる。
+- **「`hooks` キーが無ければ `{...}` を入れる」だけの判定はダメ**: 空の `hooks: {}` が既に存在するケースで素通りし、結果フックが入らないままになる。必ず内側の配列まで点検すること。
+- **クロスプラットフォームのパス**: Windows でも `command` 文字列の中はフォワードスラッシュ厳守。Claude Code が起動する bash シェルはバックスラッシュをエスケープシーケンス（`\n` → 改行）として解釈する。
 
 ### ② プロジェクト設定（`.claude/settings.json`）— パーミッション登録
 
@@ -686,8 +732,13 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
    - 再度 `--repair` を実行しても FTS クリーニングがスキップされること（マーカーにより全件スキャンが回避される）
 
 7. **フック統合テスト**: Claude Code のセッション内で以下を確認せよ。
-   1. **UserPromptSubmit**: ユーザーが発言した後、`--search` の結果が `memory_context.md` に書き込まれていること。直前の Claude 回答とユーザー発言の両方が DB に保存されていること（`--list` で `[claude]`・`[user]` プレフィックス付きレコードを確認）。
-   2. **Stop**: セッション終了後、Claude の最終回答が DB に保存されていること。`.claude/CLAUDE.md` に `memory_context.md` への `@import` 行が存在すること。
+   1. **グローバルフック登録の存在確認**（必須ゲート — §4 ①「必須・自動実行ステップ」参照）。以下を実行:
+      ```bash
+      python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook.py' in c.get('command','') for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook.py' in c.get('command','') for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+      ```
+      合格基準: `OK` が出力されること。失敗した場合は**実装が完了していない** — §4 ① の冪等インストーラを再実行してから次のサブテストへ進むこと。このゲートを飛ばすと、プロジェクトディレクトリ内で実行する次の 2 サブテストは（ローカルフックや手動実行のおかげで）通ってしまうが、ユーザーが他のディレクトリで開くセッションでは静かに発火しない — まさにこのゲートが防ぎたい「セッション間 RAG が機能しない」事故が温存される。
+   2. **UserPromptSubmit**: **N3MemoryCore プロジェクトディレクトリの外**（例: `~`）で起動した Claude Code セッションからユーザー発言を送り、`--search` の結果が `memory_context.md` に書き込まれていること。直前の Claude 回答とユーザー発言の両方が DB に保存されていること（`--list` で `[claude]`・`[user]` プレフィックス付きレコードを確認）。「プロジェクト外で実行する」ことが必須 — プロジェクト内で実行するとグローバル登録の欠落を見逃す。
+   3. **Stop**: 同じプロジェクト外セッションを終了した後、Claude の最終回答が DB に保存されていること。`.claude/CLAUDE.md` に `memory_context.md` への `@import` 行が存在すること。
 
 8. **memory_context.md 二重出力テスト**: `--search` を実行し、結果が **stdout に出力される**と同時に `N3MemoryCore/.memory/memory_context.md` にも**ファイル書き込みされる**ことを確認せよ。どちらか一方のみの場合は不合格とする。
 
