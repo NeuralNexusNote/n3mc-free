@@ -210,3 +210,6 @@ config.json
 
 # N3MC local memory (personal data)
 .memory/
+
+# Claude Code per-user permissions (auto-grown during interactive sessions)
+.claude/settings.local.json
