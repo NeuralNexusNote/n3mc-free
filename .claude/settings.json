@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *n3memory.py* --search *)",
+      "Bash(python *n3memory.py* --stop*)",
+      "Bash(python *n3memory.py* --repair*)",
+      "Bash(python *n3memory.py* --list*)",
+      "Bash(python *n3mc_hook.py*)",
+      "Bash(python *n3mc_stop_hook.py*)"
+    ]
+  }
+}
