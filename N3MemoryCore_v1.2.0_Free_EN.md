@@ -116,7 +116,7 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 |---|---|---|---|---|
 | `id` (PK) | DB record | Per record (UUIDv7, time-ordered) | **One record** | Unique identifier for each memory — used for deletion and dedup |
 | `owner_id` | `config.json` | First startup (UUIDv4) | **Owner** | Identifies whose data this is — for shared/multi-user scenarios |
-| `local_id` (agent_id) | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups. Used for `b_local` search bias |
+| `local_id` (agent_id) | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups. Stored on every record. **In Free, `b_local` is unused (always 1.0)** — the local-bias multiplier is a Pro feature; see "Search ranking bias" below |
 | `session_id` | In-memory | Per server startup (UUIDv4) | **Server process** | Identifies which server session (stored for compatibility; not used in ranking in the Free edition) |
 | `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for (agent_id) (e.g. `"claude-code"`) |
 
@@ -130,9 +130,9 @@ owner_id  (one user)
               └── id  (one memory record)
 ```
 
-**Search ranking bias:**
+**Search ranking bias (Free edition):**
 - `session_id` — stored but **not used in Free edition ranking**. Session bias (`b_session`) is a Pro feature.
-- `local_id` match → `b_local = 1.0` (mismatch: `0.6`) — prioritizes local data
+- `local_id` — stored but **not used in Free edition ranking**. Local bias (`b_local`) is a Pro feature; in Free, `b_local` is always 1.0 regardless of match/mismatch. The Pro edition applies `b_local = 1.0` on match and `b_local = 0.6` on mismatch to prioritize same-environment memories.
 
 ### Embeddings
 - Model: `intfloat/e5-base-v2` / Vector: float[768]
@@ -261,7 +261,7 @@ $$keyword\_relevance = \frac{-bm25\_score}{\max(1.0,\ \max_{results}(-bm25\_scor
 
 If the search returns 0 results, set `keyword_relevance = 0.0`.
 
-**FTS5 Table Definition**: Always create the FTS5 virtual table with `tokenize='porter unicode61'`. `content_rowid='rowid'` references the **implicit INTEGER rowid** that SQLite automatically assigns to the `memories` table (distinct from the UUID primary key). After INSERT, retrieve this value via `cursor.lastrowid` for use in FTS5 association:
+**FTS5 Table Definition**: Always create the FTS5 virtual table with `tokenize='porter unicode61'`. **Use a standalone (non-`content=`) FTS5 table** — do NOT use the external-content variant (`content='memories', content_rowid='rowid'`). External-content FTS5 does not support the natural `DELETE FROM memories_fts WHERE rowid = ?` pattern required by `delete_memory` and the `--repair` migration loops; it requires a `INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', ?, ?)` ritual instead, and getting that wrong corrupts the FTS index ("database disk image is malformed"). The standalone form keeps a private FTS shadow whose rowid we align with `memories.rowid` ourselves: after `INSERT INTO memories(...)`, retrieve `cursor.lastrowid` and pass it to `INSERT INTO memories_fts(rowid, content) VALUES (?, ?)`.
 
 ```sql
 -- memories table (UUIDv7 as primary key; rowid is implicitly managed by SQLite)
@@ -275,11 +275,9 @@ CREATE TABLE memories (
     -- SQLite automatically assigns an implicit INTEGER rowid to every table
 );
 
--- FTS5 uses the implicit rowid of memories as a foreign key
+-- FTS5 standalone — rowid alignment with memories.rowid is maintained manually
 CREATE VIRTUAL TABLE memories_fts USING fts5(
     content,
-    content='memories',
-    content_rowid='rowid',
     tokenize='porter unicode61'
 );
 
@@ -355,20 +353,22 @@ subprocess.Popen([sys.executable, server_path], stderr=subprocess.DEVNULL, ...)
 - `subprocess.DEVNULL` is a standard constant since Python 3.3. No OS-dependent path needed and no file handle leaks.
 - The caller (e.g., hooks in `settings.json`) does not need to add any redirects.
 
-**Character Encoding (UTF-8)**: At the start of `main()` in `n3memory.py`, execute the following to resolve character corruption in Windows cp932 environments from within the program itself:
+**Character Encoding (UTF-8)**: At the start of `main()` in `n3memory.py`, **AND at module top of `n3mc_hook.py` and `n3mc_stop_hook.py`** (before any `sys.stdin.read()` or `subprocess.run` invocation), execute the following to resolve character corruption in Windows cp932 environments from within the program itself:
 
 ```python
-if hasattr(sys.stdin, 'reconfigure'):
-    sys.stdin.reconfigure(encoding='utf-8')
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8')
+for _stream_name in ("stdin", "stdout", "stderr"):
+    _s = getattr(sys, _stream_name, None)
+    if _s is not None and hasattr(_s, 'reconfigure'):
+        try:
+            _s.reconfigure(encoding='utf-8')
+        except Exception:
+            pass
 ```
 
 - With this, the caller does not need to specify `python -X utf8`.
 - `reconfigure` is available from Python 3.7 onward. For older environments, use the `PYTHONUTF8=1` environment variable as an alternative.
 - All multilingual text (Japanese, English, Chinese, etc.) is unified as UTF-8.
+- ⚠️ **The reconfigure block is required in EVERY Python entry point that reads stdin or pipes stdin into a subprocess** — that includes `n3memory.py`, `n3mc_hook.py`, AND `n3mc_stop_hook.py`. Forgetting it on any one of them silently mojibakes non-ASCII input on Windows (Japanese, em-dashes, etc.); the corrupted bytes are then persisted to `audit.log` and the DB and cannot be recovered. Run the block at module top in the hooks (not inside `main()`) so it precedes the first `sys.stdin.read()`.
 
 **Path Portability**: All file path construction in Python code must use `os.path.join()` or `pathlib.Path`. Hardcoded path separator characters (`\` or `/` as string literals in path construction) are prohibited. The system must run on Windows, macOS, and Linux without code changes.
 
@@ -537,6 +537,16 @@ echo '{"message":"user input","last_assistant_message":"Claude response"}' | pyt
 
 Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` fields. Performs all UserPromptSubmit operations in a single process via HTTP requests to the server: `--repair` → `--buffer` (save Claude's response) → `--search` → `--buffer` (save user message). Called by `n3mc_hook.py`; the AI does not need to run this manually. All records saved by this hook are automatically tagged with `agent_name = "claude-code"`.
 
+### `--save-claude-turn` (Stop Hook Helper)
+
+```bash
+echo '{"session_id":"...","stop_hook_active":true,"last_assistant_message":"Claude response text"}' | python n3memory.py --save-claude-turn
+```
+
+Reads the same Stop-hook JSON from stdin, extracts `last_assistant_message`, applies `chunk_text(max_chars=400, overlap=40)`, and saves each chunk as a `[claude]` / `[claude i/N]` record via HTTP `/buffer` calls in a single process. The `turn_id` is read from `.memory/turn_id.txt` (set earlier by `--hook-submit` when it saved the user message); after the save loop the file is cleared. If the file is missing, a fresh UUID4 turn_id is generated. Called by `n3mc_stop_hook.py` only; the AI does not invoke this manually.
+
+> **Why a dedicated subcommand and not `--buffer -`?** The Stop hook itself reads stdin to extract the JSON envelope; using `--buffer -` would either double-consume stdin or require N subprocess invocations (one per chunk). `--save-claude-turn` performs all chunked saves in a single process, in order, sharing one HTTP keep-alive to the resident server, and it is the canonical "buffer" call referenced in the per-turn subprocess count below.
+
 ### Response Format
 
 ```json
@@ -583,7 +593,11 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 
 - **[Automated] Auto-repair, search, and conversation saving**: The `UserPromptSubmit` hook (`n3mc_hook.py`) calls `--hook-submit`, which performs the following steps in a single process. **Step 0 — audit log (always first)**: before anything else, every hook invocation appends one JSON record `{"ts", "hook", "raw", "payload"}` to the append-only `<N3MC-root>/.memory/audit.log`. This is the last-resort authoritative transcript; it is written BEFORE anything can fail, so even if every later step errors out, the raw input is preserved. Then: `--repair` (fix unindexed data), `--buffer` (auto-save Claude's previous response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records), `--search` (retrieve memories), and `--buffer` (auto-save the user message with complete preservation — chunked and saved as `[user]` / `[user i/N]` records). **No length filter, no skip-pattern filter**: every non-empty input is recorded character-for-character with no truncation. When Claude Code passes an image+text prompt, the `prompt` field may be a JSON array; `_extract_text()` extracts only `type=="text"` parts. If the result is empty (image-only prompt), only Step 4 (user save) is skipped because there is no user text to record — repair, Claude-turn save, search, and the audit-log entry still run. The raw multimodal payload is captured in `audit.log`.
 - **[Implementation Spec] Hook subprocess execution method (must not be changed)**: Subprocess calls within `n3mc_hook.py` and `n3mc_stop_hook.py` must use **`subprocess.run` (synchronous/blocking)**, waiting for each command to complete before proceeding to the next. **Do not use `Popen` (async/fire-and-forget).** **Reason**: `--repair` → `--search` has an execution order dependency (search results are incomplete if repair hasn't finished). Additionally, if control returns to Claude before `--search` finishes writing to `memory_context.md`, the search results cannot be read. Asynchronizing for speed destroys data integrity and search accuracy. Note: only the FastAPI server startup (§3 Clean CLI) uses `Popen` (since it does not need to wait for startup to complete).
-- **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3mc_stop_hook.py`) first writes its Step 0 audit-log record, then automatically saves Claude's last response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records. No length filter is applied; every non-empty response is recorded. It also executes `--stop` (@import setup in CLAUDE.md). Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (buffer + stop) = 3 calls.
+- **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3mc_stop_hook.py`) first writes its Step 0 audit-log record (in-process), then invokes two synchronous subprocesses in order:
+  1. `python n3memory.py --save-claude-turn` (stdin = Stop-hook JSON) — chunked save of `last_assistant_message` with `[claude]` / `[claude i/N]` prefixes, sharing the existing turn_id for Q-A pairing. No length filter is applied; every non-empty response is recorded. **Do not use `--buffer -` here**: the Stop hook already consumed stdin to write the audit log.
+  2. `python n3memory.py --stop` — idempotent `@import` setup in `.claude/CLAUDE.md` (see "`--stop` Hook Specification" above).
+
+  Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (`--save-claude-turn` + `--stop`) = 3 calls.
 - **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records. Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired.
 - **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. **Every non-empty user message and every non-empty Claude response is recorded in FULL, character-for-character, with no truncation.** There is no length filter (the previous `len(text) >= 10` / `>= 3` thresholds are REMOVED) and no skip-pattern filter (the previous `_SKIP_PATTERNS` "ok / yes / thanks" routine-response filter is REMOVED). Short acknowledgements such as `ok` or `yes` are now recorded like any other input.
 - **[AI Behavioral Guidelines] Silence on successful save**: When a save succeeds, make no report or acknowledgment — maintain silence.
@@ -592,6 +606,12 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[AI Behavioral Guidelines] Active RAG**: When knowledge is insufficient, proactively execute `--search` to retrieve relevant memories. The command is auto-approved via `permissions.allow` — no confirmation needed.
 - **[AI Behavioral Guidelines] Recall acknowledgment**: When `--search` results **actually shape your reply** (you are recalling information saved in an earlier turn), open the reply with a short acknowledgment **in the user's language**, e.g. Japanese 「前回の回答がメモリに保存されています。」 or English "Pulling this from earlier memory in this session." **If no relevant memory was found, or if retrieved snippets did not influence your answer, do not announce anything.** Never announce the mere act of searching — only the act of recalling. This lets the user see the memory layer is alive each turn.
 - **[Implementation Spec] Context injection (both stdout and file are required)**: `--search` results must be **printed to stdout via `print()`** and simultaneously **written to file** `N3MemoryCore/.memory/memory_context.md`. **Both must be performed.** Without stdout output, Claude cannot see the search results and will respond "I don't have that memory" even when the data exists in the DB. File write alone does not deliver results to Claude.
+- **[Implementation Spec] Memory-context freshness on every invocation (no stale context)**: `cmd_search` MUST overwrite `memory_context.md` and print to stdout on **every** invocation, regardless of outcome. Failure paths emit a degraded-state placeholder so Claude does not silently consume last turn's results as if they were current:
+  - **Empty query** (image-only prompt, or `--search ""`) → write `# Recalled Memory Context\n\n_No relevant memories found._\n` and print it to stdout. Empty does not mean "skip the write" — the write IS the signal that no relevant memory exists for this turn.
+  - **Server unreachable / `/search` non-2xx error** → write `# Recalled Memory Context\n\n_(memory search unavailable: <reason>)_\n` and print it to stdout. This makes the memory layer's downtime visible to Claude rather than presenting last turn's results.
+  - **Successful results** → write the rendered markdown (Previous matching exchange(s) + Other memories) to both channels.
+
+  Stale `memory_context.md` from a prior turn becoming the new session's `@import`-resolved context is treated as a **correctness bug**, not a performance trade-off. The fresh write is mandatory on every `cmd_search` invocation, including via `--hook-submit` for image-only prompts (spec §5 "Image-only prompts still trigger ... search").
 - **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
 - **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | python n3memory.py --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id ID` argument to tag the record with the agent identifier (e.g., `python n3memory.py --buffer "text" --agent-id "claude-code"`).
 - **[Customization] Language localization**: Not applicable. Skip patterns (`_SKIP_PATTERNS`) have been REMOVED in favor of the complete-recording contract; there is nothing language-specific to localize in the hook filter layer.
@@ -623,13 +643,17 @@ After implementation is complete, autonomously resolve the following tests and r
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
 
-2. **Force-termination Test (Proof of Durability)**: Save one record via `--buffer`, immediately force-terminate the process (Ctrl+C), then physically prove that the record remains in the DB after restart by running `--list`. The output format for `--list` is as follows (one record per line, tab-separated):
+2. **Force-termination Test (Proof of Durability)**: Save one record via `--buffer`, immediately force-terminate the process (Ctrl+C), then physically prove that the record remains in the DB after restart by running `--list`. The output format for `--list` is as follows (one record per line, tab-separated, exactly four columns):
 
    ```
-   [UUIDv7]  [timestamp]  [agent_name]  [first 80 characters of content]
+   [UUIDv7]\t[timestamp]\t[agent_name]\t[first 80 characters of content]
    ```
 
-   Output the total record count `Total: N records` at the end. Statically confirm during code review that `write_buffer`, `batch_insert`, asynchronous writes, and deferred COMMITs are absent.
+   - The columns are joined with a single tab (`\t`) — the four spaces shown in earlier drafts of this spec were typographic, not literal.
+   - "First 80 characters of content" means `content[:80]` — the leading 80 characters of the **full content string**, NOT of the first line. Newlines (`\n`, `\r`) within those 80 characters MUST be replaced with a single space so the tab-separated layout stays on one line per record.
+   - If `agent_name` is `NULL`, render it as `-`.
+   - Output the total record count `Total: N records` at the end.
+   - Statically confirm during code review that `write_buffer`, `batch_insert`, asynchronous writes, and deferred COMMITs are absent.
 
 3. **Real Person Test (Historical Data)**: After saving text about a real historical figure, run `--search` with that person's name and confirm that the relevant record appears **within the top 3 results** as the pass criterion. Additionally, verify that `--search` results are **printed to stdout** (visible in the terminal). If stdout is empty and results are only written to `memory_context.md`, this test fails.
    - Japanese example: "坂本龍馬" (Sakamoto Ryoma)

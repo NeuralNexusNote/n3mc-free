@@ -116,7 +116,7 @@ N3MemoryCore は 5 つの ID フィールドで各レコードの出所と文脈
 |---|---|---|---|---|
 | `id` (PK) | DB レコード | レコード作成時 (UUIDv7, 時系列順) | **1 レコード** | 各記憶の一意識別子 — 削除・重複検出に使用 |
 | `owner_id` | `config.json` | 初回起動時 (UUIDv4) | **所有者** | データの所有者識別 — 共有・マルチユーザーシナリオ用 |
-| `local_id` (agent_id) | `config.json` | 初回起動時 (UUIDv4) | **エージェント / インストール** | エージェントの UUIDv4 識別子。マルチエージェント時は各エージェント固有の UUID を指定。検索バイアス `b_local` に使用 |
+| `local_id` (agent_id) | `config.json` | 初回起動時 (UUIDv4) | **エージェント / インストール** | エージェントの UUIDv4 識別子。マルチエージェント時は各エージェント固有の UUID を指定。レコードに保存される。**Free 版では `b_local` は無効（常に 1.0）** — local バイアス乗数は Pro 機能。下記「検索ランキングバイアス」を参照 |
 | `session_id` | メモリ内 | サーバー起動ごと (UUIDv4) | **サーバープロセス** | どのサーバーセッションか（互換性のため保存。Free版のランキングには使用しません） |
 | `agent_name` | DB レコード | バッファ呼び出し時 (任意文字列) | **エージェント表示名** | (agent_id) の人間可読なラベル（例：`"claude-code"`） |
 
@@ -130,9 +130,9 @@ owner_id  (1 人のユーザー)
               └── id  (1 件の記憶レコード)
 ```
 
-**検索ランキングバイアス：**
-- `session_id` — 保存のみ。**Free版のランキングでは使用しません**。セッションバイアス（`b_session`）はPro版の機能です。
-- `local_id` 一致 → `b_local = 1.0`（不一致: `0.6`）— 自環境のデータを優先
+**検索ランキングバイアス（Free版）：**
+- `session_id` — 保存のみ。**Free版のランキングでは使用しません**。セッションバイアス（`b_session`）は Pro 版の機能です。
+- `local_id` — レコードに保存されるが、**Free 版のランキングには使用されない**。ローカルバイアス（`b_local`）は Pro 機能であり、Free 版では一致／不一致に関わらず `b_local` は常に 1.0。Pro 版では一致時 `b_local = 1.0`、不一致時 `b_local = 0.6` を適用し、同一環境の記憶を優先する。
 
 ### 埋め込み
 - モデル: `intfloat/multilingual-e5-base` / ベクトル: float[768]
@@ -261,7 +261,7 @@ $$keyword\_relevance = \frac{-bm25\_score}{\max(1.0,\ \max_{results}(-bm25\_scor
 
 検索結果が0件の場合は `keyword_relevance = 0.0` とする。
 
-**FTS5 テーブル定義**: FTS5 仮想テーブルは必ず `tokenize='trigram'` を指定して作成せよ。`content_rowid='rowid'` は SQLite が `memories` テーブルに対して自動付与する **暗黙 INTEGER rowid** を参照する（UUID主キーとは別物）。INSERT後は `cursor.lastrowid` でこの値を取得し FTS5 との対応に使用すること:
+**FTS5 テーブル定義**: FTS5 仮想テーブルは必ず `tokenize='trigram'` を指定して作成せよ。**スタンドアロン形式（`content=` 句なし）の FTS5 を使うこと** — external-content 形式（`content='memories', content_rowid='rowid'`）は使ってはならない。external-content FTS5 は `delete_memory` および `--repair` のマイグレーションループで必要となる `DELETE FROM memories_fts WHERE rowid = ?` の自然な構文をサポートせず、代わりに `INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', ?, ?)` という特殊構文が必要。これを誤ると FTS インデックスが破損する（"database disk image is malformed" エラー）。スタンドアロン形式は `memories.rowid` と整合する rowid を持つプライベートな FTS シャドウを保持し、こちらが手動で揃える: `INSERT INTO memories(...)` の後 `cursor.lastrowid` を取得し、`INSERT INTO memories_fts(rowid, content) VALUES (?, ?)` に渡す。
 
 ```sql
 -- memories テーブル（UUIDv7 が主キー、rowid は SQLite が暗黙で管理）
@@ -275,11 +275,9 @@ CREATE TABLE memories (
     -- SQLite は全テーブルに暗黙の INTEGER rowid を自動付与する
 );
 
--- FTS5 は memories の暗黙 rowid を外部キーとして使用（trigram: 日本語対応の部分文字列マッチング）
+-- FTS5 スタンドアロン — memories.rowid との整合は手動維持（trigram: 日本語対応の部分文字列マッチング）
 CREATE VIRTUAL TABLE memories_fts USING fts5(
     content,
-    content='memories',
-    content_rowid='rowid',
     tokenize='trigram'
 );
 
@@ -351,20 +349,22 @@ subprocess.Popen([sys.executable, server_path], stderr=subprocess.DEVNULL, ...)
 - `subprocess.DEVNULL` は Python 3.3以降の標準定数。OS依存のパス指定不要でファイルハンドルリークもない。
 - 呼び出し側（settings.json の hooks 等）でリダイレクトを付与する必要はない。
 
-**文字コード（UTF-8）**: `n3memory.py` の `main()` 先頭で以下を実行し、Windows cp932 環境での文字化けをプログラム内部で解決せよ。
+**文字コード（UTF-8）**: `n3memory.py` の `main()` 先頭、**および `n3mc_hook.py` と `n3mc_stop_hook.py` のモジュール先頭**（`sys.stdin.read()` や `subprocess.run` の呼び出しより前）で以下を実行し、Windows cp932 環境での文字化けをプログラム内部で解決せよ。
 
 ```python
-if hasattr(sys.stdin, 'reconfigure'):
-    sys.stdin.reconfigure(encoding='utf-8')
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8')
+for _stream_name in ("stdin", "stdout", "stderr"):
+    _s = getattr(sys, _stream_name, None)
+    if _s is not None and hasattr(_s, 'reconfigure'):
+        try:
+            _s.reconfigure(encoding='utf-8')
+        except Exception:
+            pass
 ```
 
 - この処理により、呼び出し側が `python -X utf8` を指定する必要はない。
 - `reconfigure` は Python 3.7 以降で利用可能。それ以前の環境は `PYTHONUTF8=1` 環境変数を代替手段とする。
 - 多言語テキスト（日本語・英語・中国語 等）はすべて UTF-8 で統一する。
+- ⚠️ **stdin を読む／stdin を subprocess にパイプするすべての Python エントリポイントで reconfigure ブロックが必須** — `n3memory.py`、`n3mc_hook.py`、`n3mc_stop_hook.py` のいずれか一つでも忘れると、Windows で非 ASCII 入力（日本語、em-dash 等）が静かに mojibake し、その破損バイト列が `audit.log` と DB に永続化されて復元不能になる。フックスクリプトでは `main()` 内ではなく**モジュール先頭**に置くこと（最初の `sys.stdin.read()` より前に走らせるため）。
 
 **パスのポータビリティ**: Pythonコード内のファイルパス構築はすべて `os.path.join()` または `pathlib.Path` を使用すること。パス区切り文字（`\` や `/` の文字列リテラルによるパス構築）の直接使用は禁止する。本システムはコード変更なしに Windows・macOS・Linux で動作しなければならない。
 
@@ -533,6 +533,16 @@ echo '{"message":"ユーザー入力","last_assistant_message":"Claudeの回答"
 
 stdin から JSON を読み取り、`message`（または `prompt`）と `last_assistant_message` フィールドを使用する。単一プロセス内で HTTP リクエスト経由により全 UserPromptSubmit 処理を実行する：`--repair` → `--buffer`（Claude の回答を保存）→ `--search` → `--buffer`（ユーザー発言を保存）。`n3mc_hook.py` から呼び出される。AI が手動で実行する必要はない。このフックで保存される全レコードには `agent_name = "claude-code"` が自動タグ付けされる。
 
+### `--save-claude-turn`（Stop フック専用ヘルパー）
+
+```bash
+echo '{"session_id":"...","stop_hook_active":true,"last_assistant_message":"Claude の応答テキスト"}' | python n3memory.py --save-claude-turn
+```
+
+Stop フックと同じ JSON を stdin から読み取り、`last_assistant_message` を抽出して `chunk_text(max_chars=400, overlap=40)` で分割し、各チャンクを `[claude]` / `[claude i/N]` レコードとして HTTP `/buffer` 経由で単一プロセス内で保存する。`turn_id` は `.memory/turn_id.txt` から読み取り（直前の `--hook-submit` がユーザー発言を保存した際に書き込んだもの）、保存ループ後にファイルをクリアする。ファイルが無ければ新しい UUID4 turn_id を生成する。`n3mc_stop_hook.py` のみが呼び出すサブコマンドであり、AI が手動で実行する必要はない。
+
+> **なぜ `--buffer -` でなく専用サブコマンドなのか**: Stop フック自身が JSON エンベロープを読むために stdin を消費するため、`--buffer -` を使うと stdin の二重消費になるか、チャンクごとに subprocess を立ち上げる必要が生じる（N 回呼び出し）。`--save-claude-turn` はチャンク化された保存をすべて単一プロセス内で順序通り実行し、常駐サーバへの HTTP keep-alive を 1 本で共有する。下記「1ターンあたりの合計サブプロセス数」での「buffer」とはこの呼び出しを指す。
+
 ### レスポンス形式
 
 ```json
@@ -579,7 +589,11 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 - **【自動化】修復・検索・会話の自動保存**: `UserPromptSubmit` フック（`n3mc_hook.py`）は `--hook-submit` を呼び出し、単一プロセス内で以下を実行する。**Step 0 — 監査ログ（常に最初）**: すべてのフック呼び出しは、他の処理に先立って追記専用 `<N3MC-root>/.memory/audit.log` に JSON レコード `{"ts", "hook", "raw", "payload"}` を 1 件追加する。これは他のどの処理よりも前に書かれる「最後の砦」としての権威ある生ログであり、後続が全滅しても原文だけは残る。続けて：`--repair`（未ベクトル化修復）、`--buffer`（Claude の直前の回答を `chunk_text(max_chars=400, overlap=40)` で分割し `[claude]` / `[claude i/N]` で全文保存）、`--search`（記憶取得）、`--buffer`（ユーザー発言を同様に `[user]` / `[user i/N]` で全文保存）。**長さフィルタなし、スキップパターンフィルタなし**：空でない入力はすべて一字一句記録される。Claude Code が画像+テキストのプロンプトを渡す場合、`prompt` フィールドが JSON 配列になる場合がある。`_extract_text()` は `type=="text"` の部分のみを抽出する。結果が空（画像のみのプロンプト）の場合でも、repair・Claude 回答保存・search・監査ログ記録は実行され、Step 4（ユーザー保存）のみ、記録すべき本文がないためスキップする。生のマルチモーダルペイロードは `audit.log` に捕捉される。
 - **【実装仕様】フック内のサブプロセス実行方式（変更禁止）**: `n3mc_hook.py` および `n3mc_stop_hook.py` 内のサブプロセス呼び出しは **`subprocess.run`（同期・ブロッキング）** を使用し、各コマンドの完了を待ってから次を実行せよ。`Popen`（非同期・ファイアアンドフォーゲット）を使用してはならない。**理由**: `--repair` → `--search` には実行順序の依存関係がある（修復が完了しないと検索が不完全になる）。また `--search` の結果が `memory_context.md` に書き終わる前に Claude へ制御が戻ると、検索結果が読めない。速度向上を目的とした非同期化は、データの整合性と検索精度を破壊する。なお、FastAPI サーバーの起動（§3 Clean CLI）のみ `Popen` を使用する（起動完了を待つ必要がないため）。
-- **【自動化】Claude の回答の自動保存**: `Stop` フック（`n3mc_stop_hook.py`）はまず Step 0 の監査ログ記録を書き、続いて Claude の最終回答を `chunk_text(max_chars=400, overlap=40)` で分割し、`[claude]` / `[claude i/N]` プレフィックス付きで全文保存する。長さフィルタは適用せず、空でない回答はすべて記録する。同時に `--stop`（CLAUDE.md の @import 設定）を実行する。1ターンあたりの合計サブプロセス数: `UserPromptSubmit` × 1（`--hook-submit`）+ `Stop` × 2（buffer + stop）= 3回。
+- **【自動化】Claude の回答の自動保存**: `Stop` フック（`n3mc_stop_hook.py`）はまず Step 0 の監査ログ記録を書き（プロセス内で実行）、続いて以下の 2 つの同期サブプロセスを順番に呼び出す:
+  1. `python n3memory.py --save-claude-turn`（stdin = Stop フックの JSON）— `last_assistant_message` をチャンク化保存する。`[claude]` / `[claude i/N]` プレフィックス、既存の turn_id を引き継いで Q-A pairing を維持する。長さフィルタは適用せず、空でない回答はすべて記録する。**ここで `--buffer -` を使ってはならない**: Stop フックが既に stdin を audit.log 書き込みのために消費している。
+  2. `python n3memory.py --stop` — `.claude/CLAUDE.md` の `@import` 冪等セットアップ（上記「`--stop` フック仕様」参照）。
+
+  1ターンあたりの合計サブプロセス数: `UserPromptSubmit` × 1（`--hook-submit`）+ `Stop` × 2（`--save-claude-turn` + `--stop`）= 3 回。
 - **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。
 - **【AI行動指針】全自動保存**: 全会話はフック（UserPromptSubmit / Stop）により自動保存される。Claude が自分で判断して `--buffer` を手動呼び出しする必要はない。**空でないユーザー発言・Claude 回答はすべて、一字一句、切り捨てなしで記録される。** 長さフィルタ（旧 `len(text) >= 10` / `>= 3`）は**廃止**、スキップパターンフィルタ（旧 `_SKIP_PATTERNS`、「ok / yes / thanks」定型応答フィルタ）も**廃止**。`ok` や `yes` のような短い応答も他と同様に記録される。
 - **【AI行動指針】確定報告の沈黙**: 保存成功時は報告や挨拶を一切行わず、沈黙を守れ。
@@ -588,6 +602,12 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【AI行動指針】Active RAG**: 知識不足時、自発的に `--search` を実行せよ。`permissions.allow` により自動承認済み — 確認不要。
 - **【AI行動指針】想起時の明示**: `--search` の結果を**実際に応答に活用した**（以前保存された情報を想起して答えた）場合は、返答冒頭にユーザー言語で一言そえよ。例:「前回の回答がメモリに保存されています。」「以前の会話から該当情報を取り出しました。」／英語なら "Pulling this from earlier memory in this session."。**関連メモリが無かった / 取得内容を実際には使わなかった場合は告知しない。** 「検索した」ことではなく「想起した」ことだけを述べよ。これにより、ユーザーは記憶レイヤが生きていることを毎ターン視認できる。
 - **【実装仕様】文脈注入（stdout とファイルの両方が必須）**: `--search` の結果は **stdout に `print()` で出力**すると同時に `N3MemoryCore/.memory/memory_context.md` へ**ファイル書き込み**せよ。**両方を必ず行うこと**。stdout 出力がないと Claude が検索結果を認識できず、記憶があるにもかかわらず「記憶にありません」と応答する原因になる。ファイル書き込みのみでは Claude に結果が届かない。
+- **【実装仕様】memory_context の毎回更新（stale context 禁止）**: `cmd_search` は呼び出されるたびに、結果に関わらず `memory_context.md` を必ず上書きし、stdout にも必ず出力せよ。失敗パスでは「劣化状態を示すプレースホルダー」を出すことで、前ターンの結果が現ターンの結果のように Claude へ静かに供給されることを防ぐ:
+  - **空クエリ**（画像のみのプロンプト、または `--search ""`）→ `# Recalled Memory Context\n\n_No relevant memories found._\n` をファイルに書き、stdout にも出力する。空 = 「書き込みをスキップ」ではない。**空という事実を書き込むことが、当該ターンに関連メモリが無いというシグナルである**。
+  - **サーバ不通 / `/search` が非 2xx エラー** → `# Recalled Memory Context\n\n_(memory search unavailable: <reason>)_\n` をファイルに書き、stdout にも出力する。これによりメモリ層のダウンタイムが Claude に可視化され、前ターンの結果が誤って現行コンテキストとして扱われない。
+  - **検索成功** → レンダリング済み markdown（Previous matching exchange(s) + Other memories）を両チャネルに出力する。
+
+  前ターンの古い `memory_context.md` が次セッション開始時の `@import` で Claude のコンテキストになる事象は**正しさのバグ**として扱う（パフォーマンスのトレードオフではない）。`cmd_search` のすべての呼び出しで fresh write が必須。これは `--hook-submit` 経由の画像のみプロンプト時にも適用される（仕様§5「Image-only prompts still trigger ... search」）。
 - **【実装仕様】stdin 入力**: `--buffer` は引数の代わりに `-` を指定すると標準入力からテキストを読み取る（例: `cat file.txt | python n3memory.py --buffer -`）。ただし Stop フック（`n3mc_stop_hook.py`）内では `--buffer -` を使用してはならない。Stop フック自身が stdin から Claude Code の JSON を受け取るため、二重消費になり壊れる。オプションで `--agent-id ID` 引数を指定するとエージェント識別子をタグ付けできる（例: `python n3memory.py --buffer "テキスト" --agent-id "claude-code"`）。
 - **【実装仕様】複数行コードブロックは `[code omitted]` に置換される**: 複数行コードブロック（```...```）は文書設計に従い `[code omitted]` に置換される——N3MemoryCore は会話テキストを記録する製品であり、ソースコードは記録対象外。インラインコード（`...`）はそのまま保持。コード以外の会話テキストは長さフィルタ／スキップパターンフィルタなしで一字一句保存される（上記「完全記録契約」参照）。`purify_text` / `_purify` の `_CODE_BLOCK_RE` は閉じた複数行フェンスのみを置換し、インラインコードと未閉フェンスは触らない。
 - **【カスタマイズ】言語ローカライズ**: 該当なし。完全記録契約により `_SKIP_PATTERNS` は**廃止**され、フックフィルタ層に言語依存の対象は存在しない。
@@ -619,13 +639,17 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 1. **常駐速度 & プロセス管理**: `--search` の応答時間を計測し記録せよ（達成目標: CPU 環境で 2.0s 以内）。PIDファイルの生成・削除・再起動が正常に機能することを確認せよ。
 
-2. **強制終了テスト（Durabilityの証明）**: データを1件 `--buffer` で保存直後にプロセスを強制終了（Ctrl+C）し、再起動後に `--list` でそのレコードがDBに残留していることを物理的に証明せよ。`--list` の出力フォーマットは以下の形式とする（1件1行、タブ区切り）:
+2. **強制終了テスト（Durabilityの証明）**: データを1件 `--buffer` で保存直後にプロセスを強制終了（Ctrl+C）し、再起動後に `--list` でそのレコードがDBに残留していることを物理的に証明せよ。`--list` の出力フォーマットは以下の形式とする（1件1行、タブ区切り、4 カラム固定）:
 
    ```
-   [UUIDv7]  [timestamp]  [agent_name]  [先頭80文字のcontent]
+   [UUIDv7]\t[timestamp]\t[agent_name]\t[content の先頭 80 文字]
    ```
 
-   末尾に総件数 `Total: N records` を出力すること。コードレビュー時に `write_buffer`・`batch_insert`・非同期書き込み・遅延COMMITが存在しないことを静的に確認せよ。
+   - カラム間はシングルタブ（`\t`）で連結。本仕様の旧版に見られた半角空白 4 つは表記上のものであり、リテラルではない。
+   - 「content の先頭 80 文字」は `content[:80]` を意味する — **content 全体の先頭 80 文字**であり、「先頭行の 80 文字」ではない。その 80 文字内に改行（`\n`、`\r`）が含まれる場合は単一の半角スペースに置換し、タブ区切りレイアウトが 1 レコード = 1 行を保つようにすること。
+   - `agent_name` が `NULL` の場合は `-` を出力する。
+   - 末尾に総件数 `Total: N records` を出力すること。
+   - コードレビュー時に `write_buffer`・`batch_insert`・非同期書き込み・遅延COMMITが存在しないことを静的に確認せよ。
 
 3. **実在人物テスト（実在歴史データ）**: 実在の歴史人物に関するテキストを保存後、その人物名で `--search` を実行し、**検索結果の上位3件以内** に該当レコードが含まれることを合格基準とする。加えて、`--search` の結果が **stdout に出力されていること**（ターミナルに検索結果が表示されること）を確認せよ。stdout が空で `memory_context.md` のみに書き込まれている場合は不合格とする。
    - 日本語版の例: 「坂本龍馬」
