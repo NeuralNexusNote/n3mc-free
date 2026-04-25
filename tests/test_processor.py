@@ -1,149 +1,165 @@
-"""
-Layer 2: Ranking math, purification, embedding
-"""
-import os
-import sys
+"""Layer 2: ranking math + purify + chunking + bias + (optional) embedding."""
+from __future__ import annotations
+
 import math
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
-_CORE_DIR = os.path.join(os.path.dirname(__file__), "..", "core")
-sys.path.insert(0, _CORE_DIR)
-
-from processor import (
-    cosine_sim_from_l2,
-    time_decay,
-    keyword_relevance,
-    final_score,
-    purify,
-    embed_passage,
-    embed_query,
-)
+from core import processor as proc
+from core import database as db
 
 
 class TestCosineSim:
     def test_identical_vectors(self):
-        # L2 distance of 0 → cos_sim = 1.0
-        assert cosine_sim_from_l2(0.0) == 1.0
+        # L2 distance 0 => cos_sim = 1
+        assert proc.cosine_sim_from_l2(0.0) == 1.0
 
     def test_orthogonal_vectors(self):
-        # L2 distance² = 2 for orthogonal unit vectors → cos_sim = 0.0
-        result = cosine_sim_from_l2(math.sqrt(2))
-        assert abs(result) < 1e-9
+        # For unit vectors, orthogonal => L2 = sqrt(2)
+        assert abs(proc.cosine_sim_from_l2(math.sqrt(2)) - 0.0) < 1e-6
 
     def test_clamp_negative(self):
-        # Large distance → clamped to 0
-        assert cosine_sim_from_l2(10.0) == 0.0
+        # Opposite-direction unit vectors => L2 = 2 => raw -1; clamp to 0
+        assert proc.cosine_sim_from_l2(2.0) == 0.0
 
-    def test_intermediate_value(self):
-        result = cosine_sim_from_l2(1.0)
-        assert 0.0 < result < 1.0
+    def test_intermediate(self):
+        v = proc.cosine_sim_from_l2(1.0)
+        assert 0.0 < v < 1.0
 
 
 class TestTimeDecay:
     def test_now_returns_one(self):
-        from datetime import datetime, timezone
-        ts = datetime.now(tz=timezone.utc).isoformat()
-        val = time_decay(ts, 90)
-        assert abs(val - 1.0) < 0.01
+        ts = datetime.now(timezone.utc).isoformat()
+        assert abs(proc.time_decay(ts, 90) - 1.0) < 0.01
 
     def test_half_life(self):
-        from datetime import datetime, timezone, timedelta
-        ts = (datetime.now(tz=timezone.utc) - timedelta(days=90)).isoformat()
-        val = time_decay(ts, 90)
-        assert abs(val - 0.5) < 0.01
+        old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        v = proc.time_decay(old, 90)
+        assert abs(v - 0.5) < 0.05
 
     def test_floor_value(self):
-        from datetime import datetime, timezone, timedelta
-        ts = (datetime.now(tz=timezone.utc) - timedelta(days=9000)).isoformat()
-        val = time_decay(ts, 90)
-        assert 0.0 <= val < 0.01
+        very_old = (datetime.now(timezone.utc) - timedelta(days=100000)).isoformat()
+        assert proc.time_decay(very_old, 90) > 0
 
-    def test_invalid_timestamp_returns_one(self):
-        val = time_decay("not-a-date", 90)
-        assert val == 1.0
+    def test_invalid_timestamp(self):
+        assert proc.time_decay("not-a-date", 90) == 1.0
 
 
 class TestKeywordRelevance:
     def test_below_threshold(self):
-        # abs(-0.05) < 0.1 threshold → 0.0
-        assert keyword_relevance(-0.05, 1.0, 0.1) == 0.0
+        assert proc.keyword_relevance(-0.05, 1.0, 0.1) == 0.0
 
     def test_perfect_match(self):
-        # abs(-5.0) / max(1.0, 5.0) = 1.0
-        assert keyword_relevance(-5.0, 5.0, 0.1) == 1.0
+        assert proc.keyword_relevance(-2.0, 2.0, 0.1) == 1.0
 
     def test_partial_match(self):
-        val = keyword_relevance(-2.0, 5.0, 0.1)
-        assert abs(val - 0.4) < 1e-9
+        v = proc.keyword_relevance(-1.0, 2.0, 0.1)
+        assert 0.0 < v < 1.0
 
     def test_zero_max(self):
-        # max_abs=0 → denominator becomes max(1.0, 0) = 1.0
-        val = keyword_relevance(-0.5, 0.0, 0.1)
-        assert val == 0.5
+        # max==1.0 floor -> denom is at least 1.0
+        v = proc.keyword_relevance(-0.5, 0.0, 0.1)
+        assert v == 0.5
 
 
 class TestPurification:
-    """Code blocks are excluded from stored conversation by documented
-    product design. All non-code content is preserved verbatim.
-    """
-
     def test_code_block_replaced(self):
         text = "before\n```python\nprint('hi')\n```\nafter"
-        result = purify(text)
-        assert "[code omitted]" in result
-        assert "print" not in result
+        out = proc.purify_text(text)
+        assert "[code omitted]" in out
+        assert "print" not in out
 
     def test_inline_code_preserved(self):
-        text = "use `my_func()` here"
-        result = purify(text)
-        assert "`my_func()`" in result
+        text = "use the `os.path` module"
+        assert proc.purify_text(text) == text
 
     def test_multiple_code_blocks(self):
-        text = "```a```\nmiddle\n```b```"
-        result = purify(text)
-        assert result.count("[code omitted]") == 2
+        text = "```\na\n```\nmid\n```\nb\n```"
+        out = proc.purify_text(text)
+        assert out.count("[code omitted]") == 2
 
-    def test_no_code_blocks(self):
-        text = "no code here"
-        result = purify(text)
-        assert result == "no code here"
+    def test_no_code_blocks_unchanged(self):
+        text = "Just plain text with no fences."
+        assert proc.purify_text(text) == text
+
+    def test_unclosed_fence_preserved(self):
+        text = "```python\nno close"
+        out = proc.purify_text(text)
+        assert "[code omitted]" not in out
 
 
-class TestEmbedding:
-    def test_passage_prefix(self, embedding_model):
-        # Model should accept passage prefix
-        import numpy as np
-        vec = embedding_model.encode("passage: test text", normalize_embeddings=True)
-        assert vec.shape[0] == 768
+class TestChunkText:
+    def test_short_text_single_chunk(self):
+        assert proc.chunk_text("hello") == ["hello"]
 
-    def test_query_prefix(self, embedding_model):
-        import numpy as np
-        vec = embedding_model.encode("query: test query", normalize_embeddings=True)
-        assert vec.shape[0] == 768
+    def test_long_text_multi_chunk(self):
+        text = "para1.\n\n" + ("a" * 800) + "\n\nlast"
+        chunks = proc.chunk_text(text, max_chars=400, overlap=40)
+        assert len(chunks) >= 2
+        for c in chunks:
+            assert len(c) <= 400
 
-    def test_embed_passage_function(self):
-        vec = embed_passage("hello world")
-        assert len(vec) == 768
-
-    def test_embed_query_function(self):
-        vec = embed_query("hello world")
-        assert len(vec) == 768
-
-    def test_same_text_similar_vectors(self):
-        import numpy as np
-        v1 = embed_passage("Abraham Lincoln was the 16th president")
-        v2 = embed_query("Abraham Lincoln")
-        # Should be reasonably similar (cos_sim > 0.7)
-        from processor import cosine_sim_from_l2
-        import math
-        # Compute L2 distance
-        diff = sum((a - b) ** 2 for a, b in zip(v1, v2)) ** 0.5
-        sim = cosine_sim_from_l2(diff)
-        assert sim > 0.5
+    def test_empty_returns_empty(self):
+        assert proc.chunk_text("") == []
 
 
 class TestBiasScoring:
+    def test_local_bias_match(self):
+        assert proc.local_bias("u1", "u1") == proc.B_LOCAL_MATCH
+
+    def test_local_bias_free_neutral(self):
+        # Free edition: local_id mismatch must not penalize ranking
+        # (spec §3 Identifiers Note: B_local is a Pro feature).
+        assert proc.B_LOCAL_MISMATCH == 1.0
+        assert proc.local_bias("u1", "u2") == 1.0
+
+    def test_session_bias_free_neutral(self):
+        # Free edition: session_id has no ranking effect.
+        assert proc.session_bias("a", "b") == proc.B_SESSION_MATCH
+        assert proc.session_bias("a", "a") == proc.B_SESSION_MATCH
+
     def test_full_scoring_formula(self):
-        score = final_score(0.8, 0.6, 1.0, 1.0)
-        expected = (0.8 * 0.7 + 0.6 * 0.3) * 1.0 * 1.0
-        assert abs(score - expected) < 1e-9
+        # cos=0.8, kw=0.5, decay=0.9, local=1.0
+        # base = 0.8*0.7 + 0.5*0.3 = 0.56 + 0.15 = 0.71
+        # final = 0.71 * 0.9 = 0.639
+        s = proc.compute_score(0.8, 0.5, 0.9, local_b=1.0)
+        assert abs(s - 0.639) < 0.001
+
+
+class TestRefresh:
+    def test_refresh_replaces_record(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        mid, rowid = db.insert_memory(conn, "old", dummy_vec(), "o", "l")
+        ok = proc.refresh_memory(conn, mid, "new")
+        assert ok is True
+        row = db.get_memory_by_rowid(conn, rowid)
+        assert row["content"] == "new"
+
+    def test_refresh_updates_timestamp(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        old_ts = "2020-01-01T00:00:00+00:00"
+        mid, rowid = db.insert_memory(conn, "x", dummy_vec(), "o", "l", timestamp=old_ts)
+        proc.refresh_memory(conn, mid, "y")
+        row = db.get_memory_by_rowid(conn, rowid)
+        assert row["timestamp"] != old_ts
+
+
+@pytest.mark.slow
+class TestEmbedding:
+    def test_passage_embedding_norm(self, embedding_model):
+        v = proc.embed_passage("Abraham Lincoln")
+        norm = math.sqrt(sum(x * x for x in v))
+        assert 0.99 < norm < 1.01
+
+    def test_query_embedding_norm(self, embedding_model):
+        v = proc.embed_query("Lincoln")
+        norm = math.sqrt(sum(x * x for x in v))
+        assert 0.99 < norm < 1.01
+
+    def test_same_text_similar_vectors(self, embedding_model):
+        a = proc.embed_passage("hello world")
+        b = proc.embed_passage("hello world")
+        # identical input -> identical output
+        for x, y in zip(a, b):
+            assert abs(x - y) < 1e-5

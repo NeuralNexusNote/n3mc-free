@@ -1,18 +1,21 @@
+"""N3MemoryCore — processing layer.
+
+Embeddings, ranking math, fenced-code substitution, and chunking.
+See N3MemoryCore_v1.2.0_Free_EN.md §3 (Ranking Formula) and §5 (chunking).
 """
-N3MemoryCore - processor.py
-Processing layer: embedding generation, ranking calculation, text purification
-"""
+from __future__ import annotations
+
+import math
 import os
 import re
 import sys
 from datetime import datetime, timezone
-from math import pow, log2
-from typing import List, Optional
+from typing import Iterable, Optional
 
-# Required: explicit sys.path configuration for inter-module imports
+# Spec §3: explicit sys.path so the package works regardless of CWD.
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import (
+from database import (  # noqa: E402  (intentional after sys.path tweak)
     get_connection,
     init_db,
     insert_memory,
@@ -24,288 +27,320 @@ from database import (
     check_exact_duplicate,
     find_unindexed_memories,
     serialize_vector,
-    strip_fts_punctuation,
-    get_memory_by_rowid,
 )
 
-# ---------------------------------------------------------------------------
-# Embedding model (lazy-loaded singleton)
-# ---------------------------------------------------------------------------
-_model = None
-_MODEL_NAME = "intfloat/e5-base-v2"
-_VECTOR_DIM = 768
-
-
-def get_model():
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(_MODEL_NAME)
-    return _model
-
-
-def embed_passage(text: str) -> list:
-    """Embed text for storage (document). Adds 'passage: ' prefix."""
-    model = get_model()
-    vec = model.encode("passage: " + text, normalize_embeddings=True)
-    return vec.tolist()
-
-
-def embed_query(text: str) -> list:
-    """Embed text for search (query). Adds 'query: ' prefix."""
-    model = get_model()
-    vec = model.encode("query: " + text, normalize_embeddings=True)
-    return vec.tolist()
-
 
 # ---------------------------------------------------------------------------
-# Text purification
+# Lone-surrogate sanitization (Windows / cp932 data-loss guard)
 # ---------------------------------------------------------------------------
-_CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```', re.MULTILINE)
+# Subprocess stdin pipes on Windows can deliver UTF-8 bytes that python's
+# decoder maps to lone UTF-16 surrogate halves (U+D800..U+DFFF). Such strings
+# round-trip through json.loads but blow up at sqlite3.execute() with
+# UnicodeEncodeError, silently dropping the entire write — a direct violation
+# of the complete-preservation contract. We strip these halves before any
+# value is bound to SQLite.
+_LONE_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
-def _sanitize_surrogates(text: str) -> str:
-    """Defense-in-depth: remove lone Unicode surrogates that crash sqlite3.
+def sanitize_surrogates(text):
+    """Strip lone UTF-16 surrogate halves from a string (or pass-through).
 
-    Primary sanitation happens at the hook entrypoints (n3memory.py), but
-    purify is called from every save path, so we repeat it here as
-    belt-and-suspenders for the complete-preservation contract.
+    Recursively cleans dicts / lists too so audit-log JSON payloads with
+    surrogates buried inside multimodal content don't break json.dumps.
     """
-    if not isinstance(text, str):
+    if text is None:
         return text
-    try:
-        return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-    except Exception:
-        return "".join(
-            ch if not (0xD800 <= ord(ch) <= 0xDFFF) else "\ufffd"
-            for ch in text
-        )
+    if isinstance(text, str):
+        return _LONE_SURROGATE_RE.sub("", text)
+    if isinstance(text, list):
+        return [sanitize_surrogates(x) for x in text]
+    if isinstance(text, dict):
+        return {k: sanitize_surrogates(v) for k, v in text.items()}
+    return text
 
 
-def purify(text: str) -> str:
-    """Replace multi-line code blocks with '[code omitted]'. Preserve inline code.
+_sanitize_surrogates = sanitize_surrogates  # snake-case alias used internally
 
-    Code blocks are excluded from stored conversation by documented product
-    design: N3MemoryCore records conversation text only, not source code.
-    All non-code content is preserved verbatim (no length or skip-pattern
-    filtering) and long text is chunked by ``chunk_text``.
+
+# ---------------------------------------------------------------------------
+# Purification — fenced code blocks only (spec §5) + surrogate sanitization
+# ---------------------------------------------------------------------------
+_CODE_BLOCK_RE = re.compile(r'```[^\n]*\n.*?\n```', re.DOTALL)
+
+
+def purify_text(text):
+    """Replace closed fenced code blocks with `[code omitted]` AND strip lone
+    surrogates as a defense-in-depth layer (spec §5).
+
+    Inline backtick spans and unclosed fences are preserved verbatim.
     """
-    text = _sanitize_surrogates(text)
-    return _CODE_BLOCK_RE.sub('[code omitted]', text)
+    if not text:
+        return text
+    cleaned = sanitize_surrogates(text)
+    return _CODE_BLOCK_RE.sub("[code omitted]", cleaned)
+
+
+# Public alias used by hooks.
+_purify = purify_text
 
 
 # ---------------------------------------------------------------------------
-# Hierarchical chunking for complete preservation (no truncation)
+# Chunking — paragraph → sentence → hard window (spec §5)
 # ---------------------------------------------------------------------------
-_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|(?<=[。！？])|\n+')
-_PARAGRAPH_SPLIT_RE = re.compile(r'\n\s*\n+')
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?。！？])\s+')
 
 
-def _hard_window(text: str, max_chars: int, overlap: int) -> List[str]:
-    """Fixed-size sliding window with overlap. Last resort for very long sentences."""
+def _split_paragraphs(text: str) -> list[str]:
+    parts = re.split(r'\n{2,}', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = _SENTENCE_SPLIT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _hard_window(text: str, max_chars: int, overlap: int) -> list[str]:
     if len(text) <= max_chars:
         return [text]
     step = max(1, max_chars - overlap)
-    out: List[str] = []
+    out = []
     i = 0
-    n = len(text)
-    while i < n:
-        out.append(text[i:i + max_chars])
-        if i + max_chars >= n:
+    while i < len(text):
+        out.append(text[i : i + max_chars])
+        if i + max_chars >= len(text):
             break
         i += step
     return out
 
 
-def chunk_text(
-    text: str,
-    max_chars: int = 400,
-    overlap: int = 40,
-    min_chars: int = 30,
-) -> List[str]:
-    """Hierarchical splitter: paragraph -> sentence -> hard window.
+def chunk_text(text: str, max_chars: int = 400, overlap: int = 40) -> list[str]:
+    """Hierarchical chunker used by the auto-save hooks.
 
-    Local-only (regex). No LLM, no model inference. CJK sentence terminators
-    included. Short fragments below `min_chars` are merged into the previous
-    chunk to avoid single-word records that carry no retrievable context.
-    Guarantees complete preservation — no character is dropped.
+    1. Try paragraph splits (\\n\\n).
+    2. Within an oversized paragraph, fall back to sentence splits.
+    3. Within an oversized sentence, fall back to a hard sliding window.
+
+    Aggregates adjacent small pieces up to ~max_chars to reduce record bloat.
     """
-    if not text or not text.strip():
+    if not text:
         return []
+    text = text.rstrip()
     if len(text) <= max_chars:
-        return [text.strip()]
+        return [text]
 
-    chunks: List[str] = []
-    paragraphs = _PARAGRAPH_SPLIT_RE.split(text)
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
+    pieces: list[str] = []
+    for para in _split_paragraphs(text):
         if len(para) <= max_chars:
-            chunks.append(para)
+            pieces.append(para)
             continue
-        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(para) if s.strip()]
-        buf = ""
-        for s in sentences:
-            if len(s) > max_chars:
-                if buf:
-                    chunks.append(buf)
-                    buf = ""
-                chunks.extend(_hard_window(s, max_chars, overlap))
-                continue
-            candidate = (buf + " " + s).strip() if buf else s
-            if len(candidate) <= max_chars:
-                buf = candidate
+        for sent in _split_sentences(para):
+            if len(sent) <= max_chars:
+                pieces.append(sent)
             else:
-                chunks.append(buf)
-                buf = s
-        if buf:
-            chunks.append(buf)
+                pieces.extend(_hard_window(sent, max_chars, overlap))
+    if not pieces:
+        return _hard_window(text, max_chars, overlap)
 
-    merged: List[str] = []
-    for c in chunks:
-        if merged and len(c) < min_chars and len(merged[-1]) + len(c) + 1 <= max_chars:
-            merged[-1] = merged[-1] + " " + c
+    # Greedy aggregation up to max_chars.
+    out: list[str] = []
+    buf = ""
+    for p in pieces:
+        if not buf:
+            buf = p
+        elif len(buf) + 1 + len(p) <= max_chars:
+            buf = buf + "\n" + p
         else:
-            merged.append(c)
-    return [m for m in merged if m]
+            out.append(buf)
+            buf = p
+    if buf:
+        out.append(buf)
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Ranking formula components
+# Ranking math (spec §3 Ranking Formula)
 # ---------------------------------------------------------------------------
 def cosine_sim_from_l2(l2_distance: float) -> float:
-    """
-    Convert L2 distance to cosine similarity for L2-normalized vectors.
-    cos_sim = max(0, 1.0 - L2_distance^2 / 2)
-    """
-    return max(0.0, 1.0 - (l2_distance ** 2) / 2.0)
+    """For L2-normalized vectors: cos = 1 - L2^2/2, clamped to [0, 1]."""
+    val = 1.0 - (l2_distance * l2_distance) / 2.0
+    if val < 0.0:
+        return 0.0
+    if val > 1.0:
+        return 1.0
+    return val
 
 
-def time_decay(timestamp_str: str, half_life_days: float) -> float:
-    """
-    time_decay = 2^(-days_elapsed / half_life_days)
-    Returns 1.0 on invalid timestamp.
-    """
+def time_decay(timestamp_iso: str, half_life_days: float = 90.0) -> float:
+    """2^(-elapsed_days / half_life_days). Clamped to a tiny floor."""
     try:
-        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(timestamp_iso)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        now = datetime.now(tz=timezone.utc)
-        days_elapsed = (now - ts).total_seconds() / 86400.0
-        return pow(2.0, -days_elapsed / half_life_days)
-    except Exception:
+    except (ValueError, TypeError):
         return 1.0
+    elapsed_seconds = (datetime.now(timezone.utc) - ts).total_seconds()
+    days = max(0.0, elapsed_seconds / 86400.0)
+    decay = math.pow(2.0, -days / half_life_days) if half_life_days > 0 else 1.0
+    return max(decay, 1e-6)
 
 
-def keyword_relevance(bm25_score: float, max_abs_score: float, bm25_min_threshold: float) -> float:
-    """
-    Normalize FTS5 BM25 score (negative) to [0.0, 1.0].
-    """
-    abs_score = abs(bm25_score)
-    if abs_score < bm25_min_threshold:
-        return 0.0
-    return abs_score / max(1.0, max_abs_score)
-
-
-def final_score(
-    cos_sim: float,
-    kw_relevance: float,
-    decay: float,
-    b_local: float = 1.0,
+def keyword_relevance(
+    bm25_raw: Optional[float],
+    bm25_max_abs: float,
+    bm25_min_threshold: float = 0.1,
 ) -> float:
-    """
-    Final Score = (cos_sim * 0.7 + keyword_relevance * 0.3) * time_decay * b_local
-    Note: b_local bias is a Pro feature; Free always passes 1.0.
-    """
-    return (cos_sim * 0.7 + kw_relevance * 0.3) * decay * b_local
+    """Normalize FTS5 bm25() (negative → relevant) into [0, 1]."""
+    if bm25_raw is None:
+        return 0.0
+    abs_val = abs(bm25_raw)
+    if abs_val < bm25_min_threshold:
+        return 0.0
+    denom = max(1.0, bm25_max_abs)
+    return min(1.0, abs_val / denom)
+
+
+# Free edition: session_id AND local_id are stored per-record but do NOT
+# influence ranking. Per spec §3 Identifiers Note: "In Free, local_id is
+# stored per-record but not used in ranking. The B_local bias multiplier
+# that prioritizes same-environment memories is a Pro feature." Same for
+# session_id (b_session is also Pro-only).
+B_SESSION_MATCH = 1.0
+B_SESSION_MISMATCH = 1.0  # disabled in Free
+B_LOCAL_MATCH = 1.0
+B_LOCAL_MISMATCH = 1.0  # disabled in Free
+
+
+def session_bias(record_session: Optional[str], current_session: Optional[str]) -> float:
+    if not current_session or not record_session:
+        return B_SESSION_MATCH
+    return B_SESSION_MATCH if record_session == current_session else B_SESSION_MISMATCH
+
+
+def local_bias(record_local: Optional[str], current_local: Optional[str]) -> float:
+    if not current_local or not record_local:
+        return B_LOCAL_MATCH
+    return B_LOCAL_MATCH if record_local == current_local else B_LOCAL_MISMATCH
+
+
+def compute_score(
+    cos_sim: float,
+    keyword: float,
+    time_decay_v: float,
+    *,
+    session_b: float = 1.0,
+    local_b: float = 1.0,
+) -> float:
+    """Final = (cos*0.7 + kw*0.3) * time_decay * session_bias * local_bias."""
+    base = cos_sim * 0.7 + keyword * 0.3
+    return base * time_decay_v * session_b * local_b
 
 
 # ---------------------------------------------------------------------------
-# Hybrid search (vector + FTS)
+# Embeddings (spec §3) — lazy-loaded e5-base-v2 with required prefixes
 # ---------------------------------------------------------------------------
-def hybrid_search(
+_MODEL = None
+EMBEDDING_MODEL_NAME = "intfloat/e5-base-v2"
+
+
+def _get_model():
+    global _MODEL
+    if _MODEL is None:
+        # Suppress sentence-transformers warnings on stderr.
+        from sentence_transformers import SentenceTransformer
+        _MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _MODEL
+
+
+def embed_passage(text: str) -> list[float]:
+    """Save-time embedding. MUST use 'passage: ' prefix (spec §3)."""
+    model = _get_model()
+    vec = model.encode(
+        "passage: " + text,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    return [float(x) for x in vec.tolist()]
+
+
+def embed_query(text: str) -> list[float]:
+    """Search-time embedding. MUST use 'query: ' prefix (spec §3)."""
+    model = _get_model()
+    vec = model.encode(
+        "query: " + text,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    return [float(x) for x in vec.tolist()]
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Refresh — replace an existing record's content (used by --repair
+# vec re-index migration and possible future updates).
+# ---------------------------------------------------------------------------
+def refresh_memory(
     conn,
-    query: str,
-    config: dict,
-    k: int = 50,
-) -> list:
+    memory_id: str,
+    new_content: str,
+    *,
+    new_embedding: Optional[Iterable[float]] = None,
+) -> bool:
+    """Replace content (and optionally re-embed) for an existing memory.
+
+    Updates timestamp to now. Returns True on success.
     """
-    Perform hybrid vector + FTS search and return ranked results.
-    Returns list of dicts: {id, content, score, timestamp}
-    """
-    half_life_days = config.get("half_life_days", 90)
-    bm25_min_threshold = config.get("bm25_min_threshold", 0.1)
-    search_result_limit = config.get("search_result_limit", 20)
-    min_score = config.get("min_score", 0.2)
-    local_id = config.get("local_id", "")
+    from database import (  # local import to avoid cycles
+        strip_fts_punctuation,
+        _load_vec_extension,
+    )
+    _load_vec_extension(conn)
+    row = conn.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    rowid = row["rowid"]
+    new_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        conn.execute(
+            "UPDATE memories SET content = ?, timestamp = ? WHERE rowid = ?",
+            (new_content, new_ts, rowid),
+        )
+        conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (rowid,))
+        conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            (rowid, strip_fts_punctuation(new_content)),
+        )
+        if new_embedding is not None:
+            conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (rowid,))
+            conn.execute(
+                "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                (rowid, serialize_vector(new_embedding)),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
 
-    # Vector search
-    query_vec = embed_query(query)
-    vec_results = search_vector(conn, query_vec, k=k)
-    # {rowid: l2_distance}
-    vec_map = {rowid: dist for rowid, dist in vec_results}
 
-    # FTS search
-    fts_results = search_fts(conn, query, limit=k)
-    fts_map = {rowid: score for rowid, score in fts_results}
-
-    # Normalize BM25
-    if fts_map:
-        max_abs_bm25 = max(abs(s) for s in fts_map.values())
-    else:
-        max_abs_bm25 = 1.0
-
-    # Merge all rowids
-    all_rowids = set(vec_map.keys()) | set(fts_map.keys())
-
-    results = []
-    for rowid in all_rowids:
-        row = get_memory_by_rowid(conn, rowid)
-        if row is None:
-            continue
-
-        # cos_sim
-        if rowid in vec_map:
-            cos = cosine_sim_from_l2(vec_map[rowid])
-        else:
-            cos = 0.0
-
-        # keyword_relevance
-        if rowid in fts_map:
-            kw = keyword_relevance(fts_map[rowid], max_abs_bm25, bm25_min_threshold)
-        else:
-            kw = 0.0
-
-        # time decay (sqlite3.Row supports dict-style access)
-        ts = row["timestamp"]
-        decay = time_decay(ts, half_life_days)
-
-        # local bias (Free: always 1.0)
-        b_local = 1.0
-
-        score = final_score(cos, kw, decay, b_local)
-
-        if score < min_score:
-            continue
-
-        content = row["content"]
-        rec_id = row["id"]
-
-        # Include turn_id so callers (server /search route) can reassemble
-        # Q-A pairs by fetching all siblings with the same turn_id.
-        try:
-            tid = row["turn_id"]
-        except (KeyError, IndexError):
-            tid = None
-
-        results.append({
-            "id": rec_id,
-            "content": content,
-            "score": round(score, 4),
-            "timestamp": ts,
-            "turn_id": tid,
-        })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:search_result_limit]
+__all__ = [
+    "purify_text",
+    "_purify",
+    "chunk_text",
+    "sanitize_surrogates",
+    "cosine_sim_from_l2",
+    "time_decay",
+    "keyword_relevance",
+    "session_bias",
+    "local_bias",
+    "compute_score",
+    "embed_passage",
+    "embed_query",
+    "refresh_memory",
+    "EMBEDDING_MODEL_NAME",
+    "B_SESSION_MATCH",
+    "B_SESSION_MISMATCH",
+    "B_LOCAL_MATCH",
+    "B_LOCAL_MISMATCH",
+]

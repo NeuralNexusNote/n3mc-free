@@ -1,41 +1,51 @@
+"""UserPromptSubmit hook for Claude Code.
+
+Reads JSON from stdin, forwards to `python n3memory.py --hook-submit` as a
+single synchronous subprocess. The subprocess writes the audit log, runs
+--repair, saves the previous Claude turn, runs --search, and saves the user
+message — in that order, in one process.
 """
-N3MemoryCore - n3mc_hook.py
-UserPromptSubmit hook: auto-runs --repair + --search + --buffer (auto-save user messages)
-Called by Claude Code's UserPromptSubmit hook via settings.json.
-"""
-import json
+from __future__ import annotations
+
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-_THIS_DIR = Path(__file__).parent.resolve()
-_N3MEMORY = str(_THIS_DIR / "n3memory.py")
+# Spec §3 Clean CLI: force UTF-8 on stdio so non-ASCII (Japanese, em-dash,
+# etc.) survives the Windows cp932 default. Must run before any stdin read.
+for _stream_name in ("stdin", "stdout", "stderr"):
+    _s = getattr(sys, _stream_name, None)
+    if _s is not None and hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+HERE = Path(__file__).resolve().parent
+N3MEMORY = HERE / "n3memory.py"
 
 
-def main():
-    # Reconfigure stdin to UTF-8 before reading (Windows cp932 fix)
-    if hasattr(sys.stdin, 'reconfigure'):
-        sys.stdin.reconfigure(encoding='utf-8')
-
-    # Read stdin (Claude Code passes hook JSON here)
+def main() -> int:
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     try:
-        raw = sys.stdin.read()
-    except Exception:
-        raw = ""
-
-    # Pass directly to n3memory.py --hook-submit via subprocess (synchronous)
-    result = subprocess.run(
-        [sys.executable, _N3MEMORY, "--hook-submit"],
-        input=raw,
-        capture_output=False,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    sys.exit(result.returncode)
+        # Synchronous: must complete before Claude runs (spec §5)
+        proc = subprocess.run(
+            [sys.executable, str(N3MEMORY), "--hook-submit"],
+            input=raw,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+        return proc.returncode
+    except subprocess.TimeoutExpired:
+        print("[N3MC] hook-submit timed out", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"[N3MC] n3mc_hook.py failed: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

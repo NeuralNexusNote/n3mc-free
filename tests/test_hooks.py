@@ -1,183 +1,135 @@
-"""
-Layer 4: Hook integration (complete-preservation chunking, multimodal extract).
+"""Layer 4: hook helpers — chunking labels, image strip, multimodal extract,
+complete-recording (no length filter), --stop idempotency."""
+from __future__ import annotations
 
-The complete-recording contract forbids all length filters, skip-pattern
-filters, and code-block stripping from the buffer write path. These tests
-assert that EVERY non-empty input produces at least one tagged record.
-"""
-import os
-import sys
 import json
+import sys
+from pathlib import Path
+
 import pytest
 
-_N3MC_DIR = os.path.join(os.path.dirname(__file__), "..")
-sys.path.insert(0, _N3MC_DIR)
+# Ensure n3memory is importable
+N3MC_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(N3MC_ROOT))
 
-from n3memory import (
-    _extract_text,
-    _prepare_user_buffer,
-    _prepare_claude_buffer,
-    purify_text,
-)
-from core.processor import chunk_text
+import n3memory as n3
+from core import processor as proc
 
 
-class TestCompletePreservation:
-    """Ensures full content is preserved via chunking (no truncation)."""
+class TestChunkText:
+    def test_short_text_single_record(self):
+        chunks = proc.chunk_text("hello")
+        assert chunks == ["hello"]
 
-    def test_short_text_single_chunk(self):
-        pieces = chunk_text("Hello world.", max_chars=400, overlap=40)
-        assert pieces == ["Hello world."]
+    def test_long_text_multi_chunk(self):
+        text = ("paragraph one. " * 50) + "\n\n" + ("paragraph two. " * 50)
+        chunks = proc.chunk_text(text)
+        assert len(chunks) >= 2
 
-    def test_long_text_multiple_chunks(self):
-        long_text = "Sentence number " + ". Sentence number ".join(str(i) for i in range(100)) + "."
-        pieces = chunk_text(long_text, max_chars=400, overlap=40)
-        assert len(pieces) > 1
-        for p in pieces:
-            assert p.strip()
+    def test_chunk_prefix_numbering(self):
+        text = "x" * 1200
+        labelled = n3._label_chunks(text, "user")
+        assert all(c.startswith("[user ") for c in labelled)
+        assert "1/" in labelled[0]
 
-    def test_claude_buffer_chunks_long_response(self):
-        long_response = "A" * 1000 + ". " + "B" * 1000 + ". " + "C" * 1000
-        contents = _prepare_claude_buffer(long_response)
-        assert len(contents) > 1
-        for c in contents:
-            assert c.startswith("[claude")
-        joined = " ".join(contents)
-        assert "A" in joined and "B" in joined and "C" in joined
+    def test_single_chunk_label(self):
+        labelled = n3._label_chunks("short", "claude")
+        assert labelled == ["[claude] short"]
 
-    def test_user_buffer_chunks_long_message(self):
-        long_message = "Please save the following: " + ("detail " * 200)
-        contents = _prepare_user_buffer(long_message)
-        assert len(contents) >= 1
-        for c in contents:
-            assert c.startswith("[user")
 
-    def test_short_claude_single_record_no_index(self):
-        contents = _prepare_claude_buffer("Short reply.")
-        assert len(contents) == 1
-        assert contents[0].startswith("[claude] ")
+class TestStripImages:
+    def test_no_images_unchanged(self):
+        assert n3.strip_images("plain text") == "plain text"
 
-    def test_short_user_single_record_no_index(self):
-        contents = _prepare_user_buffer("A meaningful user message.")
-        assert len(contents) == 1
-        assert contents[0].startswith("[user] ")
+    def test_strips_base64_image(self):
+        s = "before data:image/png;base64,iVBORw0KGgo= after"
+        out = n3.strip_images(s)
+        assert "iVBORw0KGgo" not in out
+        assert "[image omitted]" in out
+
+    def test_strip_in_dict(self):
+        d = {"text": "x", "img": "data:image/jpeg;base64,AAAA="}
+        out = n3.strip_images(d)
+        assert "[image omitted]" in out["img"]
 
 
 class TestExtractText:
     def test_plain_string(self):
-        assert _extract_text("hello world") == "hello world"
+        assert n3.extract_text("hello") == "hello"
 
     def test_multimodal_json(self):
-        arr = json.dumps([
-            {"type": "text", "text": "hello"},
-            {"type": "image_url", "image_url": "data:..."},
-            {"type": "text", "text": "world"},
-        ])
-        result = _extract_text(arr)
-        assert "hello" in result
-        assert "world" in result
+        msg = [
+            {"type": "image", "source": "x"},
+            {"type": "text", "text": "describe this"},
+        ]
+        assert n3.extract_text(msg) == "describe this"
 
     def test_image_only_returns_empty(self):
-        arr = json.dumps([{"type": "image_url", "image_url": "data:..."}])
-        result = _extract_text(arr)
-        assert result.strip() == ""
+        msg = [{"type": "image", "source": "x"}]
+        assert n3.extract_text(msg) == ""
 
     def test_empty_returns_empty(self):
-        assert _extract_text("") == ""
+        assert n3.extract_text(None) == ""
+        assert n3.extract_text("") == ""
+        assert n3.extract_text([]) == ""
 
 
-class TestNoSilentDrops:
-    """Complete-recording contract: nothing may be dropped from user or
-    Claude text before it reaches the DB.
-    """
+class TestCompleteRecording:
+    """Verify the spec §5 Complete-Recording Contract: no length / skip filter."""
 
-    def test_routine_words_saved_not_skipped(self):
-        for word in ("ok", "yes", "thanks", "thank you", "got it"):
-            contents = _prepare_user_buffer(word)
-            assert contents, f"routine word {word!r} must be preserved"
-            assert contents[0].startswith("[user")
+    def test_routine_ok_is_recorded(self):
+        # The hook layer should accept 'ok' / 'yes' / 'thanks' — there is
+        # no _SKIP_PATTERNS filter. We exercise this via _label_chunks.
+        labelled = n3._label_chunks("ok", "user")
+        assert labelled == ["[user] ok"]
 
-    def test_short_claude_saved(self):
-        contents = _prepare_claude_buffer("ok")
-        assert contents and contents[0].startswith("[claude")
+    def test_short_message_is_chunked(self):
+        labelled = n3._label_chunks("hi", "claude")
+        assert labelled == ["[claude] hi"]
 
-    def test_short_user_saved(self):
-        contents = _prepare_user_buffer("hi there")
-        assert contents and contents[0].startswith("[user")
-
-    def test_meaningful_not_skipped(self):
-        text = "Please implement N3MemoryCore according to this specification."
-        result = _prepare_user_buffer(text)
-        assert result
-        assert any("[user" in r for r in result)
-
-
-class TestPurifyCodeBlocks:
-    """Code blocks are excluded from stored conversation by documented
-    product design: N3MC records conversation text, not source code.
-    """
-
-    def test_closed_fence_replaced(self):
-        text = "before\n```python\nprint('hi')\n```\nafter"
-        result = purify_text(text)
-        assert "[code omitted]" in result
-        assert "print" not in result
-
-    def test_plain_text_preserved(self):
-        text = "nothing special here"
-        assert purify_text(text) == text
+    def test_audit_log_entry_written(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(n3, "AUDIT_LOG", tmp_path / "audit.log")
+        monkeypatch.setattr(n3, "MEMORY_DIR", tmp_path)
+        n3.write_audit("UserPromptSubmit", '{"x":1}', {"x": 1})
+        assert (tmp_path / "audit.log").exists()
+        line = (tmp_path / "audit.log").read_text(encoding="utf-8").strip()
+        rec = json.loads(line)
+        assert rec["hook"] == "UserPromptSubmit"
+        assert rec["payload"] == {"x": 1}
 
 
 class TestStopIdempotency:
-    def test_import_line_not_duplicated(self, tmp_path):
-        import sys
-        sys.path.insert(0, _N3MC_DIR)
-        from pathlib import Path
-        from unittest.mock import patch
-
-        # Create temp .claude dir
-        claude_dir = tmp_path / ".claude"
-        claude_dir.mkdir()
-        rules_dir = claude_dir / "rules"
-        rules_dir.mkdir()
-        claude_md = claude_dir / "CLAUDE.md"
-        claude_md.write_text("@../N3MemoryCore/.memory/memory_context.md\n", encoding="utf-8")
-
-        # Patch paths in n3memory
-        import n3memory
-        original_project_root = None
-
-        with patch.object(n3memory, '_THIS_DIR', tmp_path / "N3MemoryCore"):
-            config = {"owner_id": "x", "local_id": "y", "server_port": 18521}
-            # Manually run the import-idempotency logic
-            import_line = "@../N3MemoryCore/.memory/memory_context.md"
-            content = claude_md.read_text(encoding="utf-8")
-            count_before = content.count(import_line)
-            # Simulate running cmd_stop's CLAUDE.md update logic
-            if import_line not in content:
-                content = import_line + "\n" + content
-            claude_md.write_text(content, encoding="utf-8")
-            count_after = claude_md.read_text(encoding="utf-8").count(import_line)
-            assert count_after == count_before  # no duplicate added
+    def test_at_import_not_duplicated(self, tmp_path, monkeypatch):
+        # Redirect MEMORY_CONTEXT_MD so the @import line points to a tmp path.
+        monkeypatch.setattr(n3, "MEMORY_CONTEXT_MD", tmp_path / ".memory" / "memory_context.md")
+        project = tmp_path / "proj"
+        project.mkdir()
+        n3._ensure_at_import(project)
+        n3._ensure_at_import(project)
+        text = (project / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+        # Exactly one '@' line referencing memory_context
+        count = sum(1 for ln in text.splitlines()
+                    if ln.startswith("@") and "memory_context.md" in ln)
+        assert count == 1
 
     def test_rules_file_created(self, tmp_path):
-        from pathlib import Path
-        import n3memory
-        from unittest.mock import patch
+        n3._ensure_behavior_file(tmp_path)
+        f = tmp_path / ".claude" / "rules" / "n3mc-behavior.md"
+        assert f.exists()
+        content = f.read_text(encoding="utf-8")
+        assert "Fully Automatic Saving" in content
 
-        n3mc_dir = tmp_path / "N3MemoryCore"
-        n3mc_dir.mkdir()
-        claude_dir = tmp_path / ".claude"
-        claude_dir.mkdir()
-        rules_dir = claude_dir / "rules"
-        rules_dir.mkdir()
-        claude_md = claude_dir / "CLAUDE.md"
-        claude_md.write_text("", encoding="utf-8")
-
-        with patch.object(n3memory, '_THIS_DIR', n3mc_dir):
-            config = {}
-            # Patch project root derivation
-            behavior_md = rules_dir / "n3mc-behavior.md"
-            if not behavior_md.exists():
-                behavior_md.write_text("# N3MemoryCore Behavioral Guidelines\n", encoding="utf-8")
-            assert behavior_md.exists()
+    def test_legacy_zone_removed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(n3, "MEMORY_CONTEXT_MD", tmp_path / ".memory" / "memory_context.md")
+        project = tmp_path / "p2"
+        project.mkdir()
+        claude_md = project / ".claude" / "CLAUDE.md"
+        claude_md.parent.mkdir(parents=True)
+        claude_md.write_text(
+            "header\n<!-- N3MC_AUTO_START -->\nold\n<!-- N3MC_AUTO_END -->\nfooter\n",
+            encoding="utf-8",
+        )
+        n3._ensure_at_import(project)
+        text = claude_md.read_text(encoding="utf-8")
+        assert "N3MC_AUTO_START" not in text
+        assert "@" in text

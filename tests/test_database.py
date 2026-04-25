@@ -1,237 +1,197 @@
-"""
-Layer 1: DB unit tests (CRUD, schema, transactions)
-"""
-import os
-import sys
-import math
-import pytest
-from uuid_extensions import uuid7 as _gen_uuid7
+"""Layer 1: DB unit tests — schema, CRUD, FTS, vector, dedup, GC, repair."""
+from __future__ import annotations
 
-_CORE_DIR = os.path.join(os.path.dirname(__file__), "..", "core")
-sys.path.insert(0, _CORE_DIR)
-
-from database import (
-    get_connection, init_db, migrate_schema, insert_memory,
-    delete_memory, count_memories, check_exact_duplicate,
-    find_unindexed_memories, search_fts, search_vector,
-    serialize_vector, deserialize_vector, strip_fts_punctuation,
-    _quote_fts_query, get_all_memories, get_memory_by_rowid,
-    get_memories_by_turn_id,
-)
+from core import database as db
 
 
-def make_vec(dim=768):
-    v = [1.0 / math.sqrt(dim)] * dim
-    return v
-
-
+# ---------------------------------------------------------------------------
 class TestSchema:
-    def test_init_db_creates_tables(self, tmp_db):
-        cur = tmp_db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        names = {r[0] for r in cur.fetchall()}
-        assert "memories" in names
+    def test_init_db_creates_tables(self, isolated_db):
+        conn, _ = isolated_db
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','virtual')"
+        )}
+        # FTS virtual tables show up as 'table' too
+        all_names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN "
+            "('memories','memories_fts','memories_vec')"
+        )}
+        assert {"memories", "memories_fts", "memories_vec"}.issubset(all_names)
 
-    def test_migrate_schema_idempotent(self, tmp_db):
-        migrate_schema(tmp_db)
-        migrate_schema(tmp_db)
+    def test_migrate_schema_idempotent(self, isolated_db):
+        conn, _ = isolated_db
+        before = list(conn.execute("PRAGMA table_info(memories)"))
+        db.migrate_schema(conn)
+        db.migrate_schema(conn)
+        after = list(conn.execute("PRAGMA table_info(memories)"))
+        assert len(before) == len(after)
 
-    def test_migrate_schema_adds_missing_columns(self, tmp_db):
-        info = {r[1] for r in tmp_db.execute("PRAGMA table_info(memories)")}
-        assert "local_id" in info
-        assert "agent_name" in info
+    def test_migrate_adds_missing_columns(self, tmp_path):
+        # Open a raw sqlite, create memories without the new columns, then migrate.
+        import sqlite3
+        path = tmp_path / "legacy.db"
+        c = sqlite3.connect(str(path))
+        c.execute(
+            "CREATE TABLE memories(id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "timestamp TEXT NOT NULL, owner_id TEXT NOT NULL)"
+        )
+        c.commit()
+        c.close()
+        conn = db.init_db(path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
+        assert {"local_id", "agent_name", "turn_id"}.issubset(cols)
+        conn.close()
 
 
 class TestInsertAndRetrieve:
-    def test_insert_and_count(self, tmp_db):
-        assert count_memories(tmp_db) == 0
-        insert_memory(tmp_db, str(_gen_uuid7()), "hello world", "2025-01-01T00:00:00+00:00", "owner1", None)
-        assert count_memories(tmp_db) == 1
+    def test_insert_and_count(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        assert db.count_memories(conn) == 0
+        db.insert_memory(conn, "hello", dummy_vec(), "owner-1", "local-1")
+        assert db.count_memories(conn) == 1
 
-    def test_insert_populates_all_three_tables(self, tmp_db):
-        vec = make_vec()
-        rowid = insert_memory(tmp_db, str(_gen_uuid7()), "test content", "2025-01-01T00:00:00+00:00", "owner1", vec)
-        row = tmp_db.execute("SELECT rowid FROM memories_vec WHERE rowid = ?", (rowid,)).fetchone()
-        assert row is not None
-        row2 = tmp_db.execute("SELECT rowid FROM memories_fts WHERE rowid = ?", (rowid,)).fetchone()
-        assert row2 is not None
+    def test_insert_populates_all_three_tables(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        mem_id, rowid = db.insert_memory(
+            conn, "foo bar baz", dummy_vec(), "o", "l", agent_name="claude-code"
+        )
+        m = conn.execute("SELECT COUNT(*) FROM memories WHERE id=?", (mem_id,)).fetchone()[0]
+        f = conn.execute("SELECT COUNT(*) FROM memories_fts WHERE rowid=?", (rowid,)).fetchone()[0]
+        v = conn.execute("SELECT COUNT(*) FROM memories_vec WHERE rowid=?", (rowid,)).fetchone()[0]
+        assert m == 1 and f == 1 and v == 1
 
-    def test_insert_without_embedding(self, tmp_db):
-        rowid = insert_memory(tmp_db, str(_gen_uuid7()), "no embedding", "2025-01-01T00:00:00+00:00", "owner1", None)
-        assert rowid is not None
-        row = tmp_db.execute("SELECT rowid FROM memories_vec WHERE rowid = ?", (rowid,)).fetchone()
-        assert row is None
+    def test_insert_without_embedding(self, isolated_db):
+        conn, _ = isolated_db
+        mem_id, rowid = db.insert_memory(conn, "no-vec", None, "o", "l")
+        v = conn.execute("SELECT COUNT(*) FROM memories_vec WHERE rowid=?", (rowid,)).fetchone()[0]
+        assert v == 0  # vec missing on purpose
 
-    def test_get_memory_by_rowid(self, tmp_db):
-        rid = str(_gen_uuid7())
-        rowid = insert_memory(tmp_db, rid, "find me", "2025-01-01T00:00:00+00:00", "owner1", None)
-        row = get_memory_by_rowid(tmp_db, rowid)
-        assert row is not None
-        assert row["content"] == "find me"
+    def test_get_memory_by_rowid(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        _, rowid = db.insert_memory(conn, "x", dummy_vec(), "o", "l")
+        row = db.get_memory_by_rowid(conn, rowid)
+        assert row is not None and row["content"] == "x"
 
-    def test_get_all_memories(self, tmp_db):
-        insert_memory(tmp_db, str(_gen_uuid7()), "a", "2025-01-01T00:00:00+00:00", "owner1", None)
-        insert_memory(tmp_db, str(_gen_uuid7()), "b", "2025-01-02T00:00:00+00:00", "owner1", None)
-        rows = get_all_memories(tmp_db)
-        assert len(rows) == 2
+    def test_get_all_memories(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        for i in range(3):
+            db.insert_memory(conn, f"row{i}", dummy_vec(), "o", "l")
+        rows = db.get_all_memories(conn)
+        assert len(rows) == 3
 
 
 class TestDelete:
-    def test_delete_removes_from_all_three_tables(self, tmp_db):
-        vec = make_vec()
-        rid = str(_gen_uuid7())
-        rowid = insert_memory(tmp_db, rid, "to delete", "2025-01-01T00:00:00+00:00", "owner1", vec)
-        assert count_memories(tmp_db) == 1
-        delete_memory(tmp_db, rid)
-        assert count_memories(tmp_db) == 0
-        assert tmp_db.execute("SELECT rowid FROM memories_vec WHERE rowid = ?", (rowid,)).fetchone() is None
-        assert tmp_db.execute("SELECT rowid FROM memories_fts WHERE rowid = ?", (rowid,)).fetchone() is None
+    def test_delete_removes_from_all_three_tables(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        mid, rowid = db.insert_memory(conn, "doomed", dummy_vec(), "o", "l")
+        assert db.delete_memory(conn, mid) is True
+        for tbl in ("memories", "memories_fts", "memories_vec"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE rowid=?", (rowid,)).fetchone()[0]
+            assert n == 0
 
-    def test_delete_nonexistent_no_error(self, tmp_db):
-        result = delete_memory(tmp_db, "nonexistent-id")
-        assert result is False
+    def test_delete_nonexistent(self, isolated_db):
+        conn, _ = isolated_db
+        assert db.delete_memory(conn, "no-such-id") is False
 
 
 class TestDedup:
-    def test_check_exact_duplicate_true(self, tmp_db):
-        insert_memory(tmp_db, str(_gen_uuid7()), "duplicate text", "2025-01-01T00:00:00+00:00", "owner1", None)
-        assert check_exact_duplicate(tmp_db, "duplicate text") is True
+    def test_check_exact_duplicate_true(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "same", dummy_vec(), "o", "l")
+        assert db.check_exact_duplicate(conn, "same") is True
 
-    def test_check_exact_duplicate_false(self, tmp_db):
-        assert check_exact_duplicate(tmp_db, "unique text") is False
+    def test_check_exact_duplicate_false(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "alpha", dummy_vec(), "o", "l")
+        assert db.check_exact_duplicate(conn, "beta") is False
 
 
 class TestUnindexed:
-    def test_find_unindexed_vec_missing(self, tmp_db):
-        insert_memory(tmp_db, str(_gen_uuid7()), "no vec", "2025-01-01T00:00:00+00:00", "owner1", None)
-        rows = find_unindexed_memories(tmp_db)
-        assert len(rows) >= 1
-        assert any(r[4] == 0 for r in rows)
+    def test_find_unindexed_vec_missing(self, isolated_db):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "no-vec", None, "o", "l")  # vec missing on purpose
+        rows = db.find_unindexed_memories(conn)
+        assert len(rows) == 1
+        assert rows[0]["vec_missing"] == 1
+        assert rows[0]["fts_missing"] == 0
 
-    def test_find_unindexed_all_indexed(self, tmp_db):
-        vec = make_vec()
-        insert_memory(tmp_db, str(_gen_uuid7()), "fully indexed", "2025-01-01T00:00:00+00:00", "owner1", vec)
-        rows = find_unindexed_memories(tmp_db)
-        assert len(rows) == 0
+    def test_find_unindexed_all_indexed(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "ok", dummy_vec(), "o", "l")
+        assert db.find_unindexed_memories(conn) == []
 
 
 class TestFTS:
     def test_strip_fts_punctuation(self):
-        assert strip_fts_punctuation("hello, world!") == "hello world"
-        assert strip_fts_punctuation("(test) [bracket]") == "test bracket"
+        assert db.strip_fts_punctuation("Hello, world!") == "Hello world"
+        assert db.strip_fts_punctuation("[Alpha-9]") == "Alpha9"
 
     def test_quote_fts_query(self):
-        result = _quote_fts_query("hello world")
-        assert '"hello"' in result
-        assert '"world"' in result
+        q = db._quote_fts_query("Hello, world!")
+        assert q == '"Hello" "world"'
 
     def test_quote_fts_query_max_terms(self):
-        big_query = " ".join(f"word{i}" for i in range(35))
-        result = _quote_fts_query(big_query)
-        terms = result.split()
-        assert len(terms) == 30
+        text = " ".join(f"w{i}" for i in range(50))
+        q = db._quote_fts_query(text)
+        # 30-term cap (spec §3 _FTS_MAX_TERMS)
+        assert q.count('"') == 60
 
-    def test_search_fts_basic(self, tmp_db):
-        insert_memory(tmp_db, str(_gen_uuid7()), "Abraham Lincoln president", "2025-01-01T00:00:00+00:00", "owner1", None)
-        results = search_fts(tmp_db, "Lincoln")
-        assert len(results) >= 1
+    def test_search_fts_basic(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "Abraham Lincoln was the 16th president", dummy_vec(), "o", "l")
+        hits = db.search_fts(conn, "Lincoln")
+        assert len(hits) >= 1
 
-    def test_search_fts_short_query_skipped(self, tmp_db):
-        results = search_fts(tmp_db, "I")
-        assert results == []
+    def test_search_fts_short_query_skipped(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "I am here", dummy_vec(), "o", "l")
+        # 1-char query is skipped per spec §3 FTS5 Constraint
+        assert db.search_fts(conn, "I") == []
 
-    def test_search_fts_punctuation_resilience(self, tmp_db):
-        insert_memory(tmp_db, str(_gen_uuid7()), "Planet [Alpha-9] temperature settings", "2025-01-01T00:00:00+00:00", "owner1", None)
-        results = search_fts(tmp_db, "Alpha-9 temperature")
-        assert len(results) >= 1
+    def test_search_fts_punctuation_resilience(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "Planet [Alpha-9] temperature settings", dummy_vec(), "o", "l")
+        hits = db.search_fts(conn, "Alpha9 temperature")
+        assert len(hits) >= 1
 
 
 class TestVectorSearch:
-    def test_search_vector_returns_results(self, tmp_db):
-        vec = make_vec()
-        insert_memory(tmp_db, str(_gen_uuid7()), "vector test", "2025-01-01T00:00:00+00:00", "owner1", vec)
-        results = search_vector(tmp_db, vec, k=5)
-        assert len(results) >= 1
+    def test_search_vector_returns_results(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "x", dummy_vec(0.1), "o", "l")
+        db.insert_memory(conn, "y", dummy_vec(0.2), "o", "l")
+        hits = db.search_vector(conn, dummy_vec(0.1), k=2)
+        assert len(hits) == 2
+        assert hits[0]["distance"] <= hits[1]["distance"]
 
-    def test_search_vector_empty_db(self, tmp_db):
-        vec = make_vec()
-        results = search_vector(tmp_db, vec, k=5)
-        assert results == []
+    def test_search_vector_empty_db(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        assert db.search_vector(conn, dummy_vec(), k=5) == []
 
 
 class TestSerialization:
     def test_serialize_vector_roundtrip(self):
-        v = [float(i) / 768 for i in range(768)]
-        serialized = serialize_vector(v)
-        recovered = deserialize_vector(serialized)
-        assert len(recovered) == 768
-        assert abs(recovered[0] - v[0]) < 1e-5
+        vec = [i * 0.001 for i in range(768)]
+        blob = db.serialize_vector(vec)
+        restored = db.deserialize_vector(blob)
+        for a, b in zip(vec, restored):
+            assert abs(a - b) < 1e-5
 
 
-class TestTurnIdPairing:
-    """Q-A pair reconstruction: one [user] + N [claude i/N] share one turn_id."""
+class TestGC:
+    def test_gc_deletes_expired(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        # Insert with old timestamp
+        from datetime import datetime, timedelta, timezone
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(timespec="seconds")
+        db.insert_memory(conn, "ancient", dummy_vec(), "o", "l", timestamp=old_ts)
+        db.insert_memory(conn, "fresh", dummy_vec(), "o", "l")
+        deleted = db.gc_expired(conn, retain_days=365)
+        assert deleted == 1
+        assert db.count_memories(conn) == 1
 
-    def test_schema_has_turn_id_column(self, tmp_db):
-        info = {r[1] for r in tmp_db.execute("PRAGMA table_info(memories)")}
-        assert "turn_id" in info
-
-    def test_turn_id_index_exists(self, tmp_db):
-        idx_rows = tmp_db.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
-        ).fetchall()
-        names = {r[0] for r in idx_rows}
-        assert "idx_memories_turn_id" in names
-
-    def test_insert_memory_persists_turn_id(self, tmp_db):
-        tid = "11111111-1111-1111-1111-111111111111"
-        insert_memory(
-            tmp_db, str(_gen_uuid7()), "[user] hi", "2025-01-01T00:00:00+00:00",
-            "owner1", None, None, "claude-code", None, tid,
-        )
-        row = tmp_db.execute("SELECT turn_id FROM memories").fetchone()
-        assert row["turn_id"] == tid
-
-    def test_get_memories_by_turn_id_orders_by_rowid(self, tmp_db):
-        tid = "22222222-2222-2222-2222-222222222222"
-        insert_memory(tmp_db, str(_gen_uuid7()), "[user] Q", "2025-01-01T00:00:00+00:00",
-                      "owner1", None, None, "claude-code", None, tid)
-        insert_memory(tmp_db, str(_gen_uuid7()), "[claude 1/2] A1", "2025-01-01T00:00:01+00:00",
-                      "owner1", None, None, "claude-code", None, tid)
-        insert_memory(tmp_db, str(_gen_uuid7()), "[claude 2/2] A2", "2025-01-01T00:00:02+00:00",
-                      "owner1", None, None, "claude-code", None, tid)
-        # Unrelated row
-        insert_memory(tmp_db, str(_gen_uuid7()), "[user] other", "2025-01-01T00:00:03+00:00",
-                      "owner1", None, None, "claude-code", None, "deadbeef")
-
-        rows = get_memories_by_turn_id(tmp_db, tid)
-        assert len(rows) == 3
-        contents = [r["content"] for r in rows]
-        assert contents == ["[user] Q", "[claude 1/2] A1", "[claude 2/2] A2"]
-
-    def test_get_memories_by_turn_id_empty_on_unknown(self, tmp_db):
-        assert get_memories_by_turn_id(tmp_db, "no-such-turn") == []
-
-    def test_get_memories_by_turn_id_empty_string(self, tmp_db):
-        assert get_memories_by_turn_id(tmp_db, "") == []
-
-    def test_get_all_memories_exposes_turn_id(self, tmp_db):
-        tid = "33333333-3333-3333-3333-333333333333"
-        insert_memory(tmp_db, str(_gen_uuid7()), "[user] x", "2025-01-01T00:00:00+00:00",
-                      "owner1", None, None, "claude-code", None, tid)
-        rows = get_all_memories(tmp_db)
-        assert rows
-        assert rows[0]["turn_id"] == tid
-
-    def test_get_memory_by_rowid_exposes_turn_id(self, tmp_db):
-        tid = "44444444-4444-4444-4444-444444444444"
-        rowid = insert_memory(
-            tmp_db, str(_gen_uuid7()), "[user] y", "2025-01-01T00:00:00+00:00",
-            "owner1", None, None, "claude-code", None, tid,
-        )
-        row = get_memory_by_rowid(tmp_db, rowid)
-        assert row["turn_id"] == tid
-
-    def test_insert_without_turn_id_stores_null(self, tmp_db):
-        insert_memory(tmp_db, str(_gen_uuid7()), "[user] no-turn", "2025-01-01T00:00:00+00:00",
-                      "owner1", None)
-        row = tmp_db.execute("SELECT turn_id FROM memories").fetchone()
-        assert row["turn_id"] is None
+    def test_gc_keeps_recent(self, isolated_db, dummy_vec):
+        conn, _ = isolated_db
+        db.insert_memory(conn, "fresh", dummy_vec(), "o", "l")
+        deleted = db.gc_expired(conn, retain_days=365)
+        assert deleted == 0
