@@ -694,7 +694,10 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 2. **Claude 側のペアリング**: Stop フックが C_k（Claude 応答）を保存する際、`.memory/turn_id.txt` から T_k を読み取り、すべての [claude i/N] チャンクに付与します。保存ループ完了後にファイルはクリアされます。
 3. **リカバリ経路**: Stop フックがスキップされた場合、次回 UserPromptSubmit の Step 2（前回 Claude 応答の保存）が当該ファイルを読んで T_k を再利用し、U_k と C_k は同一 turn_id を共有します。
 4. **ペア復元**: `/search` は `results`（スコア順ヒット）と `pairs`（turn_id を持つヒットごとに、同 turn_id の全兄弟行を順序付きで取得）の 2 フィールドを返します。並び順は [user] → [claude]、各ロール内では "i/N" 番号、最後に rowid。
-5. **レンダリング**: メモリコンテキストは "Previous matching exchange(s)" ブロックを "Other memories" ブロックより先に出力します。pairs に含まれた行は重複回避のためスコア一覧から除外されます。
+
+   **実装上の重要規定**: `hybrid_search` は `{"results", "pairs"}` を返すが、**`results` から pair 所属の record を除外してはならない**。`results` は score-ranked の全 hits を含む（pair 所属でも残す）。`pairs` はそれとは独立に、各 turn_id ごとの全 siblings を含む補助情報として返す。重複は許容（renderer 側が Top matches を先頭、pairs を後に配置することで Claude の読み順を制御するため、重複しても害はない）。
+5. **レンダリング（v1.2.0+）**: `memory_context.md` は **`## Top matches (use these to answer the question)` ブロックを先頭** に置く。Top matches はスコア順の高スコア record を含み、**Q-A pair に含まれているレコードも除外せずそのまま含める**（pair 所属で result から消さない）。Q-A pairs は **`## Previous matching Q-A exchanges (supplementary context)`** ブロックとして Top matches **の後** に配置する補助情報。Top matches と Q-A pairs に同じ record が重複出現することを許容する（無害 — Claude は Top matches を先に読んで使うため）。
+   **重要な背景**: 旧仕様は逆順（Q-A pairs を先頭、pair 化 record を results から排他）だった。これは特定の話題の会話が頻出する DB（例：プロジェクト管理に関する会話を毎日繰り返すユーザー）で、その turn_id 内の chunks が score-ranked top を独占し、pair 抽出によって `## Top matches` から data record が消える致命的失敗パターンを引き起こした。Claude が context window 先頭で「無関係な履歴」を見て「答えがない」と誤判断し、Pro の data record が DB に存在するのに「見つかりません」と回答する根本原因となっていた。新仕様で完全に解消。
 6. **スキーマ**: `memories.turn_id TEXT` 列 + `idx_memories_turn_id` インデックス。`insert_memory(..., turn_id=None)` はキーワード専用引数。取得には `get_memories_by_turn_id(conn, turn_id)` を使用します。
 
 ---
