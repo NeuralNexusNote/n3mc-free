@@ -4,6 +4,27 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-04-27
+
+PyPI-readiness patch. Metadata-only change; no behavior, no API,
+no file layout changes. Anyone already on v1.3.0 can stay on v1.3.0
+without functional drawbacks — v1.3.1 only fixes packaging metadata
+so the project is publishable to PyPI.
+
+### Fixed
+- **`pyproject.toml` license metadata** now matches the repository's
+  `LICENSE` file. v1.3.0's `pyproject.toml` declared the project as
+  MIT (both in `project.license` and in the trove classifier), while
+  the actual `LICENSE` file is Apache 2.0. Without this fix,
+  `pip install` would surface incorrect license information and PyPI
+  would reject the upload (or display the wrong license to users).
+  - `project.license`: `MIT` → `Apache-2.0`
+  - classifier: `License :: OSI Approved :: MIT License` →
+    `License :: OSI Approved :: Apache Software License`
+
+### Tests
+96 / 96 passing (unchanged from v1.3.0).
+
 ## [1.3.0] - 2026-04-27
 
 Distribution release. The implementation is now `pip install`-able as a
