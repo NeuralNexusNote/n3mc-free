@@ -20,14 +20,14 @@ This project prioritizes Instructions over Static Code. Please read our Developm
 > Iterated across three AIs — that process is N3MemoryCore.
 
 N3MemoryCore gives Claude Code long-term memory across sessions.
-**Setup is handled entirely by Claude Code. No coding required.**
+**Two install paths supported**: drop the spec into Claude Code and let it build the system, or `pip install` the reference build and run `n3mc --init`. Either way, no manual hook editing. (See [Setup](#setup) below.)
 
 ---
 
 ## Features
 
 - 💾 **Fully local** — Your conversations stay on your machine. Nothing sent to the cloud.
-- 🔍 **Semantic search** — Finds relevant past conversations even when the exact words differ.
+- 🔍 **Semantic search** — Finds relevant past conversations even when the exact words differ. Multilingual by default (`intfloat/multilingual-e5-base`) — works for Japanese, English, Chinese, Korean, and ~100 other languages out of the box. Swap to a language-specialised model via `config.json` if you need higher single-language precision.
 - 🔄 **Persistent across sessions** — Pick up tomorrow where you left off today.
 - ⚡ **Works automatically** — Saving and searching happen automatically. No manual steps needed.
 - 🤖 **Multi-agent ready** — Multiple AI agents share one memory DB. Each agent prioritizes its own memories while accessing the team's collective knowledge.
@@ -94,6 +94,10 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 
 ## Setup
 
+There are two supported setup paths. Pick whichever fits your style.
+
+### Path A — AI-Native Setup (canonical)
+
 1. Pick a specification file from the table above
 2. Drop the file into the Claude Code prompt
 3. Say: "Please implement this."
@@ -101,6 +105,82 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 That's it. Claude Code writes the code, configures the hooks, and sets everything up.
 Setup takes roughly 15–30 minutes (varies by environment and model).
 Memory kicks in from the next session.
+
+### Path B — Quick Start with `pip`
+
+If you'd rather skip the AI implementation step and use the reference build directly:
+
+#### 1. Install
+
+```bash
+git clone https://github.com/NeuralNexusNote/n3mc-free.git
+cd n3mc-free
+pip install -e .          # or  pip install .
+```
+
+Requirements: Python 3.10+. The first server start will download the embedding model (`intfloat/multilingual-e5-base`, ~470 MB) — expect a 2–10 minute one-time delay.
+
+#### 2. Connect to Claude Code
+
+```bash
+n3mc --init
+```
+
+This single command does **everything** needed to wire N3MC into Claude Code:
+
+- Creates `~/.n3mc/` (data lives here — DB, config, audit log, PID file).
+- Writes `~/.n3mc/config.json` with auto-generated `owner_id` / `local_id`.
+- Registers the `UserPromptSubmit` and `Stop` hooks in **your user-global** `~/.claude/settings.json`, pointing to the installed `n3mc-hook` / `n3mc-stop-hook` entry-point scripts. The "user-global" location is essential — it means hooks fire from **any** project directory, not just this repo.
+
+The command is idempotent: re-running it is safe and won't create duplicates.
+
+#### 3. Verify the hook registration
+
+Run this one-liner — it should print `OK`:
+
+```bash
+python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+```
+
+If you see `OK`, the hooks are registered correctly. If you see an `AssertionError`, re-run `n3mc --init`.
+
+#### 4. Restart Claude Code
+
+Close **every** running Claude Code session (terminal CLI windows, IDE extensions like VS Code's "Claude Code" panel, etc.) and start a fresh one. Hooks are read at session startup; sessions started before `n3mc --init` will not pick up the new hooks.
+
+#### 5. Confirm it's working
+
+In a fresh Claude Code session, send any message. After Claude responds, run:
+
+```bash
+n3mc --list
+```
+
+You should see at least two records — one with a `[user]` prefix (your message) and one with a `[claude]` prefix (Claude's response). If the list is empty, jump to **Troubleshooting** below.
+
+#### Optional: change where data lives
+
+Override the data location by setting `N3MC_HOME=/path/to/dir` before running `n3mc --init` (the chosen path is then permanent for that install).
+
+---
+
+### Troubleshooting (Path B)
+
+**`n3mc: command not found` after `pip install`**
+Your Python `Scripts/` (Windows) or `bin/` (macOS/Linux) directory is not on `PATH`. Either add it to `PATH`, or invoke as `python -m n3memorycore.n3memory --init` instead.
+
+**`--list` shows zero records after a real conversation**
+You opened the Claude Code session **before** running `n3mc --init`. Close it completely and open a new session — hooks are loaded at session start.
+
+**Hooks register, but nothing saves**
+Check the audit log:
+```bash
+cat ~/.n3mc/.memory/audit.log | tail -3
+```
+Each user prompt should produce one JSON line. If the file is empty, the hooks aren't firing — confirm Step 3's verification command prints `OK`, and confirm `~/.claude/settings.json` (user-global, not project-local) was the file modified.
+
+**`n3mc --search` returns nothing the first time, but works after**
+The `intfloat/multilingual-e5-base` model is downloading (~470 MB) on the first call. Wait 2–10 minutes for the download to finish, then retry.
 
 ### What to expect after setup
 
@@ -111,15 +191,22 @@ Once setup is complete, everything works automatically from the next session:
 
 ### Backup and restore
 
-To migrate memories to another environment or keep a safe backup, save these 2 files:
-- `n3memory.db` — the memory database
+To migrate memories to another environment or keep a safe backup, save these 2 files
+from `~/.n3mc/`:
+- `.memory/n3memory.db` — the memory database
 - `config.json` — contains `owner_id` and `local_id` UUIDv4 keys
 
 These 2 files must be kept together. If the keys don't match, owner verification will fail.
 
 ### Uninstall
 
-Do not delete the folder directly. Instead, ask Claude Code: "Please uninstall N3MemoryCore." It will safely remove hooks and clean up the configuration.
+```bash
+pip uninstall n3memorycore-free
+rm -rf ~/.n3mc/                                      # delete data (irreversible)
+# Then manually remove the hook entries from ~/.claude/settings.json.
+```
+
+Or, if you set up via Path A, ask Claude Code: "Please uninstall N3MemoryCore."
 
 ## ID Hierarchy
 
@@ -128,16 +215,16 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 | ID | Stored in | Generated | Granularity | Purpose |
 |---|---|---|---|---|
 | `id` (PK) | DB record | Per record (UUIDv7, time-ordered) | **One record** | Unique identifier for each memory — used for deletion and dedup |
-| `owner_id` | `config.json` | First startup (UUIDv4) | **Owner** | Identifies whose data this is — for shared/multi-user scenarios |
-| `local_id` (agent_id) | `config.json` | First startup (UUIDv4) | **Agent / install** | UUIDv4 identifier for the agent. Each agent gets its own UUID in multi-agent setups |
-| `session_id` | In-memory | Per server startup (UUIDv4) | **Server process** | Identifies which server session (stored for compatibility; not used in Free edition ranking) |
-| `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for (agent_id) (e.g. `"claude-code"`) |
+| `owner_id` | `config.json` | First startup (UUIDv4) | **Owner / N3MC server** | Identifies whose data this is — for shared/multi-user scenarios and import provenance |
+| `session_id` | In-memory or supplied by host | Per task / project / conversation (UUIDv4) | **Task / project / conversation** | Groups memories that belong to one task / project / conversation. In Free, drives the `b_session` ranking bias (match=1.0, mismatch=0.6) so the ongoing exchange ranks above unrelated past sessions |
+| `local_id` (agent_id) | `config.json` / API | First startup (UUIDv4), or per request | **Agent / install** | UUIDv4 identifier for the speaking agent. Each agent gets its own UUID in multi-agent setups (in Free, stored but not used in ranking; `b_local` is a Pro feature) |
+| `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for the agent (e.g. `"claude-code"`) |
 
 ```
-owner_id  (one user)
-  └── local_id  (agent's UUIDv4 identifier)
-        ├── agent_name  (its display name: "claude-code", etc.)
-        └── session_id  (one server startup)
+owner_id  (one N3MC server / data owner)
+  └── session_id  (one task / project / conversation)
+        └── local_id  (the speaking agent within that session)
+              ├── agent_name  (its display name: "claude-code", etc.)
               └── id  (one memory record)
 ```
 

@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.2.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.3.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -40,15 +40,30 @@ By using this software, you agree to the terms above.
 
 ### Quick Start
 
+There are two supported setup paths:
+
+**Path A — Quick Start with `pip`** (use the reference build directly)
+
+```bash
+git clone https://github.com/NeuralNexusNote/n3mc-free.git
+cd n3mc-free
+pip install -e .          # editable install; or  pip install .
+n3mc --init               # creates ~/.n3mc/  and registers Claude Code hooks
+```
+
+Then **restart Claude Code**. Memory kicks in from the next session.
+
+**Path B — AI-Native Setup** (regenerate from this specification)
+
 1. Load this specification into Claude Code and ask: "Please implement N3MemoryCore according to this specification."
    - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. No manual steps required.
    - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
 
-> **📖 After implementation**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
+> **📖 After implementation (Path B only)**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
 
 ### Data Backup
 
-All memory data is stored in `N3MemoryCore/.memory/n3memory.db`. To fully preserve your memories, back up both this file and `N3MemoryCore/config.json` (which contains the `owner_id` and `local_id` UUIDv4 keys). The DB alone is sufficient for data recovery, but without the matching `config.json`, owner verification and environment classification will not function correctly.
+All memory data is stored under `~/.n3mc/`. To fully preserve your memories, back up both `~/.n3mc/.memory/n3memory.db` and `~/.n3mc/config.json` (which contains the `owner_id` and `local_id` UUIDv4 keys). The DB alone is sufficient for data recovery, but without the matching `config.json`, owner verification and environment classification will not function correctly. Override the data location with `N3MC_HOME=/path/to/dir` if you need it elsewhere.
 
 ### Upgrading to Pro
 
@@ -60,7 +75,7 @@ Load the Pro specification (`N3MemoryCore_v1.2.0_Pro_*_Complete.md`) into Claude
 Implement long-term memory for Claude Code as a "lifelong asset."
 Exclude source code and accumulate high-density "intent, conclusions, and evaluations" of information. Build a RAG foundation with hybrid search (vector + FTS5) and mathematical correctness, treating data Durability as the top priority. All conversations are automatically saved by hooks. Claude does not need to judge what to save. (The auto-save hooks apply minimal noise filters to exclude trivial responses; see §5 for details.)
 
-> **Do NOT output manual command hints** (e.g., `python n3memory.py --buffer "fact to save"`, `python n3memory.py --search "keyword"`, `python n3memory.py --list`) at any point during or after implementation.
+> **Do NOT output manual command hints** (e.g., `n3mc --buffer "fact to save"`, `n3mc --search "keyword"`, `n3mc --list`) at any point during or after implementation.
 
 > **⚠️ Python check**: Before starting implementation, run `python --version` or `python3 --version` to verify Python 3.10+ is available. If not found, display: "Python 3.10 or higher is required. Install from https://www.python.org/" and **abort setup**.
 
@@ -70,7 +85,7 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7
 ```
 
-> **⚠️ First-run download**: `sentence-transformers` downloads the `e5-base-v2` model (~440 MB) on first server start. This can take **2–10 minutes** — the server will appear unresponsive during this time, which is expected. Subsequent startups complete in seconds once cached.
+> **⚠️ First-run download**: `sentence-transformers` downloads the `multilingual-e5-base` model (~470 MB) on first server start. This can take **2–10 minutes** — the server will appear unresponsive during this time, which is expected. Subsequent startups complete in seconds once cached.
 
 > **Important: Character Limits (Design Constraints for Implementation)**
 > - Hook auto-save: **Complete preservation guaranteed**. Long content is chunked via `core.processor.chunk_text(max_chars=400, overlap=40)` (paragraph → sentence → hard window) and saved as multiple records (`[claude 1/N]`..`[claude N/N]` / `[user 1/N]`..`[user N/N]`). No truncation.
@@ -81,28 +96,59 @@ pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7
 > - **Large text handling**: When a user pastes a long text (spec, article, log, etc.), Claude must NOT save it as-is. Instead: read and understand the full content, extract each key fact as a separate short sentence (~50–200 chars), and save each with its own `--buffer` call. Although auto-save preserves the full raw text via chunking, manually extracted key facts produce higher-quality, more searchable records.
 
 ## 2. Directory Structure (Strictly Enforced)
+
+Code lives in the repository (under `n3memorycore/`). Personal data lives outside the repository under `~/.n3mc/` so that the same package can be `pip install`-ed by anyone without colliding with anyone else's memories.
+
+### Repository layout (what `git clone` gives you)
 ```
-project_root/
-├── N3MemoryCore/            # Main program
-│   ├── core/
-│   │   ├── database.py      # DB layer: schema definitions, CRUD, PRAGMA settings, migrations
-│   │   └── processor.py     # Processing layer: embedding generation, ranking calculation, purify (fenced-code substitution per documented design)
-│   ├── .memory/             # N3MC database storage (hidden folder)
-│   │   ├── n3memory.db      # SQLite DB (vec0 + FTS5)
-│   │   ├── n3mc.pid         # FastAPI server PID file (exists only while running)
-│   │   └── memory_context.md  # Search result output destination (loaded into CLAUDE.md via @import)
-│   ├── n3mc_hook.py         # UserPromptSubmit hook: auto-runs --repair + --search + --buffer (auto-save user messages)
-│   ├── n3mc_stop_hook.py    # Stop hook: auto-saves Claude's response + --stop
-│   ├── n3memory.py          # Main CLI (Stop hook entry point)
-│   ├── config.json          # Persistent config: owner_id, server_port, dedup_threshold, half_life_days, bm25_min_threshold, search_result_limit, context_char_limit (⚠️ excluded from git — contains personal UUIDs)
-│   └── config.json.example  # Settings reference for GitHub (config.json is auto-generated on first run)
-├── .gitignore               # Excludes config.json and .memory/ from git
-└── .claude/                 # Claude Code integration config
-    ├── settings.json        # ★ Hooks and Permissions definitions
-    ├── CLAUDE.md            # @import structure (see §4)
+n3mc-free/                       # Repository root
+├── pyproject.toml               # ★ pip metadata + entry-point declarations
+├── README.md / README_JP.md
+├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
+├── N3MemoryCore_v1.2.0_Free_EN.md / _JP.md   # this specification
+├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
+│   ├── __init__.py              # exposes __version__
+│   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
+│   ├── n3memory.py              # main CLI module (--init / --buffer / --search / --list / --stop / --repair / --hook-submit / --save-claude-turn / --run-server) + FastAPI app
+│   ├── n3mc_hook.py             # UserPromptSubmit hook entry: writes audit.log → calls --hook-submit
+│   ├── n3mc_stop_hook.py        # Stop hook entry: writes audit.log → calls --save-claude-turn → calls --stop
+│   └── core/
+│       ├── __init__.py
+│       ├── database.py          # DB layer: schema definitions, CRUD, PRAGMA settings, migrations
+│       └── processor.py         # Processing layer: embedding generation, ranking calculation, purify (fenced-code substitution per documented design)
+├── tests/                       # pytest suite (see §7)
+│   ├── conftest.py
+│   ├── test_api.py
+│   ├── test_database.py
+│   ├── test_hooks.py
+│   └── test_processor.py
+└── .claude/                     # Project-scoped Claude Code config (tracked)
+    ├── settings.json            # Permission allowlist (Hooks live in user-global ~/.claude/settings.json — see §4)
+    ├── CLAUDE.md                # Per-project guidance (the @import for memory_context.md is added by --stop)
     └── rules/
-        └── n3mc-behavior.md # AI behavioral guidelines (auto-generated by --stop)
+        └── n3mc-behavior.md     # AI behavioral guidelines (auto-generated by --stop)
 ```
+
+### User-data layout (created by `n3mc --init`, NOT in the repository)
+```
+~/.n3mc/                            # Override with $N3MC_HOME if needed
+├── config.json                     # Persistent config: owner_id, local_id, server_port, dedup_threshold, half_life_days, bm25_min_threshold, search_result_limit, context_char_limit, min_score, search_query_max_chars
+└── .memory/
+    ├── n3memory.db                 # SQLite DB (vec0 + FTS5)
+    ├── n3mc.pid                    # FastAPI server PID file (exists only while the server is running)
+    ├── audit.log                   # JSONL hook audit trail (append-only, written before any other action)
+    ├── memory_context.md           # --search output (also @imported into .claude/CLAUDE.md)
+    ├── turn_id.txt                 # Q-A pairing handoff between UserPromptSubmit and Stop hooks
+    ├── fts_punct_cleaned           # one-time FTS5 punctuation-clean migration marker (touched by --repair)
+    └── vec_e5v2_migrated           # one-time vector-reindex migration marker (touched by --repair)
+```
+
+### Console scripts (installed by `pip install`)
+| Script | Maps to | Purpose |
+|---|---|---|
+| `n3mc` | `n3memorycore.n3memory:main` | Primary CLI for humans and Claude Code |
+| `n3mc-hook` | `n3memorycore.n3mc_hook:main` | UserPromptSubmit hook (registered in `~/.claude/settings.json` by `n3mc --init`) |
+| `n3mc-stop-hook` | `n3memorycore.n3mc_stop_hook:main` | Stop hook (registered in `~/.claude/settings.json` by `n3mc --init`) |
 
 ## 3. Technical Specifications (No Modifications Allowed)
 
@@ -135,7 +181,8 @@ owner_id  (one N3MC server / data owner)
 - `local_id` — stored but **not used in Free edition ranking**. Local bias (`b_local`) is a Pro feature; in Free, `b_local` is always 1.0 regardless of match/mismatch. The Pro edition applies `b_local = 1.0` on match and `b_local = 0.8` on mismatch to additionally prioritize the agent's own memories over those from other agents on the same DB.
 
 ### Embeddings
-- Model: `intfloat/e5-base-v2` / Vector: float[768]
+- **Default model**: `intfloat/multilingual-e5-base` / Vector: float[768]
+- The default is multilingual on purpose — it indexes Japanese, English, Chinese, Korean, and ~100 other languages out of the box. Users who need higher precision in a single language can override the model (see "Switching to a language-specialised model" below); the default release does NOT make that decision for them.
 - Always specify `normalize_embeddings=True` at retrieval time to guarantee L2-normalized vectors (norm=1).
 - **Input Prefixes (Required)**: Without prefixes, this model's accuracy degrades significantly. The following must be strictly observed:
 
@@ -147,18 +194,38 @@ text_to_embed = "passage: " + content
 text_to_embed = "query: " + keyword
 ```
 
+#### Switching to a language-specialised model (user-side customisation)
+
+The embedding model is resolved at server startup from (priority order):
+1. `embed_model` field in `~/.n3mc/config.json`
+2. `$N3MC_EMBED_MODEL` environment variable
+3. Built-in default (`intfloat/multilingual-e5-base`)
+
+Examples a user might configure:
+
+| Goal | `embed_model` value | Vector dim |
+|---|---|---|
+| English-only, slightly higher precision | `intfloat/e5-base-v2` | 768 |
+| Multilingual, higher precision (slower, larger) | `intfloat/multilingual-e5-large` | 1024 |
+| Japanese-specialised | `cl-nagoya/sup-simcse-ja-base` | 768 |
+| English, smaller / faster | `intfloat/e5-small-v2` | 384 |
+
+**⚠️ Vector dimension constraint**: `memories_vec` is created with a fixed `float[768]` dimension. Switching to a model with a different vector size requires dropping and recreating the vec table (and re-embedding every record). The reference implementation only supports same-dimension switches without manual intervention.
+
+**Upgrade procedure (same-dimension model swap)**:
+1. Edit `~/.n3mc/config.json` → set `embed_model` to the new model name.
+2. Restart the server (kill the PID file's process, or just let the next CLI call relaunch it).
+3. The next `n3mc --repair` call detects the model mismatch (via the `vec_model.txt` marker in `~/.n3mc/.memory/`) and prints a warning. The on-disk vectors are still from the OLD model, so search quality will be degraded until they are regenerated.
+4. To force a full re-embed: delete `~/.n3mc/.memory/vec_model.txt` and the `memories_vec` rows for affected records (or drop and rebuild the entire vec table), then run `n3mc --repair` to rebuild vectors using the new model.
+
+**⚠️ Different-dimension model swap**: NOT supported by the reference implementation without manual SQL. Drop the `memories_vec` table, recreate it with the new dimension, delete `vec_model.txt`, then run `n3mc --repair`.
+
 ### Inter-module Imports
-At the top of `processor.py`, explicitly configure `sys.path` to avoid dependency on the execution directory:
+Use proper package-relative imports (no `sys.path` hacks). Inside the package:
 
 ```python
-import sys, os
-sys.path.insert(0, os.path.dirname(__file__))  # Add core/ to resolution path
-```
-
-`processor.py` must import all of the following functions from `database.py`:
-
-```python
-from database import (
+# n3memorycore/core/processor.py
+from .database import (
     get_connection,
     init_db,
     insert_memory,
@@ -170,12 +237,30 @@ from database import (
     check_exact_duplicate,
     find_unindexed_memories,
     serialize_vector,        # Required for /repair endpoint
+    get_memories_by_turn_id, # Required for Q-A pairing
+    strip_fts_punctuation,   # Required for /repair FTS migration
 )
 ```
 
+```python
+# n3memorycore/n3memory.py
+from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, CONTEXT_FILE, AUDIT_LOG, CONFIG_FILE, claude_paths
+from .core.database import (
+    get_connection, init_db, migrate_schema, insert_memory,
+    check_exact_duplicate, search_vector, find_unindexed_memories,
+    strip_fts_punctuation, serialize_vector,
+)
+from .core.processor import (
+    embed_passage, cosine_sim_from_l2, hybrid_search,
+    chunk_text, add_chunk_prefixes, purify_text, render_memory_context,
+)
+```
+
+`paths.py` resolves `HOME_DIR` from `$N3MC_HOME` if set, otherwise `~/.n3mc/`. All `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, etc. derive from it. Per-project `.claude/` paths come from `claude_paths()` which uses the current working directory.
+
 ### Resident FastAPI Server
 - **Port**: Default `18520` (configurable via `server_port` in `config.json`)
-- **Start Timing**: On execution of any subcommand in `n3memory.py`, check `N3MemoryCore/.memory/n3mc.pid`; if the process does not exist, automatically start it in the background. Write the PID file using an atomic operation (e.g., `open(..., 'x')` exclusive-create flag) to prevent duplicate launches when multiple processes check simultaneously.
+- **Start Timing**: On execution of any `n3mc` subcommand (or `python -m n3memorycore.n3memory`), check `~/.n3mc/.memory/n3mc.pid`; if the process does not exist, automatically start it in the background as `python -m n3memorycore.n3memory --run-server`. Write the PID file using an atomic operation (e.g., `open(..., 'x')` exclusive-create flag) to prevent duplicate launches when multiple processes check simultaneously.
 - **Communication**: HTTP over TCP (`http://127.0.0.1:{port}`)
 - **Health Monitoring**: On every CLI execution, PING the `/health` endpoint; if unresponsive, delete the old PID file and restart.
 - **Response Target**: Around 0.7s (total of embedding generation + DB search). Treat this as a target, not a strict requirement, as it depends on hardware, OS, and model cache state.
@@ -366,13 +451,17 @@ Completely silence model load warnings and similar output. When launching the Fa
 
 ```python
 import subprocess, sys
-subprocess.Popen([sys.executable, server_path], stderr=subprocess.DEVNULL, ...)
+subprocess.Popen(
+    [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
+    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+)
 ```
 
+- The `-m n3memorycore.n3memory` form is required so the package's relative imports resolve. Do **not** spawn the server by absolute file path.
 - `subprocess.DEVNULL` is a standard constant since Python 3.3. No OS-dependent path needed and no file handle leaks.
 - The caller (e.g., hooks in `settings.json`) does not need to add any redirects.
 
-**Character Encoding (UTF-8)**: At the start of `main()` in `n3memory.py`, **AND at module top of `n3mc_hook.py` and `n3mc_stop_hook.py`** (before any `sys.stdin.read()` or `subprocess.run` invocation), execute the following to resolve character corruption in Windows cp932 environments from within the program itself:
+**Character Encoding (UTF-8)**: At the start of `main()` in `n3memorycore/n3memory.py`, **AND at module top of `n3memorycore/n3mc_hook.py` and `n3memorycore/n3mc_stop_hook.py`** (before any `sys.stdin.read()` or `subprocess.run` invocation), execute the following to resolve character corruption in Windows cp932 environments from within the program itself:
 
 ```python
 for _stream_name in ("stdin", "stdout", "stderr"):
@@ -387,7 +476,7 @@ for _stream_name in ("stdin", "stdout", "stderr"):
 - With this, the caller does not need to specify `python -X utf8`.
 - `reconfigure` is available from Python 3.7 onward. For older environments, use the `PYTHONUTF8=1` environment variable as an alternative.
 - All multilingual text (Japanese, English, Chinese, etc.) is unified as UTF-8.
-- ⚠️ **The reconfigure block is required in EVERY Python entry point that reads stdin or pipes stdin into a subprocess** — that includes `n3memory.py`, `n3mc_hook.py`, AND `n3mc_stop_hook.py`. Forgetting it on any one of them silently mojibakes non-ASCII input on Windows (Japanese, em-dashes, etc.); the corrupted bytes are then persisted to `audit.log` and the DB and cannot be recovered. Run the block at module top in the hooks (not inside `main()`) so it precedes the first `sys.stdin.read()`.
+- ⚠️ **The reconfigure block is required in EVERY Python entry point that reads stdin or pipes stdin into a subprocess** — that includes `n3memorycore/n3memory.py`, `n3memorycore/n3mc_hook.py`, AND `n3memorycore/n3mc_stop_hook.py`. Forgetting it on any one of them silently mojibakes non-ASCII input on Windows (Japanese, em-dashes, etc.); the corrupted bytes are then persisted to `audit.log` and the DB and cannot be recovered. Run the block at module top in the hooks (not inside `main()`) so it precedes the first `sys.stdin.read()`.
 
 **Path Portability**: All file path construction in Python code must use `os.path.join()` or `pathlib.Path`. Hardcoded path separator characters (`\` or `/` as string literals in path construction) are prohibited. The system must run on Windows, macOS, and Linux without code changes.
 
@@ -440,45 +529,49 @@ Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) 
 
 ## 4. Claude Code Integration Settings (Core of Automation)
 
-Register hooks in the **global settings** using absolute paths so they apply to all sessions. Register permissions in the project settings.
+Register hooks in the **user-global** Claude Code settings (`~/.claude/settings.json`) using absolute paths so they apply to all sessions. Register permissions in the project settings (`.claude/settings.json`).
 
 > **🛑 [Mandatory automated step] Hook registration is NOT optional and NOT user-deferred**
 >
 > The single most common reason cross-session RAG fails to work after a "successful" install is that the AI implementing this spec generated all the Python code, started the server, ran `--buffer` / `--search` smoke tests successfully — and then **left the `~/.claude/settings.json` hook block to the user** (or skipped it because it touches a global config file). When this happens, every subsequent Claude Code session running outside the project directory has **zero hooks firing**, so no conversation gets auto-saved and no `--search` runs at the start of each turn. The user sees the smoke test pass, believes the install is complete, and discovers months later that nothing they said to Claude was ever recorded.
 >
-> **The AI implementing this spec MUST write the hook block in §4 ① below into `~/.claude/settings.json` idempotently as part of the automated implementation, before reporting completion.** Do not ask the user to do it manually. Do not output the block as a "next step" instruction. Do not skip it because it modifies a global file. The merge is read-modify-write JSON with field preservation; see "Idempotent Hook Installation Algorithm" below.
+> **The implementation MUST write the hook block in §4 ① below into `~/.claude/settings.json` idempotently as part of automated setup, before reporting completion.** Path A (`pip install` + `n3mc --init`) does this for you. Path B (AI-Native regeneration) must do it programmatically — do not ask the user to do it manually, and do not skip it because it modifies a global file.
 >
-> Verification gate (also see §6 test 7): the implementation is **not** complete until `python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook.py' in c.get('command','') for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook.py' in c.get('command','') for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"` prints `OK`.
+> Verification gate (also see §6 test 7): the implementation is **not** complete until the global `~/.claude/settings.json` contains hook entries whose `command` strings reference `n3mc-hook` (UserPromptSubmit) and `n3mc-stop-hook` (Stop). For pip installs, those resolve to the absolute path of the entry-point scripts (e.g. `.../Scripts/n3mc-hook.exe` on Windows or `.../bin/n3mc-hook` on Unix).
 
 ### ① Global Settings (`~/.claude/settings.json`) — Hook Registration
 
-> Replace `{full path to N3MemoryCore}` with the actual installation path (e.g., `C:/Users/you/Claude Code/N3MemoryCore`).
->
-> **⚠️ Path separators**: Claude Code uses a bash shell, so Windows backslashes (`\`) are interpreted as escape sequences (`\n`→newline, `\t`→tab). **Always use forward slashes (`/`).**
->
-> **⚠️ Permissions and path quoting**: If the installation path contains spaces (e.g., `C:/Users/you/Claude Code/N3MemoryCore`), Claude Code wraps the path in quotes when executing commands (`python "...n3memory.py" --search ...`). Permission patterns must use `*n3memory.py*` with a trailing wildcard (to absorb the closing quote). Using `*n3memory.py --search` without the trailing wildcard will fail to match, causing the user to be prompted for permission on every execution.
+#### Path A — let `n3mc --init` do it (recommended)
+
+After `pip install`, run:
+
+```bash
+n3mc --init
+```
+
+This writes the hook block into `~/.claude/settings.json` with the absolute path resolved by `shutil.which('n3mc-hook')` / `shutil.which('n3mc-stop-hook')`. Re-running is a no-op (idempotent — entries that already reference `n3mc_hook` / `n3mc_stop_hook` in any command string are replaced rather than duplicated).
+
+The resulting block looks like (paths vary per machine):
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "python '{full path to N3MemoryCore}/n3mc_hook.py'"
+            "command": "C:/Users/you/AppData/Local/Programs/Python/Python312/Scripts/n3mc-hook.EXE"
           }
         ]
       }
     ],
     "Stop": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "python '{full path to N3MemoryCore}/n3mc_stop_hook.py'"
+            "command": "C:/Users/you/AppData/Local/Programs/Python/Python312/Scripts/n3mc-stop-hook.EXE"
           }
         ]
       }
@@ -487,63 +580,77 @@ Register hooks in the **global settings** using absolute paths so they apply to 
 }
 ```
 
-#### Idempotent Hook Installation Algorithm (mandatory)
+> **⚠️ Path separators**: Claude Code uses a bash shell, so Windows backslashes (`\`) are interpreted as escape sequences (`\n`→newline, `\t`→tab). `n3mc --init` always writes forward slashes — if you patch the file by hand, do the same.
 
-The AI implementing this spec must execute logic equivalent to the following against `~/.claude/settings.json`. The merge **preserves all existing fields** (`permissions`, `autoUpdatesChannel`, anything else the user has) and only adds the two hook entries if they are missing. Re-running the algorithm on an already-installed environment is a no-op.
+#### Path B — Idempotent Hook Installation Algorithm (for AI-Native regeneration)
+
+When regenerating from this spec, the AI must execute logic equivalent to the following against `~/.claude/settings.json`. The merge **preserves all existing fields** (`permissions`, `autoUpdatesChannel`, anything else the user has) and only adds the two hook entries; entries that already reference our hook scripts are replaced (not duplicated). Re-running the algorithm on an already-installed environment is a no-op.
 
 ```python
-# install_hooks.py — runnable equivalent of the mandatory step
-import json, os, pathlib
+# n3memorycore/n3memory.py:cmd_init — runnable equivalent of the mandatory step
+import json, os, pathlib, shutil, sys
 
-N3MC_ROOT = "{full path to N3MemoryCore}"  # e.g. "E:/N3DEV/n3mc-free"  (forward slashes!)
-SETTINGS  = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
-
+SETTINGS = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
 settings = json.loads(SETTINGS.read_text(encoding="utf-8")) if SETTINGS.exists() else {}
 hooks = settings.setdefault("hooks", {})
 
-def ensure(event, script_basename):
-    entries = hooks.setdefault(event, [])
-    target_cmd = f"python '{N3MC_ROOT}/{script_basename}'"
-    # Already present (any matcher) → no-op
-    for entry in entries:
-        for h in entry.get("hooks", []):
-            if script_basename in h.get("command", ""):
-                return
-    entries.append({"matcher": "", "hooks": [{"type": "command", "command": target_cmd}]})
+def resolve_cmd(script_name: str) -> str:
+    # Prefer the installed entry-point script (n3mc-hook / n3mc-stop-hook).
+    exe = shutil.which(script_name)
+    if exe:
+        return exe
+    # Fallback for non-installed checkouts: spawn via -m.
+    module = {"n3mc-hook": "n3memorycore.n3mc_hook",
+              "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
+    return f'"{sys.executable}" -m {module}'
 
-ensure("UserPromptSubmit", "n3mc_hook.py")
-ensure("Stop",             "n3mc_stop_hook.py")
+def install(event: str, marker: str, command: str) -> None:
+    # Drop any existing entry that references our scripts (any path),
+    # then append the freshly-resolved one.
+    kept = []
+    for entry in hooks.get(event, []):
+        inner = [h for h in entry.get("hooks", []) if marker not in h.get("command", "")]
+        if inner:
+            kept.append({**entry, "hooks": inner})
+    kept.append({"hooks": [{"type": "command", "command": command}]})
+    hooks[event] = kept
+
+install("UserPromptSubmit", "n3mc_hook",      resolve_cmd("n3mc-hook"))
+install("Stop",             "n3mc_stop_hook", resolve_cmd("n3mc-stop-hook"))
 
 SETTINGS.parent.mkdir(parents=True, exist_ok=True)
 SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 ```
 
-- **Why match by script basename, not full command string**: the user may have moved the install root or fixed a path typo; matching on `n3mc_hook.py` / `n3mc_stop_hook.py` keeps the algorithm idempotent across path edits without creating duplicates.
+- **Why match by script-name marker, not full command string**: the user may have moved the install root or upgraded Python; matching on `n3mc_hook` / `n3mc_stop_hook` keeps the algorithm idempotent across path edits without creating duplicates.
 - **Do NOT use `git add`-style trust** (`if "hooks" not in settings: settings["hooks"] = {...}`): an empty `hooks: {}` key still passes that check and the user ends up with no hooks. Always inspect the inner arrays.
 - **Cross-platform path**: forward slashes only inside the `command` string, even on Windows. The bash shell Claude Code spawns interprets backslashes as escape sequences (`\n` → newline).
 
 ### ② Project Settings (`.claude/settings.json`) — Permission Registration
 
+The `n3mc` console script (installed by `pip install`) is the only entry point Claude needs to invoke directly. The hook scripts (`n3mc-hook` / `n3mc-stop-hook`) are spawned by Claude Code itself, not via `Bash(...)`, so they do not need permissions.
+
 ```json
 {
   "permissions": {
     "allow": [
-      "Bash(python *n3memory.py* --search *)",
-      "Bash(python *n3memory.py* --stop*)",
-      "Bash(python *n3memory.py* --repair*)",
-      "Bash(python *n3memory.py* --list*)",
-      "Bash(python *n3mc_hook.py*)",
-      "Bash(python *n3mc_stop_hook.py*)"
+      "Bash(n3mc --search *)",
+      "Bash(n3mc --buffer *)",
+      "Bash(n3mc --list*)",
+      "Bash(n3mc --repair*)",
+      "Bash(n3mc --stop*)"
     ]
   }
 }
 ```
 
+> **⚠️ Path quoting**: With the `n3mc` console script installed on `PATH`, no path quoting is needed. If you launch via `python -m n3memorycore.n3memory ...` instead (e.g. inside a venv where the entry point is not on `PATH`), use a wildcard pattern like `Bash(python *n3memorycore.n3memory* --search *)` to absorb interpreter-path variation.
+
 ### `--stop` Hook Specification (Session Termination Processing)
 
-The responsibility of `--stop` is **session-end cleanup and ensuring the @import reference in CLAUDE.md**. Saving conversation content is fully automated by hooks. Claude AI does not need to manually call `--buffer`. The `Stop` hook (`n3mc_stop_hook.py`) auto-saves Claude's last response in addition to running `--stop` (see [Automated] in §5).
+The responsibility of `--stop` is **session-end cleanup and ensuring the @import reference in CLAUDE.md**. Saving conversation content is fully automated by hooks. Claude AI does not need to manually call `--buffer`. The `Stop` hook (`n3memorycore/n3mc_stop_hook.py`, exposed as the `n3mc-stop-hook` entry point) auto-saves Claude's last response in addition to running `--stop` (see [Automated] in §5).
 
-**`n3mc_stop_hook.py` stdin input spec**: Claude Code passes the following JSON to the Stop hook via standard input. `last_assistant_message` contains the full text of Claude's last response.
+**`n3mc-stop-hook` stdin input spec**: Claude Code passes the following JSON to the Stop hook via standard input. `last_assistant_message` contains the full text of Claude's last response.
 
 ```json
 {
@@ -555,23 +662,25 @@ The responsibility of `--stop` is **session-end cleanup and ensuring the @import
 
 Processing order on `--stop` execution:
 
-1. Ensure `.claude/rules/n3mc-behavior.md` exists with the AI behavioral guidelines (Fully Automatic Saving, Active RAG, etc.). This is an **idempotent** operation — if the file already exists, do nothing.
-2. Ensure `.claude/CLAUDE.md` contains the `@import` reference to `N3MemoryCore/.memory/memory_context.md`. This is an **idempotent** operation — if the line already exists, do nothing.
-   - If `.claude/CLAUDE.md` does not exist, create it with the `@import` line.
-   - **Migration**: If a legacy `<!-- N3MC_AUTO_START -->` ... `<!-- N3MC_AUTO_END -->` zone exists, remove it and add the `@import` line instead.
+1. Ensure `<cwd>/.claude/rules/n3mc-behavior.md` exists with the AI behavioral guidelines (Fully Automatic Saving, Active RAG, etc.). This is an **idempotent** operation — if the file already exists, do nothing.
+2. Ensure `<cwd>/.claude/CLAUDE.md` contains the `@import` reference to `~/.n3mc/.memory/memory_context.md` (resolved as an **absolute path** since the data dir is outside the project tree). This is an **idempotent** operation — if the line already exists, do nothing.
+   - If `<cwd>/.claude/CLAUDE.md` does not exist, create it with the `@import` line.
+   - **Migration**: If a legacy `<!-- N3MC_AUTO_START -->` ... `<!-- N3MC_AUTO_END -->` zone or a relative `@../N3MemoryCore/.memory/...` path exists, remove it and add the absolute `@import` line instead.
 3. Exit normally. Produce no output on success (silence).
 4. Output a fatal failure warning only on DB write failure.
 
 ### CLAUDE.md Structure (@import)
 
-`.claude/CLAUDE.md` references `memory_context.md` via Claude Code's `@import` mechanism. This keeps the CLAUDE.md file compact (a single line for N3MC) and avoids monopolizing a shared resource.
+`<cwd>/.claude/CLAUDE.md` references `memory_context.md` via Claude Code's `@import` mechanism. This keeps the CLAUDE.md file compact (a single line for N3MC) and avoids monopolizing a shared resource. Because the memory data dir lives at `~/.n3mc/` (outside the project), the `@import` path is **absolute** and per-machine — `--stop` writes the resolved absolute path on the first run.
 
 ```markdown
 # (User-managed content)
 # Write user behavioral guidelines and project settings here
 
-@../N3MemoryCore/.memory/memory_context.md
+@C:/Users/you/.n3mc/.memory/memory_context.md
 ```
+
+(On macOS / Linux the path looks like `@/home/you/.n3mc/.memory/memory_context.md`.)
 
 At session start, Claude Code expands the `@import` and loads the contents of `memory_context.md` into context alongside CLAUDE.md. N3MC no longer writes search results directly into CLAUDE.md.
 
@@ -594,18 +703,18 @@ The CLI sends HTTP requests to the FastAPI server. All endpoints are issued to `
 ### `--hook-submit` (UserPromptSubmit Hook Entry Point)
 
 ```bash
-echo '{"message":"user input","last_assistant_message":"Claude response"}' | python n3memory.py --hook-submit
+echo '{"message":"user input","last_assistant_message":"Claude response"}' | n3mc --hook-submit
 ```
 
-Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` fields. Performs all UserPromptSubmit operations in a single process via HTTP requests to the server: `--repair` → `--buffer` (save Claude's response) → `--search` → `--buffer` (save user message). Called by `n3mc_hook.py`; the AI does not need to run this manually. All records saved by this hook are automatically tagged with `agent_name = "claude-code"`.
+Reads JSON from stdin with `message` (or `prompt`) and `last_assistant_message` fields. Performs all UserPromptSubmit operations in a single process via HTTP requests to the server: `--repair` → `--buffer` (save Claude's response) → `--search` → `--buffer` (save user message). Called by the `n3mc-hook` entry point (`n3memorycore/n3mc_hook.py`); the AI does not need to run this manually. All records saved by this hook are automatically tagged with `agent_name = "claude-code"`.
 
 ### `--save-claude-turn` (Stop Hook Helper)
 
 ```bash
-echo '{"session_id":"...","stop_hook_active":true,"last_assistant_message":"Claude response text"}' | python n3memory.py --save-claude-turn
+echo '{"session_id":"...","stop_hook_active":true,"last_assistant_message":"Claude response text"}' | n3mc --save-claude-turn
 ```
 
-Reads the same Stop-hook JSON from stdin, extracts `last_assistant_message`, applies `chunk_text(max_chars=400, overlap=40)`, and saves each chunk as a `[claude]` / `[claude i/N]` record via HTTP `/buffer` calls in a single process. The `turn_id` is read from `.memory/turn_id.txt` (set earlier by `--hook-submit` when it saved the user message); after the save loop the file is cleared. If the file is missing, a fresh UUID4 turn_id is generated. Called by `n3mc_stop_hook.py` only; the AI does not invoke this manually.
+Reads the same Stop-hook JSON from stdin, extracts `last_assistant_message`, applies `chunk_text(max_chars=400, overlap=40)`, and saves each chunk as a `[claude]` / `[claude i/N]` record via HTTP `/buffer` calls in a single process. The `turn_id` is read from `~/.n3mc/.memory/turn_id.txt` (set earlier by `--hook-submit` when it saved the user message); after the save loop the file is cleared. If the file is missing, a fresh UUID4 turn_id is generated. Called by the `n3mc-stop-hook` entry point (`n3memorycore/n3mc_stop_hook.py`) only; the AI does not invoke this manually.
 
 > **Why a dedicated subcommand and not `--buffer -`?** The Stop hook itself reads stdin to extract the JSON envelope; using `--buffer -` would either double-consume stdin or require N subprocess invocations (one per chunk). `--save-claude-turn` performs all chunked saves in a single process, in order, sharing one HTTP keep-alive to the resident server, and it is the canonical "buffer" call referenced in the per-turn subprocess count below.
 
@@ -649,15 +758,15 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 1. Every user message and every Claude response is recorded in FULL, character-for-character, with no truncation.
 2. Long content is split into overlapping chunks by `chunk_text` (max_chars=400, overlap=40, paragraph → sentence → hard-window hierarchy). Each chunk is tagged `[user]` / `[claude]` for single-chunk content, or `[user i/N]` / `[claude i/N]` for multi-chunk content.
 3. NO length filter, NO skip-pattern filter. Fenced code blocks ARE substituted with `[code omitted]` per documented product design; this is the single documented exception and applies to conversation records only (source code is not in scope of complete recording). N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved.
-4. An append-only JSONL audit log at `<N3MC-root>/.memory/audit.log` is written BEFORE anything can fail. This is the last-resort authoritative transcript. Every hook invocation (UserPromptSubmit + Stop) writes one JSON record: `{"ts", "hook", "raw", "payload"}`.
+4. An append-only JSONL audit log at `~/.n3mc/.memory/audit.log` is written BEFORE anything can fail. This is the last-resort authoritative transcript. Every hook invocation (UserPromptSubmit + Stop) writes one JSON record: `{"ts", "hook", "raw", "payload"}`.
 5. On HTTP POST failure to the embedding server, writes fall back to `_buffer_direct` (direct SQLite insert without an embedding; re-indexed by the next `--repair`). Silent drops are forbidden; every failure path either succeeds via fallback or emits to stderr.
 6. Image-only prompts still trigger repair + search + Claude-turn save + audit-log entry. Only Step 4 (user save) is skipped because there is no user text to record.
 
-- **[Automated] Auto-repair, search, and conversation saving**: The `UserPromptSubmit` hook (`n3mc_hook.py`) calls `--hook-submit`, which performs the following steps in a single process. **Step 0 — audit log (always first)**: before anything else, every hook invocation appends one JSON record `{"ts", "hook", "raw", "payload"}` to the append-only `<N3MC-root>/.memory/audit.log`. This is the last-resort authoritative transcript; it is written BEFORE anything can fail, so even if every later step errors out, the raw input is preserved. Then: `--repair` (fix unindexed data), `--buffer` (auto-save Claude's previous response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records), `--search` (retrieve memories), and `--buffer` (auto-save the user message with complete preservation — chunked and saved as `[user]` / `[user i/N]` records). **No length filter, no skip-pattern filter**: every non-empty input is recorded character-for-character with no truncation. When Claude Code passes an image+text prompt, the `prompt` field may be a JSON array; `_extract_text()` extracts only `type=="text"` parts. If the result is empty (image-only prompt), only Step 4 (user save) is skipped because there is no user text to record — repair, Claude-turn save, search, and the audit-log entry still run. The raw multimodal payload is captured in `audit.log`.
-- **[Implementation Spec] Hook subprocess execution method (must not be changed)**: Subprocess calls within `n3mc_hook.py` and `n3mc_stop_hook.py` must use **`subprocess.run` (synchronous/blocking)**, waiting for each command to complete before proceeding to the next. **Do not use `Popen` (async/fire-and-forget).** **Reason**: `--repair` → `--search` has an execution order dependency (search results are incomplete if repair hasn't finished). Additionally, if control returns to Claude before `--search` finishes writing to `memory_context.md`, the search results cannot be read. Asynchronizing for speed destroys data integrity and search accuracy. Note: only the FastAPI server startup (§3 Clean CLI) uses `Popen` (since it does not need to wait for startup to complete).
-- **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3mc_stop_hook.py`) first writes its Step 0 audit-log record (in-process), then invokes two synchronous subprocesses in order:
-  1. `python n3memory.py --save-claude-turn` (stdin = Stop-hook JSON) — chunked save of `last_assistant_message` with `[claude]` / `[claude i/N]` prefixes, sharing the existing turn_id for Q-A pairing. No length filter is applied; every non-empty response is recorded. **Do not use `--buffer -` here**: the Stop hook already consumed stdin to write the audit log.
-  2. `python n3memory.py --stop` — idempotent `@import` setup in `.claude/CLAUDE.md` (see "`--stop` Hook Specification" above).
+- **[Automated] Auto-repair, search, and conversation saving**: The `UserPromptSubmit` hook (`n3memorycore/n3mc_hook.py`, registered as `n3mc-hook`) calls `n3mc --hook-submit`, which performs the following steps in a single process. **Step 0 — audit log (always first)**: before anything else, every hook invocation appends one JSON record `{"ts", "hook", "raw", "payload"}` to the append-only `~/.n3mc/.memory/audit.log`. This is the last-resort authoritative transcript; it is written BEFORE anything can fail, so even if every later step errors out, the raw input is preserved. Then: `--repair` (fix unindexed data), `--buffer` (auto-save Claude's previous response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records), `--search` (retrieve memories), and `--buffer` (auto-save the user message with complete preservation — chunked and saved as `[user]` / `[user i/N]` records). **No length filter, no skip-pattern filter**: every non-empty input is recorded character-for-character with no truncation. When Claude Code passes an image+text prompt, the `prompt` field may be a JSON array; `_extract_text()` extracts only `type=="text"` parts. If the result is empty (image-only prompt), only Step 4 (user save) is skipped because there is no user text to record — repair, Claude-turn save, search, and the audit-log entry still run. The raw multimodal payload is captured in `audit.log`.
+- **[Implementation Spec] Hook subprocess execution method (must not be changed)**: Subprocess calls within `n3memorycore/n3mc_hook.py` and `n3memorycore/n3mc_stop_hook.py` must use **`subprocess.run` (synchronous/blocking)**, waiting for each command to complete before proceeding to the next. **Do not use `Popen` (async/fire-and-forget).** **Reason**: `--repair` → `--search` has an execution order dependency (search results are incomplete if repair hasn't finished). Additionally, if control returns to Claude before `--search` finishes writing to `memory_context.md`, the search results cannot be read. Asynchronizing for speed destroys data integrity and search accuracy. Note: only the FastAPI server startup (§3 Clean CLI) uses `Popen` (since it does not need to wait for startup to complete).
+- **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3memorycore/n3mc_stop_hook.py`, registered as `n3mc-stop-hook`) first writes its Step 0 audit-log record (in-process), then invokes two synchronous subprocesses in order:
+  1. `python -m n3memorycore.n3memory --save-claude-turn` (stdin = Stop-hook JSON) — chunked save of `last_assistant_message` with `[claude]` / `[claude i/N]` prefixes, sharing the existing turn_id for Q-A pairing. No length filter is applied; every non-empty response is recorded. **Do not use `--buffer -` here**: the Stop hook already consumed stdin to write the audit log.
+  2. `python -m n3memorycore.n3memory --stop` — idempotent `@import` setup in `<cwd>/.claude/CLAUDE.md` (see "`--stop` Hook Specification" above).
 
   Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (`--save-claude-turn` + `--stop`) = 3 calls.
 - **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records. Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired.
@@ -667,7 +776,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   > ⚠️ Physical save failed. Current memories may be lost.
 - **[AI Behavioral Guidelines] Active RAG**: When knowledge is insufficient, proactively execute `--search` to retrieve relevant memories. The command is auto-approved via `permissions.allow` — no confirmation needed.
 - **[AI Behavioral Guidelines] Recall acknowledgment**: When `--search` results **actually shape your reply** (you are recalling information saved in an earlier turn), open the reply with a short acknowledgment **in the user's language**, e.g. Japanese 「前回の回答がメモリに保存されています。」 or English "Pulling this from earlier memory in this session." **If no relevant memory was found, or if retrieved snippets did not influence your answer, do not announce anything.** Never announce the mere act of searching — only the act of recalling. This lets the user see the memory layer is alive each turn.
-- **[Implementation Spec] Context injection (both stdout and file are required)**: `--search` results must be **printed to stdout via `print()`** and simultaneously **written to file** `N3MemoryCore/.memory/memory_context.md`. **Both must be performed.** Without stdout output, Claude cannot see the search results and will respond "I don't have that memory" even when the data exists in the DB. File write alone does not deliver results to Claude.
+- **[Implementation Spec] Context injection (both stdout and file are required)**: `--search` results must be **printed to stdout via `print()`** and simultaneously **written to file** `~/.n3mc/.memory/memory_context.md`. **Both must be performed.** Without stdout output, Claude cannot see the search results and will respond "I don't have that memory" even when the data exists in the DB. File write alone does not deliver results to Claude.
 - **[Implementation Spec] Memory-context freshness on every invocation (no stale context)**: `cmd_search` MUST overwrite `memory_context.md` and print to stdout on **every** invocation, regardless of outcome. Failure paths emit a degraded-state placeholder so Claude does not silently consume last turn's results as if they were current:
   - **Empty query** (image-only prompt, or `--search ""`) → write `# Recalled Memory Context\n\n_No relevant memories found._\n` and print it to stdout. Empty does not mean "skip the write" — the write IS the signal that no relevant memory exists for this turn.
   - **Server unreachable / `/search` non-2xx error** → write `# Recalled Memory Context\n\n_(memory search unavailable: <reason>)_\n` and print it to stdout. This makes the memory layer's downtime visible to Claude rather than presenting last turn's results.
@@ -675,7 +784,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 
   Stale `memory_context.md` from a prior turn becoming the new session's `@import`-resolved context is treated as a **correctness bug**, not a performance trade-off. The fresh write is mandatory on every `cmd_search` invocation, including via `--hook-submit` for image-only prompts (spec §5 "Image-only prompts still trigger ... search").
 - **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
-- **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | python n3memory.py --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id ID` argument to tag the record with the agent identifier (e.g., `python n3memory.py --buffer "text" --agent-id "claude-code"`).
+- **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | n3mc --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3memorycore/n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id ID` argument to tag the record with the agent identifier (e.g., `n3mc --buffer "text" --agent-id "claude-code"`).
 - **[Customization] Language localization**: Not applicable. Skip patterns (`_SKIP_PATTERNS`) have been REMOVED in favor of the complete-recording contract; there is nothing language-specific to localize in the hook filter layer.
 - **[Implementation Specs] Deduplication & HTTP-failure fallback**:
   - While server is running: Skip saving if cos_sim ≥ `dedup_threshold` (0.95) or exact string match.
@@ -685,7 +794,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Implementation Specs] _load_vec_extension idempotency**: Loading the sqlite-vec extension twice on the same connection is a no-op — if the extension is already loaded, the load call raises an exception containing "already" or "duplicate" in its message. Catch such exceptions and continue; re-raise all others.
 - **[Implementation Specs] delete_memory transactional**: `delete_memory` calls `_load_vec_extension(conn)` first, then wraps all three DELETEs (memories_fts, memories_vec, memories) in a try/except with `conn.rollback()` on failure. All three indexes succeed or all roll back together.
 - **[Implementation Specs] lifespan startup**: Use FastAPI's `@asynccontextmanager` lifespan pattern (`async def lifespan(app: FastAPI)` with `yield`, passed to `FastAPI(lifespan=lifespan)`) instead of the deprecated `@app.on_event("startup")`.
-- **[Implementation Specs] Vector re-index migration**: When upgrading the embedding model from `multilingual-e5-base` to `e5-base-v2`, a one-time vector re-index migration (`_run_vec_reindex`) is triggered on the first `--repair` call after upgrade, controlled by a marker file `vec_e5v2_migrated`.
+- **[Implementation Specs] Vector model marker**: On every `--repair` call, the server writes the currently-active embedding model name into `~/.n3mc/.memory/vec_model.txt` (creating it on first run). If the file exists with a name that differs from `cfg['embed_model']`, the server prints a warning to stderr — the on-disk vectors were generated by a different model than the one currently configured, so similarity search will be degraded until the vectors are regenerated. The reference implementation does NOT auto-trigger re-embedding (the operation can take many minutes on a large DB); the user is responsible for the manual upgrade procedure documented in §3 "Switching to a language-specialised model".
 - **[AI Behavioral Guidelines] Utilizing CLAUDE.md**: At the start of the next session, read `.claude/CLAUDE.md` and inherit the behavioral guidelines from the previous session. Memory context is loaded via `@import` from `memory_context.md` (see §4).
 
 ### Q-A Pairing Contract
@@ -697,13 +806,13 @@ Every [user] and [claude i/N] row recorded for the same conversational turn shar
 4. **Pair reconstruction**: `/search` returns two fields — `results` (score-ranked hits) and `pairs` (for every hit with a turn_id, the full ordered list of sibling rows). Ordering is: [user] rows first, then [claude] rows, each group by chunk index "i/N", then by rowid.
 
    **Critical implementation rule**: `hybrid_search` returns `{"results", "pairs"}`, but **`results` MUST NOT exclude records that also belong to a pair**. `results` contains all score-ranked hits in full (pair members are kept). `pairs` is a separate supplementary list of siblings grouped by turn_id. Overlap is allowed because the renderer places `## Top matches` first and `## Previous matching Q-A exchanges` second, so Claude reads the highest-confidence answer first regardless of overlap.
-5. **Rendering (v1.2.0+)**: `memory_context.md` puts a **`## Top matches (use these to answer the question)` block FIRST**. Top matches contain all high-scoring records in score order, **including records that also belong to a Q-A pair** (do NOT suppress them from the result list). Q-A pairs follow as a **`## Previous matching Q-A exchanges (supplementary context)`** block placed AFTER Top matches. Overlap between sections is allowed: a record may appear in both Top matches and a Q-A pair — harmless because Claude reads Top matches first.
+5. **Rendering (v1.2.0+)**: `memory_context.md` puts a **`## Top matches (use these to answer the question)` block FIRST** (v1.2.0+ renderer; carried forward unchanged in v1.3.0). Top matches contain all high-scoring records in score order, **including records that also belong to a Q-A pair** (do NOT suppress them from the result list). Q-A pairs follow as a **`## Previous matching Q-A exchanges (supplementary context)`** block placed AFTER Top matches. Overlap between sections is allowed: a record may appear in both Top matches and a Q-A pair — harmless because Claude reads Top matches first.
    **Important background**: Earlier spec drafts had the reverse ordering (Q-A pairs at top, pair members suppressed from results). This caused a critical failure mode in databases dominated by recurring conversation themes (e.g., a user who regularly discusses project management): the chunks of one popular turn_id would occupy the top of the score ranking, and pair extraction would yank them out of `results`, leaving `## Top matches` empty of useful data. Claude, encountering 5KB of unrelated conversation history at the top of memory_context.md, would conclude "the answer isn't here" and fall back to MCP / training, falsely reporting "I don't have that information" even though the actual data record existed in the Pro DB. The new ordering eliminates this failure mode.
 6. **Schema**: `memories.turn_id TEXT` with index `idx_memories_turn_id`. `insert_memory(..., turn_id=None)` is the keyword-only parameter. `get_memories_by_turn_id(conn, turn_id)` is the helper used by retrieval.
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.2.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.3.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
@@ -732,21 +841,21 @@ After implementation is complete, autonomously resolve the following tests and r
    - English example: save `"Planet [Alpha-9] temperature settings"`, search with `"Alpha-9 temperature"`
    - Japanese example: save `架空の惑星「アルファ9」の気温設定`, search with `アルファ9の気温`
 
-6. **--repair FTS Migration Test**: Delete the `.memory/fts_punct_cleaned` marker file, then run `--repair` and verify the following:
+6. **--repair FTS Migration Test**: Delete the `~/.n3mc/.memory/fts_punct_cleaned` marker file, then run `n3mc --repair` and verify the following:
    - FTS cleaning is executed (if punctuated records exist, the count is reported)
-   - The `.memory/fts_punct_cleaned` marker file is created
-   - Running `--repair` again skips FTS cleaning (full-table scan is avoided due to the marker)
+   - The `~/.n3mc/.memory/fts_punct_cleaned` marker file is created
+   - Running `n3mc --repair` again skips FTS cleaning (full-table scan is avoided due to the marker)
 
 7. **Hook integration test**: Verify the following within a Claude Code session:
    1. **Global hook registration is in place** (mandatory gate — see §4 ① "Mandatory automated step"). Run:
       ```bash
-      python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook.py' in c.get('command','') for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook.py' in c.get('command','') for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+      python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc_hook' in c.get('command','').lower() or 'n3mc-hook' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc_stop_hook' in c.get('command','').lower() or 'n3mc-stop-hook' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
       ```
-      Pass criterion: prints `OK`. If this assertion fails, **the implementation is not complete** — re-run the idempotent installer in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
-   2. **UserPromptSubmit**: From a Claude Code session running **outside the N3MemoryCore project directory** (e.g. `~`), send a user message and confirm that `--search` results are written to `memory_context.md`. Confirm that both the preceding Claude response and the user message are saved to the DB (check `--list` for records with `[claude]` and `[user]` prefixes). The "outside the project directory" stipulation is essential — running the test from inside the project would mask a missing global registration.
-   3. **Stop**: After session termination of that same outside-the-project session, confirm that Claude's final response is saved to the DB. Confirm that `.claude/CLAUDE.md` contains an `@import` line pointing to `memory_context.md`.
+      Pass criterion: prints `OK`. If this assertion fails, **the implementation is not complete** — run `n3mc --init` (Path A) or re-run the idempotent installer (Path B) in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
+   2. **UserPromptSubmit**: From a Claude Code session running **outside the n3mc-free project directory** (e.g. `~`), send a user message and confirm that `--search` results are written to `~/.n3mc/.memory/memory_context.md`. Confirm that both the preceding Claude response and the user message are saved to the DB (check `n3mc --list` for records with `[claude]` and `[user]` prefixes). The "outside the project directory" stipulation is essential — running the test from inside the project would mask a missing global registration.
+   3. **Stop**: After session termination of that same outside-the-project session, confirm that Claude's final response is saved to the DB. Confirm that the project's `.claude/CLAUDE.md` contains an `@import` line pointing to the absolute path of `~/.n3mc/.memory/memory_context.md`.
 
-8. **memory_context.md dual output test**: Run `--search` and confirm that results are **printed to stdout** AND **written to `N3MemoryCore/.memory/memory_context.md`**. If only one output channel works, the test fails.
+8. **memory_context.md dual output test**: Run `--search` and confirm that results are **printed to stdout** AND **written to `~/.n3mc/.memory/memory_context.md`**. If only one output channel works, the test fails.
 
 9. **Complete-Recording Test (replaces the old Noise-Filter test)**: Verify that the filters described below are REMOVED and that every non-empty input is recorded:
     - Pass a 2-character string with `[claude]` prefix via `--hook-submit` and confirm the **record IS saved**. (Old `len(text) >= 3` filter no longer exists.)
@@ -772,14 +881,30 @@ After implementation is complete, autonomously resolve the following tests and r
 
 ### Directory Structure
 
+Tests live at the repository root (NOT inside the package). Imports resolve via the installed `n3memorycore` package, not via `sys.path` hacks.
+
 ```
-N3MemoryCore/
+n3mc-free/
 └── tests/
     ├── conftest.py          # Shared fixtures: isolated DB, config, dummy vectors
     ├── test_database.py     # Layer 1: DB unit tests (CRUD, schema, transactions)
     ├── test_processor.py    # Layer 2: Ranking math, purify `[code omitted]` substitution, Refresh
     ├── test_api.py          # Layer 3: FastAPI endpoint tests (TestClient)
     └── test_hooks.py        # Layer 4: Hook integration (complete-preservation chunking, image strip, audit log)
+```
+
+Standard fixture import style:
+
+```python
+# tests/conftest.py
+from n3memorycore.core.database import get_connection, init_db
+from n3memorycore.core.processor import get_model
+```
+
+Tests should NOT use `sys.path.insert(...)`. Run from the repo root after `pip install -e ".[test]"`:
+
+```bash
+python -m pytest tests/ -v
 ```
 
 ### Layer 1: `test_database.py` (27 tests)
@@ -850,7 +975,7 @@ python -m pytest tests/ -v -k "not TestEmbedding"
 
 ## 📎 Reference: GPU Acceleration
 
-> With the current default configuration (384-dim model, 1 embedding per prompt), CPU performance is sufficient. GPU is not required.
+> With the current default configuration (768-dim multilingual-e5-base model, 1 embedding per prompt), CPU performance is sufficient. GPU is not required.
 > Consider GPU acceleration only if switching to a 1024-dim model or if latency is a concern.
 
 If you have an NVIDIA CUDA-compatible GPU, the following command may speed up embeddings:
