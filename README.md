@@ -112,10 +112,18 @@ If you'd rather skip the AI implementation step and use the reference build dire
 
 #### 1. Install
 
+The simplest install — straight from PyPI (no clone needed):
+
+```bash
+pip install n3memorycore-free
+```
+
+Or, if you want a local checkout to read / modify / contribute:
+
 ```bash
 git clone https://github.com/NeuralNexusNote/n3mc-free.git
 cd n3mc-free
-pip install -e .          # or  pip install .
+pip install -e .          # editable install
 ```
 
 Requirements: Python 3.10+. The first server start will download the embedding model (`intfloat/multilingual-e5-base`, ~470 MB) — expect a 2–10 minute one-time delay.
