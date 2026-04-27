@@ -4,6 +4,143 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-27
+
+Distribution release. The implementation is now `pip install`-able as a
+proper Python package, the embedding model defaults to multilingual, and
+data lives outside the repository so forks no longer ship anyone's personal
+memory. The user-facing CLI surface is unchanged from v1.2.1; everything
+new is opt-in or transparent after the documented migration steps.
+
+### Added
+- **`pip install` support** — `pyproject.toml` declares the project,
+  `setuptools` finds the `n3memorycore` package automatically, and three
+  console scripts are exposed: `n3mc`, `n3mc-hook`, `n3mc-stop-hook`.
+  `pip install -e .` (editable) and `pip install .` (normal) both work
+  from the repo root.
+- **`n3mc --init` command** — single-shot setup that creates `~/.n3mc/`,
+  writes `config.json` with auto-generated `owner_id` / `local_id`, and
+  registers the `UserPromptSubmit` / `Stop` hooks in user-global
+  `~/.claude/settings.json` pointing at the installed entry-point scripts.
+  Idempotent — re-running replaces existing entries that reference our
+  scripts (matched by script-name marker, not full path) instead of
+  duplicating.
+- **Multilingual default model** — `intfloat/multilingual-e5-base`
+  (768-dim) replaces `intfloat/e5-base-v2`. Indexes Japanese, English,
+  Chinese, Korean and ~100 other languages out of the box. Users who need
+  higher precision in a single language can override via `embed_model`
+  in `config.json` or the `$N3MC_EMBED_MODEL` environment variable; a new
+  `~/.n3mc/.memory/vec_model.txt` marker records the model that built the
+  on-disk vectors and `--repair` warns when the marker disagrees with
+  current config (manual re-embed path documented in spec §3).
+- **`embed_model` config field** — first-class user override for the
+  embedding model, resolved at server startup with priority
+  `config.json` → `$N3MC_EMBED_MODEL` → built-in default.
+- **`paths.py` module** — centralises path resolution. `$N3MC_HOME`
+  overrides the data root if `~/.n3mc/` is not where the user wants it.
+- **Encoding regression suite restored** — `tests/test_hooks_encoding.py`
+  rewritten for the new package layout (16 tests pinning surrogate
+  stripping, SQLite acceptance, purify-applies-sanitization, and the
+  cp932→utf-8 mojibake heuristic / recovery roundtrip).
+
+### Changed (BREAKING — repository layout and data location)
+- **Package layout**: code moved from root-level scripts (`n3memory.py`,
+  `n3mc_hook.py`, `n3mc_stop_hook.py`, `core/`) into the lowercase
+  `n3memorycore/` package. Imports are now package-relative
+  (`from .core.database import ...`); the legacy `sys.path.insert(...)`
+  hack at module top is removed. The server is launched as
+  `python -m n3memorycore.n3memory --run-server` (file-path invocation
+  no longer works because the relative imports require package context).
+- **Data location**: persistent data moved from `<repo>/.memory/` and
+  `<repo>/config.json` to `~/.n3mc/.memory/` and `~/.n3mc/config.json`.
+  This means the repository can be `pip install`-ed without leaking
+  per-user data into anyone else's checkout, and the same install
+  serves all working directories. **Existing v1.2.x users must
+  manually copy their old `.memory/n3memory.db` and `config.json` to
+  the new location before upgrading.**
+- **Vector model marker renamed**: `vec_e5v2_migrated` (empty marker)
+  → `vec_model.txt` (records the embedding-model name in plain text).
+  `--repair` now reads the marker and warns when it disagrees with
+  `cfg['embed_model']` — search quality is degraded until the user
+  rebuilds vectors against the new model. Auto re-embed is intentionally
+  not triggered (can take many minutes on a large DB).
+- **`@import` line in `.claude/CLAUDE.md`**: `--stop` now writes the
+  **absolute path** to `~/.n3mc/.memory/memory_context.md` (resolved at
+  hook execution time per machine). The old relative path
+  `@../N3MemoryCore/.memory/memory_context.md` no longer makes sense
+  because the data dir is outside the project tree. Migration: the
+  relative form is detected and rewritten to the absolute form on the
+  next `--stop` call.
+- **Permission allow-list**: project `.claude/settings.json` permission
+  patterns now reference the `n3mc` console script
+  (`Bash(n3mc --search *)` etc.) instead of `Bash(python *n3memory.py* …)`.
+- **README / spec restructured**: setup section now leads with two
+  parallel paths (Path A: AI-Native regeneration; Path B: pip install).
+  Path B includes a 5-step procedure (install → connect → verify →
+  restart → confirm) and a dedicated troubleshooting section.
+
+### Fixed
+- **`init_db` order tolerance**: creating the `idx_memories_turn_id`
+  index no longer fails when called against an old-schema DB that lacks
+  the `turn_id` column. The index is created only after `migrate_schema`
+  adds the column.
+- **`strip_fts_punctuation` word boundary**: punctuation between word
+  characters is now substituted with a single space, not deleted. This
+  preserves the boundary so `Alpha-9` indexes as two tokens
+  (`alpha` + `9`) and a query for just `Alpha` matches the record.
+  Previously the dash was deleted, concatenating to `alpha9`, which
+  required an exact-substring query to hit.
+- **`cmd_repair` count surfacing**: the CLI now reads the HTTP
+  `count` field from the `/repair` endpoint and prints
+  `Repaired N record(s).` to stderr when any records were repaired.
+  Previously the server-side stderr message was discarded by
+  `subprocess.DEVNULL`, so `--repair` was completely silent on the
+  client side regardless of how many records were re-indexed.
+- **Repair-loop error visibility**: failures inside `cmd_hook_submit`'s
+  pre-search `--repair` call are now logged via `logger.warning`
+  instead of swallowed with `pass`, so degraded states are observable
+  in the audit log.
+
+### Restored from v1.2.1 (had been lost during the v1.3.0 refactor)
+- `core/processor.sanitize_surrogates` — strips lone UTF-16 surrogates
+  to prevent silent SQLite `UnicodeEncodeError` data loss on Windows
+  subprocess pipes. Applied in `purify_text`, `_buffer_direct`, and
+  the audit-log writers in both hook entry points.
+- `run_mojibake_recovery` — one-time, idempotent (marker file
+  `~/.n3mc/.memory/mojibake_recovered`) cp932→utf-8 roundtrip on
+  existing rows from pre-1.2.0 installs. Prefixes recovered content
+  with `[recovered] ` and resyncs FTS. Original timestamps are
+  preserved so time-decay history is not zeroed. Invoked once at
+  server startup (lifespan).
+
+### Removed
+- `tests/test_hooks_encoding.py` (old `sys.path` form) — replaced by
+  the new package-relative version with the same coverage.
+- Legacy root-level scripts (`n3memory.py`, `n3mc_hook.py`,
+  `n3mc_stop_hook.py`, `core/`) — superseded by the `n3memorycore/`
+  package.
+- `<repo>/memory/` directory and the personal `n3memory.db` it
+  contained — never appropriate to ship in a public repository.
+
+### Migration from v1.2.x
+1. Back up your existing data: copy `<old-repo>/.memory/n3memory.db`
+   and `<old-repo>/config.json` aside.
+2. `pip install -e .` (or `pip install .`) the new package.
+3. `n3mc --init` to create `~/.n3mc/` and register the new hooks.
+4. Move your backed-up files into `~/.n3mc/`:
+   - `cp .memory/n3memory.db ~/.n3mc/.memory/n3memory.db`
+   - `cp config.json ~/.n3mc/config.json`
+5. Restart Claude Code (close every running session first — hooks
+   are loaded at session start).
+6. Run `n3mc --repair` once. If it warns about a model mismatch,
+   either accept degraded search quality on old vectors or follow the
+   "Switching to a language-specialised model" procedure in spec §3
+   to rebuild vectors against the new default
+   (`intfloat/multilingual-e5-base`).
+
+### Tests
+96 / 96 passing (80 baseline + 16 encoding regression).
+
 ## [1.2.1] - 2026-04-25
 
 Maintenance release that completes the encoding-safety contract declared
