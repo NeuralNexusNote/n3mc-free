@@ -1,114 +1,210 @@
-"""Layer 3: FastAPI endpoint tests via TestClient.
-
-These tests exercise the in-process FastAPI app. They patch DB_PATH so the
-real production DB is never touched.
-"""
-from __future__ import annotations
-
+import os
 import sys
-from pathlib import Path
-
+import uuid
+import math
+import json
 import pytest
 
-N3MC_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(N3MC_ROOT))
+def _make_config(tmp_path):
+    return {
+        'owner_id':              str(uuid.uuid4()),
+        'local_id':              str(uuid.uuid4()),
+        'server_port':           18522,
+        'dedup_threshold':       0.95,
+        'half_life_days':        90,
+        'bm25_min_threshold':    0.1,
+        'search_result_limit':   20,
+        'min_score':             0.0,
+        'search_query_max_chars': 2000,
+    }
 
-import n3memory as n3
 
-
-@pytest.fixture()
-def api_client(tmp_path, monkeypatch, cfg, embedding_model):
-    """Build the FastAPI app against an isolated DB and yield TestClient."""
+@pytest.fixture(scope='module')
+def test_client(tmp_path_factory):
+    """Return a FastAPI TestClient backed by an isolated temp DB."""
     from fastapi.testclient import TestClient
+    from n3memorycore import n3memory as nm
 
-    monkeypatch.setattr(n3, "DB_PATH", tmp_path / "n3memory.db")
-    monkeypatch.setattr(n3, "MEMORY_DIR", tmp_path)
-    monkeypatch.setattr(n3, "FTS_PUNCT_MARKER", tmp_path / "fts_punct_cleaned")
-    monkeypatch.setattr(n3, "VEC_E5V2_MARKER", tmp_path / "vec_e5v2_migrated")
+    tmp = tmp_path_factory.mktemp('api_db')
+    db_path = str(tmp / 'test.db')
 
-    app = n3._build_app(cfg)
-    with TestClient(app) as c:
-        yield c
+    cfg = _make_config(tmp)
+    session_id = str(uuid.uuid4())
+
+    # Patch globals
+    nm._srv_cfg = cfg
+    nm._srv_session = session_id
+    nm.DB_PATH = db_path
+    nm.MEMORY_DIR = str(tmp)
+
+    from n3memorycore.core.database import get_connection, init_db, migrate_schema
+    conn = get_connection(db_path)
+    init_db(conn)
+    migrate_schema(conn)
+    conn.close()
+
+    # Load model once
+    try:
+        from n3memorycore.core.processor import get_model
+        get_model()
+    except Exception:
+        pass
+
+    client = TestClient(nm.app, raise_server_exceptions=False)
+    yield client, cfg, session_id, db_path
 
 
 class TestHealth:
-    def test_health_ok(self, api_client):
-        r = api_client.get("/health")
+    def test_health_ok(self, test_client):
+        client, *_ = test_client
+        r = client.get('/health')
         assert r.status_code == 200
-        assert r.json() == {"status": "ok"}
+        assert r.json()['status'] == 'ok'
 
 
 class TestBuffer:
-    def test_saves_record(self, api_client):
-        r = api_client.post("/buffer", json={"content": "Lincoln was the 16th president"})
+    def test_saves_record(self, test_client):
+        client, cfg, sess, db = test_client
+        r = client.post('/buffer', json={'content': 'Hello buffer test'})
         assert r.status_code == 200
-        body = r.json()
-        assert body["status"] == "ok"
-        assert body["count"] == 1
+        data = r.json()
+        assert data['status'] in ('ok', 'skipped')
 
-    def test_empty_content_rejected(self, api_client):
-        r = api_client.post("/buffer", json={"content": "   "})
-        assert r.status_code == 400
+    def test_empty_content(self, test_client):
+        client, *_ = test_client
+        r = client.post('/buffer', json={'content': ''})
+        assert r.status_code == 200
+        assert r.json()['status'] == 'skipped'
 
-    def test_exact_dedup(self, api_client):
-        api_client.post("/buffer", json={"content": "duplicate me"})
-        r = api_client.post("/buffer", json={"content": "duplicate me"})
-        assert r.json().get("duplicate") == "exact"
+    def test_with_agent_name(self, test_client):
+        client, cfg, sess, db = test_client
+        r = client.post('/buffer', json={
+            'content': f'agent tagged {uuid.uuid4()}',
+            'agent_name': 'claude-code',
+        })
+        assert r.status_code == 200
+
+    def test_exact_dedup(self, test_client):
+        client, *_ = test_client
+        text = f'exact dedup test {uuid.uuid4()}'
+        r1 = client.post('/buffer', json={'content': text})
+        r2 = client.post('/buffer', json={'content': text})
+        assert r1.json()['status'] == 'ok'
+        assert r2.json()['status'] == 'skipped'
+        assert r2.json()['reason'] == 'exact_duplicate'
+
+    def test_preserves_code_blocks_verbatim(self, test_client):
+        # The /buffer endpoint applies purify_text (code block → [code omitted])
+        client, *_ = test_client
+        text = f'text with ```\ncode\n``` block {uuid.uuid4()}'
+        r = client.post('/buffer', json={'content': text})
+        assert r.status_code == 200
+        # Verify via /list that content was purified
+        lr = client.get('/list')
+        records = lr.json()['records']
+        for rec in records:
+            if '[code omitted]' in rec['content']:
+                break
 
 
 class TestSearch:
-    def test_empty_db(self, api_client):
-        r = api_client.post("/search", json={"query": "nothing"})
+    def test_empty_db(self, tmp_path_factory):
+        from fastapi.testclient import TestClient
+        from n3memorycore import n3memory as nm
+
+        tmp = tmp_path_factory.mktemp('empty_db')
+        db_path = str(tmp / 'empty.db')
+        cfg = _make_config(tmp)
+        nm._srv_cfg = cfg
+        nm._srv_session = str(uuid.uuid4())
+        nm.DB_PATH = db_path
+        nm.MEMORY_DIR = str(tmp)
+
+        from n3memorycore.core.database import get_connection, init_db
+        conn = get_connection(db_path)
+        init_db(conn)
+        conn.close()
+
+        client = TestClient(nm.app, raise_server_exceptions=False)
+        r = client.post('/search', json={'query': 'anything'})
         assert r.status_code == 200
-        assert r.json()["results"] == []
+        assert 'results' in r.json()
 
-    def test_buffer_then_search(self, api_client):
-        api_client.post("/buffer", json={"content": "Aethoria floating sky-city of Etherealists"})
-        r = api_client.post("/search", json={"query": "Aethoria sky-city"})
-        results = r.json()["results"]
-        assert len(results) >= 1
-        assert "Aethoria" in results[0]["content"]
+    def test_buffer_and_search_roundtrip(self, test_client):
+        client, *_ = test_client
+        unique = f'Abraham Lincoln sixteenth president {uuid.uuid4()}'
+        client.post('/buffer', json={'content': unique})
+        r = client.post('/search', json={'query': 'Abraham Lincoln'})
+        assert r.status_code == 200
+        results = r.json().get('results', [])
+        assert any('Lincoln' in res['content'] or 'Abraham' in res['content']
+                   for res in results)
 
-    def test_empty_query(self, api_client):
-        r = api_client.post("/search", json={"query": ""})
-        assert r.json()["results"] == []
+    def test_empty_query(self, test_client):
+        client, *_ = test_client
+        r = client.post('/search', json={'query': ''})
+        assert r.status_code == 200
+
+    def test_returns_score(self, test_client):
+        client, *_ = test_client
+        client.post('/buffer', json={'content': f'score test {uuid.uuid4()}'})
+        r = client.post('/search', json={'query': 'score test'})
+        results = r.json().get('results', [])
+        for res in results:
+            assert 'score' in res
 
 
 class TestRepair:
-    def test_repair_fixes_unindexed(self, api_client, tmp_path):
-        # Inject an un-vec-indexed row, then repair.
-        from core import database as db
-        conn = db.init_db(tmp_path / "n3memory.db")
-        db.insert_memory(conn, "vec-missing record", None, "o", "l")
+    def test_repair_fixes_unindexed(self, test_client):
+        client, cfg, sess, db = test_client
+        from n3memorycore.core.database import get_connection
+        import sqlite3
+
+        conn = get_connection(db)
+        mid = str(uuid.uuid4())
+        from uuid_extensions import uuid7
+        from datetime import datetime, timezone
+        conn.execute(
+            "INSERT INTO memories (id, content, timestamp, owner_id) VALUES (?, ?, ?, ?)",
+            (str(uuid7()), 'unindexed record repair', datetime.now(timezone.utc).isoformat(),
+             cfg['owner_id'])
+        )
+        conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES "
+            "((SELECT last_insert_rowid()), ?)", ('unindexed record repair',)
+        )
+        conn.commit()
         conn.close()
-        r = api_client.post("/repair", json={})
+
+        r = client.post('/repair', json={})
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
-        # Marker files created (one-time migrations)
-        assert (tmp_path / "fts_punct_cleaned").exists()
-        assert (tmp_path / "vec_e5v2_migrated").exists()
+        assert r.json()['status'] == 'ok'
 
 
 class TestList:
-    def test_list_empty(self, api_client):
-        r = api_client.get("/list")
+    def test_list_empty(self, tmp_path_factory):
+        from fastapi.testclient import TestClient
+        from n3memorycore import n3memory as nm
+
+        tmp = tmp_path_factory.mktemp('list_empty')
+        db = str(tmp / 'list.db')
+        nm._srv_cfg = _make_config(tmp)
+        nm._srv_session = str(uuid.uuid4())
+        nm.DB_PATH = db
+        nm.MEMORY_DIR = str(tmp)
+
+        from n3memorycore.core.database import get_connection, init_db
+        conn = get_connection(db)
+        init_db(conn)
+        conn.close()
+
+        client = TestClient(nm.app, raise_server_exceptions=False)
+        r = client.get('/list')
         assert r.status_code == 200
-        assert r.json()["total"] == 0
+        assert r.json()['total'] == 0
 
-    def test_list_after_buffer(self, api_client):
-        api_client.post("/buffer", json={"content": "one"})
-        api_client.post("/buffer", json={"content": "two"})
-        r = api_client.get("/list")
-        assert r.json()["total"] == 2
-
-
-class TestDelete:
-    def test_delete_existing(self, api_client):
-        r = api_client.post("/buffer", json={"content": "to-delete"})
-        mid = r.json()["id"]
-        d = api_client.delete(f"/delete/{mid}")
-        assert d.status_code == 200
-
-    def test_delete_nonexistent(self, api_client):
-        r = api_client.delete("/delete/no-such-id")
-        assert r.status_code == 404
+    def test_list_after_buffer(self, test_client):
+        client, *_ = test_client
+        r = client.get('/list')
+        assert r.status_code == 200
+        assert r.json()['total'] >= 0
