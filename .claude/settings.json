@@ -1,6 +1,11 @@
 {
   "permissions": {
     "allow": [
+      "Bash(python -m n3memorycore.n3memory --search *)",
+      "Bash(python -m n3memorycore.n3memory --buffer *)",
+      "Bash(python -m n3memorycore.n3memory --list*)",
+      "Bash(python -m n3memorycore.n3memory --repair*)",
+      "Bash(python -m n3memorycore.n3memory --stop*)",
       "Bash(n3mc --search *)",
       "Bash(n3mc --buffer *)",
       "Bash(n3mc --list*)",

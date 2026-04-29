@@ -598,42 +598,60 @@ def resolve_cmd(script_name: str) -> str:
     # Prefer the installed entry-point script (n3mc-hook / n3mc-stop-hook).
     exe = shutil.which(script_name)
     if exe:
-        return exe
+        # On Windows, shutil.which() returns backslash-separated paths, but
+        # Claude Code spawns a bash shell that interprets backslashes as
+        # escape sequences. Always normalize to forward slashes via as_posix().
+        return pathlib.Path(exe).as_posix()
     # Fallback for non-installed checkouts: spawn via -m.
     module = {"n3mc-hook": "n3memorycore.n3mc_hook",
               "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
-    return f'"{sys.executable}" -m {module}'
+    py = pathlib.Path(sys.executable).as_posix()
+    return f'"{py}" -m {module}'
 
-def install(event: str, marker: str, command: str) -> None:
-    # Drop any existing entry that references our scripts (any path),
-    # then append the freshly-resolved one.
+def install(event: str, markers: tuple, command: str) -> None:
+    # Drop any existing entry that references our scripts (any path, any
+    # form), then append the freshly-resolved one. `markers` MUST contain
+    # both the hyphenated form (entry-point exe name `n3mc-hook`) AND the
+    # underscored form (module name `n3memorycore.n3mc_hook`). The resolved
+    # exe path contains the hyphen; the python -m fallback contains the
+    # underscore. Checking only one form leaves the other-form entries in
+    # place, so each `n3mc --init` re-run accumulates a duplicate.
     kept = []
     for entry in hooks.get(event, []):
-        inner = [h for h in entry.get("hooks", []) if marker not in h.get("command", "")]
+        inner = [
+            h for h in entry.get("hooks", [])
+            if not any(m in h.get("command", "") for m in markers)
+        ]
         if inner:
             kept.append({**entry, "hooks": inner})
     kept.append({"hooks": [{"type": "command", "command": command}]})
     hooks[event] = kept
 
-install("UserPromptSubmit", "n3mc_hook",      resolve_cmd("n3mc-hook"))
-install("Stop",             "n3mc_stop_hook", resolve_cmd("n3mc-stop-hook"))
+install("UserPromptSubmit", ("n3mc-hook", "n3mc_hook"),           resolve_cmd("n3mc-hook"))
+install("Stop",             ("n3mc-stop-hook", "n3mc_stop_hook"), resolve_cmd("n3mc-stop-hook"))
 
 SETTINGS.parent.mkdir(parents=True, exist_ok=True)
 SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 ```
 
-- **Why match by script-name marker, not full command string**: the user may have moved the install root or upgraded Python; matching on `n3mc_hook` / `n3mc_stop_hook` keeps the algorithm idempotent across path edits without creating duplicates.
+- **Why match by script-name marker, not full command string**: the user may have moved the install root or upgraded Python; matching on script/module name keeps the algorithm idempotent across path edits without creating duplicates.
+- **Markers MUST cover both hyphen and underscore forms**: the resolved entry-point path is `n3mc-hook.EXE` (hyphen); the `python -m` fallback writes `n3memorycore.n3mc_hook` (underscore). Checking only one form fails to dedupe entries written in the other form, and each `n3mc --init` re-run leaks a fresh duplicate (real-world incidents observed up to 4 stacked entries).
 - **Do NOT use `git add`-style trust** (`if "hooks" not in settings: settings["hooks"] = {...}`): an empty `hooks: {}` key still passes that check and the user ends up with no hooks. Always inspect the inner arrays.
-- **Cross-platform path**: forward slashes only inside the `command` string, even on Windows. The bash shell Claude Code spawns interprets backslashes as escape sequences (`\n` → newline).
+- **Cross-platform path**: forward slashes only inside the `command` string, even on Windows. Always normalize `shutil.which()` results via `pathlib.Path(exe).as_posix()`. The bash shell Claude Code spawns interprets backslashes as escape sequences (`\n` → newline, `\t` → tab), so a raw `\Users\...` path silently corrupts during shell parsing.
 
 ### ② Project Settings (`.claude/settings.json`) — Permission Registration
 
-The `n3mc` console script (installed by `pip install`) is the only entry point Claude needs to invoke directly. The hook scripts (`n3mc-hook` / `n3mc-stop-hook`) are spawned by Claude Code itself, not via `Bash(...)`, so they do not need permissions.
+There are two callable entry-point forms, and **the `python -m n3memorycore.n3memory ...` form is the first-class one for Claude AI invocations.** The bash subshell Claude Code spawns for permission-gated commands does NOT reliably include the Python `Scripts/` directory on its `PATH` — the `n3mc` console script appears to work in interactive smoke tests but silently fails with `command not found` in production hook contexts. `python` itself is virtually always on `PATH` in any environment that has `n3mc` installed (since `n3mc` is a Python entry point), so `python -m` resolves cleanly across venvs and platforms. The hook scripts (`n3mc-hook` / `n3mc-stop-hook`) are spawned by Claude Code itself with absolute paths and do not need `Bash(...)` permissions.
 
 ```json
 {
   "permissions": {
     "allow": [
+      "Bash(python -m n3memorycore.n3memory --search *)",
+      "Bash(python -m n3memorycore.n3memory --buffer *)",
+      "Bash(python -m n3memorycore.n3memory --list*)",
+      "Bash(python -m n3memorycore.n3memory --repair*)",
+      "Bash(python -m n3memorycore.n3memory --stop*)",
       "Bash(n3mc --search *)",
       "Bash(n3mc --buffer *)",
       "Bash(n3mc --list*)",
@@ -644,7 +662,9 @@ The `n3mc` console script (installed by `pip install`) is the only entry point C
 }
 ```
 
-> **⚠️ Path quoting**: With the `n3mc` console script installed on `PATH`, no path quoting is needed. If you launch via `python -m n3memorycore.n3memory ...` instead (e.g. inside a venv where the entry point is not on `PATH`), use a wildcard pattern like `Bash(python *n3memorycore.n3memory* --search *)` to absorb interpreter-path variation.
+> **🛑 Preferred invocation form (important)**: The Active RAG rule in `.claude/rules/n3mc-behavior.md` instructs Claude to call `python -m n3memorycore.n3memory --search "<keywords>"`. The bare `n3mc --search ...` form passes interactive-shell smoke tests but in the bash subshell Claude Code spawns for tool calls and prompt-submit hooks, `n3mc` is frequently NOT on `PATH`, leading to a silent "search just doesn't run" failure mode. The `python -m` form is invariant across launch contexts.
+>
+> **⚠️ Path quoting**: The `n3mc` console-script form is convenient for interactive use but is `PATH`-dependent. Inside a venv where the `python` interpreter location matters, use a wildcard pattern like `Bash(python *n3memorycore.n3memory* --search *)` to absorb interpreter-path variation.
 
 ### `--stop` Hook Specification (Session Termination Processing)
 

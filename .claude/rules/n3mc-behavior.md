@@ -10,8 +10,14 @@ recorded character-for-character; there is no length filter and no skip-pattern
 filter. Make NO acknowledgement when a save succeeds — silence is correct.
 
 ## Active RAG
-When prior context would help, run `--search "<keywords>"` proactively. The
-command is auto-allowed via `permissions.allow`.
+When prior context would help, run a search proactively. **Always invoke via
+`python -m n3memorycore.n3memory --search "<keywords>"`**, NOT the bare `n3mc`
+console script. Claude Code spawns a bash subprocess whose `PATH` does not
+reliably include the Python `Scripts/` directory where the `n3mc` entry-point
+lives, so `n3mc --search ...` works in interactive shells but fails in
+production with `command not found`. `python -m` resolves through the Python
+interpreter (which is on `PATH`) and is portable across venvs and platforms.
+Both invocation forms are auto-allowed via `permissions.allow`.
 
 ## Recall Acknowledgment
 When `--search` results actually shape your reply (you are recalling something

@@ -880,18 +880,24 @@ def run_server(cfg: dict) -> None:
 def _resolve_hook_command(script_name: str) -> str:
     """Resolve the absolute path to the entry-point script (e.g. n3mc-hook).
 
+    Always returned with forward slashes — the bash shell Claude Code spawns
+    interprets backslashes as escape sequences (\\n -> newline, \\t -> tab),
+    so a Windows-style \\Users\\... path silently corrupts when bash parses it.
+
     Falls back to `python -m n3memorycore.n3mc_hook` form if the entry-point
     script is not on PATH (e.g. running from a non-installed checkout).
     """
     import shutil
+    import pathlib
     exe = shutil.which(script_name)
     if exe:
-        return exe
+        return pathlib.Path(exe).as_posix()
     module = {
         'n3mc-hook':      'n3memorycore.n3mc_hook',
         'n3mc-stop-hook': 'n3memorycore.n3mc_stop_hook',
     }[script_name]
-    return f'"{sys.executable}" -m {module}'
+    py = pathlib.Path(sys.executable).as_posix()
+    return f'"{py}" -m {module}'
 
 
 def cmd_init() -> None:
@@ -917,14 +923,20 @@ def cmd_init() -> None:
     hook_cmd = _resolve_hook_command('n3mc-hook')
     stop_cmd = _resolve_hook_command('n3mc-stop-hook')
 
-    def _replace_hook(event: str, marker: str, command: str) -> None:
-        # Drop existing entries that reference our scripts (any path),
-        # then add the freshly-resolved one.
+    def _replace_hook(event: str, markers: tuple, command: str) -> None:
+        # Drop existing entries that reference our scripts (any path, any form),
+        # then add the freshly-resolved one. Markers must cover BOTH the
+        # hyphenated entry-point form (n3mc-hook.EXE) AND the underscored
+        # module form (n3memorycore.n3mc_hook) — the resolved exe contains
+        # the hyphen, the python -m fallback contains the underscore.
         existing = hooks.get(event, [])
         new_entries = []
         for entry in existing:
             inner = entry.get('hooks', [])
-            keep = [h for h in inner if marker not in h.get('command', '')]
+            keep = [
+                h for h in inner
+                if not any(m in h.get('command', '') for m in markers)
+            ]
             if keep:
                 new_entry = dict(entry)
                 new_entry['hooks'] = keep
@@ -934,8 +946,8 @@ def cmd_init() -> None:
         })
         hooks[event] = new_entries
 
-    _replace_hook('UserPromptSubmit', 'n3mc_hook',     hook_cmd)
-    _replace_hook('Stop',             'n3mc_stop_hook', stop_cmd)
+    _replace_hook('UserPromptSubmit', ('n3mc-hook', 'n3mc_hook'),           hook_cmd)
+    _replace_hook('Stop',             ('n3mc-stop-hook', 'n3mc_stop_hook'), stop_cmd)
 
     with open(settings_path, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=2, ensure_ascii=False)

@@ -594,42 +594,59 @@ def resolve_cmd(script_name: str) -> str:
     # インストール済みのエントリポイントスクリプト（n3mc-hook / n3mc-stop-hook）を優先
     exe = shutil.which(script_name)
     if exe:
-        return exe
+        # Windows の shutil.which() はバックスラッシュ区切りで返るが、Claude Code
+        # が起動する bash はバックスラッシュをエスケープシーケンスとして解釈
+        # するため、必ず as_posix() でフォワードスラッシュに正規化する。
+        return pathlib.Path(exe).as_posix()
     # 未インストールチェックアウト用フォールバック: -m で起動
     module = {"n3mc-hook": "n3memorycore.n3mc_hook",
               "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
-    return f'"{sys.executable}" -m {module}'
+    py = pathlib.Path(sys.executable).as_posix()
+    return f'"{py}" -m {module}'
 
-def install(event: str, marker: str, command: str) -> None:
-    # 既存エントリのうち当該スクリプトを参照するもの（パス問わず）を除去してから、
-    # 新たに解決したコマンドを 1 件だけ追記。
+def install(event: str, markers: tuple, command: str) -> None:
+    # 既存エントリのうち当該スクリプトを参照するもの（パス問わず・形式問わず）を
+    # 除去してから、新たに解決したコマンドを 1 件だけ追記。
+    # markers はハイフン形（実行ファイル名 n3mc-hook）とアンダースコア形（モジュール
+    # 名 n3memorycore.n3mc_hook）の両方を含むタプルでなければならない — でなければ
+    # 一方の形式のエントリが残ったまま新しいエントリが追記され、毎回の n3mc --init
+    # で重複が累積する。
     kept = []
     for entry in hooks.get(event, []):
-        inner = [h for h in entry.get("hooks", []) if marker not in h.get("command", "")]
+        inner = [
+            h for h in entry.get("hooks", [])
+            if not any(m in h.get("command", "") for m in markers)
+        ]
         if inner:
             kept.append({**entry, "hooks": inner})
     kept.append({"hooks": [{"type": "command", "command": command}]})
     hooks[event] = kept
 
-install("UserPromptSubmit", "n3mc_hook",      resolve_cmd("n3mc-hook"))
-install("Stop",             "n3mc_stop_hook", resolve_cmd("n3mc-stop-hook"))
+install("UserPromptSubmit", ("n3mc-hook", "n3mc_hook"),           resolve_cmd("n3mc-hook"))
+install("Stop",             ("n3mc-stop-hook", "n3mc_stop_hook"), resolve_cmd("n3mc-stop-hook"))
 
 SETTINGS.parent.mkdir(parents=True, exist_ok=True)
 SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 ```
 
-- **なぜ完全コマンド文字列ではなくスクリプト名マーカーで照合するのか**: ユーザーがインストール先を移動したり Python をアップグレードした場合に、`n3mc_hook` / `n3mc_stop_hook` での照合なら重複登録せず冪等性を保てる。
+- **なぜ完全コマンド文字列ではなくスクリプト名マーカーで照合するのか**: ユーザーがインストール先を移動したり Python をアップグレードした場合に、スクリプト名／モジュール名での照合なら重複登録せず冪等性を保てる。
+- **マーカーは必ずハイフン形とアンダースコア形の両方**: 実行ファイル名は `n3mc-hook.EXE`（ハイフン）、`python -m` フォールバック時のモジュール名は `n3memorycore.n3mc_hook`（アンダースコア）。片方しかチェックしないと、もう片方の形式で書かれた既存エントリが除去されず、再 `n3mc --init` のたびに新エントリが追加されて累積する（実機で 4 件重複事例あり）。
 - **「`hooks` キーが無ければ `{...}` を入れる」だけの判定はダメ**: 空の `hooks: {}` が既に存在するケースで素通りし、結果フックが入らないままになる。必ず内側の配列まで点検すること。
-- **クロスプラットフォームのパス**: Windows でも `command` 文字列の中はフォワードスラッシュ厳守。Claude Code が起動する bash シェルはバックスラッシュをエスケープシーケンス（`\n` → 改行）として解釈する。
+- **クロスプラットフォームのパス**: Windows でも `command` 文字列の中はフォワードスラッシュ厳守。`shutil.which()` の戻り値は `pathlib.Path(exe).as_posix()` で必ず正規化すること。Claude Code が起動する bash シェルはバックスラッシュをエスケープシーケンス（`\n` → 改行、`\t` → タブ）として解釈するため、`\Users\...` をそのまま書くとパスが破壊される。
 
 ### ② プロジェクト設定（`.claude/settings.json`）— パーミッション登録
 
-`pip install` でインストールされる `n3mc` コンソールスクリプトが、Claude が直接呼び出す唯一のエントリポイント。フックスクリプト（`n3mc-hook` / `n3mc-stop-hook`）は Claude Code 自身が起動するため、`Bash(...)` パーミッションは不要。
+Claude が直接呼び出すエントリポイントは 2 系統ある。**Claude AI 側からの呼び出しは原則 `python -m n3memorycore.n3memory ...` 形式を一級市民とする** — Claude Code が起動する bash サブシェルの `PATH` には Python の `Scripts/` ディレクトリが含まれるとは限らず、`n3mc` バイナリが「対話シェルでは通るのに本番フックでは command not found になる」差異が報告されている。`python` 自体はインストール済み環境ならほぼ確実に `PATH` に乗っているため、`python -m` で起動すれば PATH 解決問題を完全に回避できる。フックスクリプト（`n3mc-hook` / `n3mc-stop-hook`）は Claude Code 自身が絶対パスで起動するので `Bash(...)` パーミッションは不要。
 
 ```json
 {
   "permissions": {
     "allow": [
+      "Bash(python -m n3memorycore.n3memory --search *)",
+      "Bash(python -m n3memorycore.n3memory --buffer *)",
+      "Bash(python -m n3memorycore.n3memory --list*)",
+      "Bash(python -m n3memorycore.n3memory --repair*)",
+      "Bash(python -m n3memorycore.n3memory --stop*)",
       "Bash(n3mc --search *)",
       "Bash(n3mc --buffer *)",
       "Bash(n3mc --list*)",
@@ -640,7 +657,9 @@ SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding
 }
 ```
 
-> **⚠️ パスの引用符**: `n3mc` コンソールスクリプトが `PATH` に通っていれば、パスの引用符処理は不要。venv 内などで `python -m n3memorycore.n3memory ...` 形式で起動する場合は、`Bash(python *n3memorycore.n3memory* --search *)` のようにワイルドカードでインタプリタパスのバリエーションを吸収させる。
+> **🛑 推奨呼び出し形式（重要）**: `.claude/rules/n3mc-behavior.md` の Active RAG ルールでは、Claude に `python -m n3memorycore.n3memory --search "<keywords>"` を呼ばせる。`n3mc --search ...` は対話シェル経由のスモークテストでは通るが、Claude Code が UserPromptSubmit やツール呼び出しで起動する bash サブシェルでは PATH に `n3mc` が乗っていないケースが多く、サイレントに「検索が走らないだけ」の状態になる。`python -m` 形式なら起動経路を問わず安定する。
+>
+> **⚠️ パスの引用符**: `n3mc` コンソールスクリプト形式は対話シェル用途では便利だが、PATH 依存。venv 内などで `python` インタプリタの位置に依存する場合は、`Bash(python *n3memorycore.n3memory* --search *)` のようにワイルドカードでインタプリタパスのバリエーションを吸収させる。
 
 ### `--stop` フック仕様（セッション終了処理）
 
