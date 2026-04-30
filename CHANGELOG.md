@@ -4,6 +4,31 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-04-30
+
+Patch release fixing three connected bugs that prevented `n3mc` from
+working in Claude Code's production bash subprocess even when interactive
+smoke tests passed. No API changes, no schema changes.
+
+### Fixed
+- **PATH miss for `n3mc --search`**: Claude Code's bash subshell does not
+  reliably include the Python `Scripts/` directory. Switched Active RAG
+  rule and project permissions to `python -m n3memorycore.n3memory ...`
+  as the canonical invocation form (python is always on PATH when n3mc
+  is installed).
+- **Backslash paths in hook commands on Windows**: `shutil.which()` returns
+  `\`-separated paths, but Claude Code's bash interprets `\n`/`\t` as
+  escape sequences, corrupting the path. Normalized via
+  `pathlib.Path(...).as_posix()` for both the resolved exe and the
+  `python -m` fallback.
+- **Idempotency marker mismatch**: the dedupe marker `n3mc_hook`
+  (underscore) never matched the resolved exe `n3mc-hook.EXE` (hyphen),
+  causing each `n3mc --init` re-run to accumulate a duplicate hook entry.
+  Markers now cover both hyphen and underscore forms.
+
+### Tests
+96 / 96 passing (unchanged).
+
 ## [1.3.1] - 2026-04-27
 
 PyPI-readiness patch. Metadata-only change; no behavior, no API,
