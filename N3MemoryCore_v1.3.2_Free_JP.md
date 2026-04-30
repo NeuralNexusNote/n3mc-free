@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.3.1 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.3.2 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -105,7 +105,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.3.1_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.3.2_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -827,7 +827,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.3.1 Evidence Report]）
+## 6. 自律評価（[N3MC v1.3.2 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 1. **常駐速度 & プロセス管理**: `--search` の応答時間を計測し記録せよ（達成目標: CPU 環境で 2.0s 以内）。PIDファイルの生成・削除・再起動が正常に機能することを確認せよ。
