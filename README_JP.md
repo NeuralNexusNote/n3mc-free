@@ -238,7 +238,7 @@ owner_id  (1 つの N3MC サーバ／データ所有者)
 
 - **Claude Code**（必須）
 - **Python 3.10+**
-- **OS**: Windows 11（動作確認済み） / macOS・Linux（対応設計だが未検証）
+- **OS**: Windows 11・Ubuntu（動作確認済み） / macOS（対応設計だが未検証）
 
 > Pythonが入っているか確認するには、ターミナルで `python --version` を実行してください。
 > 未インストールの場合、セットアップ時にClaude Codeが案内します。

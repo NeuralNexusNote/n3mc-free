@@ -240,7 +240,7 @@ owner_id  (one N3MC server / data owner)
 
 - **Claude Code** (required)
 - **Python 3.10+**
-- **OS**: Windows 11 (tested) / macOS and Linux (designed for, but not yet verified)
+- **OS**: Windows 11 and Ubuntu (tested) / macOS (designed for, but not yet verified)
 
 > To check if Python is installed, run `python --version` in your terminal.
 > If missing, Claude Code will guide you during setup.

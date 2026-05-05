@@ -5,7 +5,7 @@
 >
 > **対象ユーザー**: セッションをまたいで持続する検索可能な記憶を、CLAUDE.md を手動で管理せずに実現したい Claude Code ユーザー。
 >
-> **動作確認環境**: Claude Pro (claude.ai/code) / Windows 11
+> **動作確認環境**: Claude Pro (claude.ai/code) / Windows 11・Ubuntu
 
 ## ⚠️ 免責事項・配布条件
 

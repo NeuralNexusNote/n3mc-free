@@ -5,7 +5,7 @@
 >
 > **Who is this for?** Claude Code users who want persistent, searchable memory that survives across sessions — without manually maintaining CLAUDE.md.
 >
-> **Tested with**: Claude Pro (claude.ai/code) on Windows 11.
+> **Tested with**: Claude Pro (claude.ai/code) on Windows 11 and Ubuntu.
 
 ## ⚠️ Disclaimer & Distribution Terms
 
