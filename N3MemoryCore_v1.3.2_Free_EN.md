@@ -527,6 +527,48 @@ Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) 
 
 ---
 
+## 3.6. Retrieval Extensions
+
+> **Purpose**: Strengthen retrieval over already-saved memories. All entries here are **additive**; existing schemas, existing CLI flags, and existing behaviors are not modified.
+
+### `--since` / `--until` (Time-Range Filter)
+
+```bash
+python n3memory.py --search "keyword" --since 2026-01-01 --until 2026-03-31
+```
+
+- Accepted as options on `--search` and `--list`.
+- AND-combines `WHERE timestamp >= ? AND timestamp <= ?` against the existing `timestamp` column. No schema additions.
+- Date-only inputs are interpreted as `since=00:00:00` / `until=23:59:59`.
+- ISO 8601 extended form (`YYYY-MM-DDTHH:MM:SS`) is also accepted.
+- Either bound may be specified alone (open-ended range).
+
+### `--recall-thread` (Conversation Reconstruction)
+
+```bash
+python n3memory.py --recall-thread <turn_id> [--before N] [--after N]
+```
+
+- Returns the target `turn_id` plus the N preceding and N following turns, in chronological order.
+- Defaults: `--before 2`, `--after 2`.
+- Uses the existing `idx_memories_turn_id` index. No new index required.
+- Output format matches `--list` (tab-separated; `--format jsonl` supported).
+- **Operational rule**: When the snippet returned by `--search` is insufficient, Claude SHOULD pass the hit's `turn_id` to `--recall-thread` to retrieve surrounding context. End users do not need to invoke this command directly.
+
+---
+
+## 3.7. Backward Compatibility (Mandatory)
+
+No feature added by this specification may break the existing `memories` / `memories_vec` / `memories_fts` schemas or the behavior of existing CLI flags. New features MUST be implemented as one of the following:
+
+- New CLI flags or new subcommands
+- New DB tables or new indexes (`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`)
+- Column additions to existing tables only via `ALTER TABLE ... ADD COLUMN` (`DROP` / `RENAME` are forbidden)
+
+Existing user DBs MUST continue to operate under the new specification without regeneration.
+
+---
+
 ## 4. Claude Code Integration Settings (Core of Automation)
 
 Register hooks in the **user-global** Claude Code settings (`~/.claude/settings.json`) using absolute paths so they apply to all sessions. Register permissions in the project settings (`.claude/settings.json`).

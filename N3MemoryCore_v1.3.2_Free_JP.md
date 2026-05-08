@@ -523,6 +523,48 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 ---
 
+## 3.6. 取り出し拡張（Retrieval Extensions）
+
+> **目的**: 保存済み記憶からの取り出しを強化する。すべて**追加機能**であり、既存スキーマ・既存 CLI・既存挙動には一切手を加えない。
+
+### `--since` / `--until`（時間範囲フィルタ）
+
+```bash
+python n3memory.py --search "キーワード" --since 2026-01-01 --until 2026-03-31
+```
+
+- `--search` および `--list` のオプションとして受け付ける。
+- 既存の `timestamp` 列に対し `WHERE timestamp >= ? AND timestamp <= ?` を AND 結合する。新規スキーマ追加なし。
+- 日付のみ指定された場合は `since=00:00:00` / `until=23:59:59` と解釈する。
+- ISO 8601 拡張形式（`YYYY-MM-DDTHH:MM:SS`）も受け付ける。
+- 片方のみの指定（範囲を片開きにする）も可能。
+
+### `--recall-thread`（会話再構成）
+
+```bash
+python n3memory.py --recall-thread <turn_id> [--before N] [--after N]
+```
+
+- 指定 `turn_id` のターンと、それ以前 N 件・それ以後 N 件のターンを時系列で返す。
+- `--before` / `--after` のデフォルトは各 2。
+- 既存 `idx_memories_turn_id` インデックスを使用。新規インデックス不要。
+- 出力は `--list` と同じタブ区切り（`--format jsonl` も対応）。
+- **運用**: Claude は `--search` のスニペットで文脈不足と判断した場合、ヒットの `turn_id` を `--recall-thread` に渡して周辺会話を取得すること。ユーザーがこのコマンドを直接叩く必要はない。
+
+---
+
+## 3.7. 後方互換性（厳守）
+
+本指示書のいかなる機能追加も、既存の `memories` / `memories_vec` / `memories_fts` スキーマおよび既存 CLI フラグの挙動を破壊してはならない。新機能は次のいずれかで実装すること：
+
+- 新しい CLI フラグ・新しいサブコマンドの追加
+- 新しい DB テーブル・新しいインデックスの追加（`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`）
+- 既存テーブルへのカラム追加は `ALTER TABLE ... ADD COLUMN` のみ（`DROP` / `RENAME` は禁止）
+
+既存ユーザの DB は、再生成なしにそのまま新仕様で動作すること。
+
+---
+
 ## 4. Claude Code 連携設定（自動化の核）
 
 フックは**ユーザーグローバル**の Claude Code 設定（`~/.claude/settings.json`）に絶対パスで登録し、全セッションで有効化する。パーミッションはプロジェクト設定（`.claude/settings.json`）に登録する。
