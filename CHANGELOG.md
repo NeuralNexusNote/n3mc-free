@@ -4,6 +4,38 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-05-09
+
+Patch release hardening the dedup window, aligning the server with the
+v1.3.2 spec, and expanding platform documentation. No API changes, no
+schema changes.
+
+### Fixed
+- **Dedup window too narrow**: cosine-similarity deduplication searched
+  only `k=5` candidates, so near-duplicates (cos_sim ≥ 0.95) were missed
+  when five or more highly-similar records crowded the top-k window.
+  Widened to `k=20`.
+- **Duplicate server spawn on missing PID file**: `ensure_server` now
+  captures the `Popen` handle and writes the PID atomically, preventing
+  a race that caused a second server process to spawn when the PID file
+  was absent.
+- **`n3mc_stop_hook` silent failures**: exit code was not propagated,
+  so Claude Code never surfaced save failures. Exit code is now forwarded
+  from `--save-claude-turn`.
+- **Pro-only endpoint stubs**: `/delete/{id}`, `/gc`, and `/import` now
+  return HTTP 403 "Pro feature" per spec §3 instead of 404.
+
+### Tests
+All tests updated to reflect the above fixes; layer counts aligned with
+spec §7 (27/24/21/20). New coverage: `TestGC`, `TestRefresh`,
+`TestStripImages`, `TestDelete` / `TestGC` / `TestImport` for the 403
+stubs. Dead `TestMojibake*` classes removed.
+
+### Docs
+- Spec files renamed `v1.3.1 → v1.3.2` and synced with Retrieval
+  Extensions v1 addendum.
+- Ubuntu 22.04 LTS added as a tested platform alongside Windows 11.
+
 ## [1.3.2] - 2026-04-30
 
 Patch release fixing three connected bugs that prevented `n3mc` from
