@@ -1,6 +1,5 @@
 import os
 import re
-import math
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,6 +9,7 @@ from .database import (
     init_db,
     insert_memory,
     search_vector,
+    search_vector_with_filter,
     search_fts,
     get_all_memories,
     delete_memory,
@@ -23,26 +23,15 @@ from .database import (
 
 logger = logging.getLogger(__name__)
 
+# spec §5: closed fenced code blocks → [code omitted]; inline backticks preserved
 _CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```')
 
-# ---------------------------------------------------------------------------
-# Lone-surrogate sanitization (Windows / cp932 data-loss guard)
-# ---------------------------------------------------------------------------
-# Subprocess stdin pipes on Windows can deliver UTF-8 bytes that python's
-# decoder maps to lone UTF-16 surrogate halves (U+D800..U+DFFF). Such strings
-# round-trip through json.loads but blow up at sqlite3.execute() with
-# UnicodeEncodeError, silently dropping the entire write — a direct violation
-# of the complete-preservation contract. We strip these halves before any
-# value is bound to SQLite.
+# spec §5: strip lone UTF-16 surrogate halves (Windows cp932 guard)
 _LONE_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
 def sanitize_surrogates(text):
-    """Strip lone UTF-16 surrogate halves from a string (or pass-through).
-
-    Recursively cleans dicts / lists too so audit-log JSON payloads with
-    surrogates buried inside multimodal content do not break json.dumps.
-    """
+    """Strip lone UTF-16 surrogate halves. Recursively cleans dicts/lists."""
     if text is None:
         return text
     if isinstance(text, str):
@@ -53,6 +42,7 @@ def sanitize_surrogates(text):
         return {k: sanitize_surrogates(v) for k, v in text.items()}
     return text
 
+
 DEFAULT_EMBED_MODEL = 'intfloat/multilingual-e5-base'
 
 _model = None
@@ -60,23 +50,9 @@ _model_name = None
 
 
 def get_model(name: Optional[str] = None):
-    """Lazy-load and cache the embedding model.
+    """Lazy-load and cache the sentence-transformers embedding model.
 
-    On the first call (or when `name` differs from the cached model),
-    the model is selected from (in priority order):
-      1. `name` argument
-      2. `$N3MC_EMBED_MODEL` environment variable
-      3. `DEFAULT_EMBED_MODEL` (multilingual baseline)
-
-    Subsequent calls with `name=None` return the cached model without
-    re-resolving — so the model loaded by the server lifespan (with
-    `embed_model` from config.json) wins, and `embed_passage` /
-    `embed_query` reuse it transparently.
-
-    Callers that want to switch to a language-specialised model should
-    set `embed_model` in `config.json` and run `--repair` once after
-    the first save under the new model (see spec §5 vector re-index
-    migration).
+    Priority: name arg → $N3MC_EMBED_MODEL → DEFAULT_EMBED_MODEL.
     """
     global _model, _model_name
     if name is None and _model is not None:
@@ -91,24 +67,18 @@ def get_model(name: Optional[str] = None):
 
 def embed_passage(text: str) -> list:
     model = get_model()
-    prefixed = "passage: " + text
-    vec = model.encode(prefixed, normalize_embeddings=True)
+    vec = model.encode("passage: " + text, normalize_embeddings=True)
     return vec.tolist()
 
 
 def embed_query(text: str) -> list:
     model = get_model()
-    prefixed = "query: " + text
-    vec = model.encode(prefixed, normalize_embeddings=True)
+    vec = model.encode("query: " + text, normalize_embeddings=True)
     return vec.tolist()
 
 
 def purify_text(text: str) -> str:
-    """Replace closed fenced code blocks with [code omitted] AND strip lone
-    surrogates as a defense-in-depth layer (spec §5).
-
-    Inline backtick spans and unclosed fences are preserved verbatim.
-    """
+    """Replace closed fenced code blocks with [code omitted]; strip lone surrogates."""
     if not text:
         return text
     cleaned = sanitize_surrogates(text)
@@ -151,7 +121,6 @@ def _merge_chunks(parts: list, max_chars: int, overlap: int, sep: str) -> list:
             chunks.extend(sub)
         elif current and len(current) + len(sep) + len(part) > max_chars:
             chunks.append(current)
-            # Overlap: keep tail of previous chunk
             tail = current[-overlap:] if overlap else ""
             current = (tail + sep + part) if tail else part
         else:
@@ -186,10 +155,12 @@ def add_chunk_prefixes(chunks: list, role: str) -> list:
 
 
 def cosine_sim_from_l2(l2_distance: float) -> float:
+    """spec §3: cos_sim = max(0, 1 - L2²/2) for L2-normalized vectors."""
     return max(0.0, 1.0 - (l2_distance ** 2) / 2.0)
 
 
 def time_decay(timestamp_str: str, half_life_days: float) -> float:
+    """spec §3: time_decay = 2^(-days_elapsed / half_life_days)."""
     try:
         ts = datetime.fromisoformat(timestamp_str)
         if ts.tzinfo is None:
@@ -201,7 +172,10 @@ def time_decay(timestamp_str: str, half_life_days: float) -> float:
         return 1.0
 
 
-def keyword_relevance(bm25_score: float, max_abs_bm25: float, bm25_min_threshold: float) -> float:
+def keyword_relevance(
+    bm25_score: float, max_abs_bm25: float, bm25_min_threshold: float
+) -> float:
+    """spec §3: normalize BM25 score to [0, 1]."""
     abs_score = abs(bm25_score)
     if abs_score < bm25_min_threshold:
         return 0.0
@@ -213,6 +187,8 @@ def hybrid_search(
     query: str,
     config: dict,
     current_session_id: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
 ) -> dict:
     half_life = config.get('half_life_days', 90)
     bm25_min = config.get('bm25_min_threshold', 0.1)
@@ -229,19 +205,22 @@ def hybrid_search(
         if query.strip():
             try:
                 q_vec = embed_query(query)
-                rows = search_vector(conn, q_vec, k=limit * 3)
+                if since or until:
+                    rows = search_vector_with_filter(conn, q_vec, k=limit * 3,
+                                                     since=since, until=until)
+                else:
+                    rows = search_vector(conn, q_vec, k=limit * 3)
                 for row in rows:
                     rid = row['id']
-                    dist = row['distance']
-                    cs = cosine_sim_from_l2(dist)
+                    cs = cosine_sim_from_l2(row['distance'])
                     vec_results[rid] = {
-                        'id': rid,
-                        'content': row['content'],
-                        'timestamp': row['timestamp'],
+                        'id':         rid,
+                        'content':    row['content'],
+                        'timestamp':  row['timestamp'],
                         'session_id': row['session_id'],
-                        'turn_id': row['turn_id'],
+                        'turn_id':    row['turn_id'],
                         'agent_name': row['agent_name'],
-                        'cos_sim': cs,
+                        'cos_sim':    cs,
                         'bm25_score': None,
                     }
             except Exception as e:
@@ -251,57 +230,58 @@ def hybrid_search(
         fts_results = {}
         if query.strip():
             try:
-                rows = search_fts(conn, query, limit=limit * 3)
+                rows = search_fts(conn, query, limit=limit * 3,
+                                  since=since, until=until)
                 max_abs = max((abs(r['bm25_score']) for r in rows), default=0.0)
                 for row in rows:
                     rid = row['id']
                     fts_results[rid] = {
-                        'id': rid,
-                        'content': row['content'],
-                        'timestamp': row['timestamp'],
-                        'session_id': row['session_id'],
-                        'turn_id': row['turn_id'],
-                        'agent_name': row['agent_name'],
-                        'bm25_score': row['bm25_score'],
+                        'id':          rid,
+                        'content':     row['content'],
+                        'timestamp':   row['timestamp'],
+                        'session_id':  row['session_id'],
+                        'turn_id':     row['turn_id'],
+                        'agent_name':  row['agent_name'],
+                        'bm25_score':  row['bm25_score'],
                         'max_abs_bm25': max_abs,
-                        'cos_sim': None,
+                        'cos_sim':     None,
                     }
             except Exception as e:
                 logger.warning(f"FTS search error: {e}")
 
-        # Combine
+        # Combine results
         all_ids = set(vec_results.keys()) | set(fts_results.keys())
-        scored = []
         fts_max_abs = 0.0
         if fts_results:
             fts_max_abs = max(abs(v['bm25_score']) for v in fts_results.values())
 
+        scored = []
         for rid in all_ids:
             vec_r = vec_results.get(rid)
             fts_r = fts_results.get(rid)
-
             meta = vec_r or fts_r
+
             cs = vec_r['cos_sim'] if vec_r else 0.0
             bm25 = fts_r['bm25_score'] if fts_r else 0.0
             kr = keyword_relevance(bm25, fts_max_abs, bm25_min)
 
-            ts = meta['timestamp']
-            decay = time_decay(ts, half_life)
+            decay = time_decay(meta['timestamp'], half_life)
 
             sess = meta.get('session_id')
+            # spec §3: b_session = 1.0 if session matches, 0.6 otherwise
             b_session = 1.0 if (current_session_id and sess == current_session_id) else 0.6
 
             score = (cs * 0.7 + kr * 0.3) * decay * b_session
 
             scored.append({
-                'id': rid,
-                'content': meta['content'],
-                'timestamp': ts,
-                'session_id': sess,
-                'turn_id': meta.get('turn_id'),
-                'agent_name': meta.get('agent_name'),
-                'score': score,
-                'cos_sim': cs,
+                'id':               rid,
+                'content':          meta['content'],
+                'timestamp':        meta['timestamp'],
+                'session_id':       sess,
+                'turn_id':          meta.get('turn_id'),
+                'agent_name':       meta.get('agent_name'),
+                'score':            score,
+                'cos_sim':          cs,
                 'keyword_relevance': kr,
             })
 
@@ -309,7 +289,7 @@ def hybrid_search(
         filtered = [r for r in scored if r['score'] >= min_score]
         results = filtered[:limit]
 
-        # Q-A pair collection
+        # Q-A pair collection: spec §5 — results include pair records too
         pairs = {}
         seen_turn_ids = set()
         for r in results:
@@ -320,8 +300,8 @@ def hybrid_search(
                 if siblings:
                     pairs[tid] = [
                         {
-                            'id': s['id'],
-                            'content': s['content'],
+                            'id':        s['id'],
+                            'content':   s['content'],
                             'timestamp': s['timestamp'],
                         }
                         for s in siblings
@@ -333,6 +313,7 @@ def hybrid_search(
 
 
 def render_memory_context(search_result: dict, query: str) -> str:
+    """spec §5 v1.2.0+ rendering: Top matches first, Q-A pairs after."""
     results = search_result.get('results', [])
     pairs = search_result.get('pairs', {})
 
@@ -341,12 +322,11 @@ def render_memory_context(search_result: dict, query: str) -> str:
     if not results:
         lines.append("_No relevant memories found._\n")
     else:
+        # spec §5: Top matches block first (pair records NOT excluded)
         lines.append("## Top matches (use these to answer the question)\n")
         for i, r in enumerate(results, 1):
-            score = r['score']
-            content = r['content']
-            lines.append(f"### [{i}] score={score:.4f}")
-            lines.append(content)
+            lines.append(f"### [{i}] score={r['score']:.4f}")
+            lines.append(r['content'])
             lines.append("")
 
     if pairs:

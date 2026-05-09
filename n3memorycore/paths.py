@@ -20,22 +20,18 @@ def get_home_dir() -> str:
     return os.path.join(os.path.expanduser('~'), '.n3mc')
 
 
-HOME_DIR              = get_home_dir()
-MEMORY_DIR            = os.path.join(HOME_DIR, '.memory')
-DB_PATH               = os.path.join(MEMORY_DIR, 'n3memory.db')
-PID_FILE              = os.path.join(MEMORY_DIR, 'n3mc.pid')
-TURN_ID_FILE          = os.path.join(MEMORY_DIR, 'turn_id.txt')
-CONTEXT_FILE          = os.path.join(MEMORY_DIR, 'memory_context.md')
-AUDIT_LOG             = os.path.join(MEMORY_DIR, 'audit.log')
-CONFIG_FILE           = os.path.join(HOME_DIR,   'config.json')
-MOJIBAKE_RECOVERED    = os.path.join(MEMORY_DIR, 'mojibake_recovered')
+HOME_DIR     = get_home_dir()
+MEMORY_DIR   = os.path.join(HOME_DIR,   '.memory')
+DB_PATH      = os.path.join(MEMORY_DIR, 'n3memory.db')
+PID_FILE     = os.path.join(MEMORY_DIR, 'n3mc.pid')
+TURN_ID_FILE = os.path.join(MEMORY_DIR, 'turn_id.txt')
+CONTEXT_FILE = os.path.join(MEMORY_DIR, 'memory_context.md')
+AUDIT_LOG    = os.path.join(MEMORY_DIR, 'audit.log')
+CONFIG_FILE  = os.path.join(HOME_DIR,   'config.json')
 
 
 def claude_paths(cwd: str = None) -> dict:
-    """Resolve per-project Claude Code config paths against `cwd`.
-
-    Defaults to current working directory when `cwd` is omitted.
-    """
+    """Resolve per-project Claude Code config paths against `cwd`."""
     cwd = cwd or os.getcwd()
     claude_dir = os.path.join(cwd, '.claude')
     return {

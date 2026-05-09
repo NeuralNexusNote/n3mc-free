@@ -42,7 +42,7 @@ def main():
 
     _write_audit('Stop', raw, payload)
 
-    subprocess.run(
+    proc = subprocess.run(
         [sys.executable, '-m', 'n3memorycore.n3memory', '--save-claude-turn'],
         input=raw,
         encoding='utf-8',
@@ -53,6 +53,8 @@ def main():
         [sys.executable, '-m', 'n3memorycore.n3memory', '--stop'],
         capture_output=False,
     )
+
+    sys.exit(proc.returncode)
 
 
 if __name__ == '__main__':

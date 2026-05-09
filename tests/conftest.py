@@ -23,14 +23,14 @@ def tmp_db(tmp_path):
 @pytest.fixture
 def cfg(tmp_path):
     return {
-        'owner_id':              str(uuid.uuid4()),
-        'local_id':              str(uuid.uuid4()),
-        'server_port':           18521,
-        'dedup_threshold':       0.95,
-        'half_life_days':        90,
-        'bm25_min_threshold':    0.1,
-        'search_result_limit':   20,
-        'min_score':             0.0,
+        'owner_id':               str(uuid.uuid4()),
+        'local_id':               str(uuid.uuid4()),
+        'server_port':            18521,
+        'dedup_threshold':        0.95,
+        'half_life_days':         90,
+        'bm25_min_threshold':     0.1,
+        'search_result_limit':    20,
+        'min_score':              0.0,
         'search_query_max_chars': 2000,
     }
 

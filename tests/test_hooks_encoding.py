@@ -1,10 +1,12 @@
-"""Encoding regression suite (CHANGELOG v1.2.1, restored in v1.3.0).
+"""Encoding regression suite — surrogate sanitization and purify/SQLite integration.
 
 Pins the Windows / Japanese fixes:
   - lone UTF-16 surrogate stripping (sqlite3 binding crash)
   - clean Japanese passthrough (no false positives)
   - SQLite accepts the sanitized output
-  - Mojibake heuristic + cp932 -> utf-8 recovery
+
+Note: _looks_mojibake / _try_recover_mojibake were removed in v1.3.2.
+sanitize_surrogates() in processor.py is the replacement approach.
 """
 from __future__ import annotations
 
@@ -17,7 +19,6 @@ import pytest
 
 from n3memorycore.core import database as db
 from n3memorycore.core import processor as proc
-from n3memorycore import n3memory as nm
 
 
 # --------------------------------------------------------------------------- 1
@@ -91,36 +92,3 @@ class TestPurifyAppliesSanitization:
         assert proc.purify_text(None) is None
 
 
-# --------------------------------------------------------------------------- 4
-class TestMojibakeHeuristic:
-    def test_clean_japanese_not_flagged(self):
-        assert nm._looks_mojibake("これはテストです") is False
-
-    def test_classic_mojibake_flagged(self):
-        # 「こんにちは」 mis-decoded as cp932
-        text = "縺薙ｓ縺ｫ縺｡縺ｯ"
-        assert nm._looks_mojibake(text) is True
-
-    def test_short_text_not_flagged(self):
-        # Below the 2-hint threshold.
-        assert nm._looks_mojibake("縺a") is False
-        assert nm._looks_mojibake("normal text") is False
-
-
-# --------------------------------------------------------------------------- 5
-class TestMojibakeRecoveryRoundtrip:
-    def test_recovery_returns_recovered_text(self):
-        # 「こんにちは」 round-tripped through cp932 misdecoding.
-        original = "こんにちは"
-        mojibake = original.encode("utf-8").decode("cp932", errors="replace")
-        # Sanity: mojibake should match the heuristic
-        assert nm._looks_mojibake(mojibake)
-        recovered = nm._try_recover_mojibake(mojibake)
-        assert recovered is not None
-        assert original in recovered
-
-    def test_recovery_skips_clean_text(self):
-        assert nm._try_recover_mojibake("クリーンな日本語") is None
-
-    def test_recovery_skips_english(self):
-        assert nm._try_recover_mojibake("hello world") is None

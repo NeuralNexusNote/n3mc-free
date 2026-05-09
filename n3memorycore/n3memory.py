@@ -1,6 +1,7 @@
 import sys
 import os
 
+# spec §3: reconfigure all streams to UTF-8 before any I/O (Windows cp932 guard)
 for _s_name in ("stdin", "stdout", "stderr"):
     _s = getattr(sys, _s_name, None)
     if _s is not None and hasattr(_s, 'reconfigure'):
@@ -21,7 +22,7 @@ from typing import Optional
 
 from .paths import (
     HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, TURN_ID_FILE,
-    CONTEXT_FILE, AUDIT_LOG, CONFIG_FILE, MOJIBAKE_RECOVERED, claude_paths,
+    CONTEXT_FILE, AUDIT_LOG, CONFIG_FILE, claude_paths,
 )
 
 logging.basicConfig(level=logging.WARNING)
@@ -32,16 +33,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG: dict = {
-    "owner_id":              None,
-    "local_id":              None,
-    "server_port":           18520,
-    "embed_model":           "intfloat/multilingual-e5-base",
-    "dedup_threshold":       0.95,
-    "half_life_days":        90,
-    "bm25_min_threshold":    0.1,
-    "search_result_limit":   20,
-    "context_char_limit":    3000,
-    "min_score":             0.2,
+    "owner_id":               None,
+    "local_id":               None,
+    "server_port":            18520,
+    "embed_model":            "intfloat/multilingual-e5-base",
+    "dedup_threshold":        0.95,
+    "half_life_days":         90,
+    "bm25_min_threshold":     0.1,
+    "search_result_limit":    20,
+    "context_char_limit":     3000,
+    "min_score":              0.2,
     "search_query_max_chars": 2000,
 }
 
@@ -56,7 +57,7 @@ def _load_config() -> dict:
                 cfg.update(json.load(f))
         except Exception as e:
             print(f"Warning: config.json parse error: {e}", file=sys.stderr)
-            # Recover owner_id / local_id from DB
+            # spec §3.5: recover owner_id / local_id from DB on config corruption
             try:
                 import sqlite3
                 if os.path.exists(DB_PATH):
@@ -174,6 +175,7 @@ def ensure_server(cfg: dict) -> bool:
         except Exception:
             pass
 
+    # spec §3 Clean CLI: stderr/stdout → DEVNULL to silence model load warnings
     proc = subprocess.Popen(
         [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
         stderr=subprocess.DEVNULL,
@@ -184,8 +186,8 @@ def ensure_server(cfg: dict) -> bool:
         with open(PID_FILE, 'x') as f:
             f.write(str(proc.pid))
     except FileExistsError:
-        pass
-
+        pass  # Another process is starting the server concurrently
+    # spec §5: wait up to 60s (covers first-time model download)
     if not _wait_for_server(cfg, max_wait=60):
         print("Warning: N3MC server did not start in time.", file=sys.stderr)
         return False
@@ -193,7 +195,7 @@ def ensure_server(cfg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Direct buffer fallback (no embedding)
+# Direct buffer fallback (no embedding — used when server is down)
 # ---------------------------------------------------------------------------
 
 def _buffer_direct(
@@ -210,11 +212,11 @@ def _buffer_direct(
     from .core.processor import sanitize_surrogates
     from uuid_extensions import uuid7
 
-    # Strip lone UTF-16 surrogates before SQLite binding (Windows cp932 guard).
     content = sanitize_surrogates(content)
 
     conn = get_connection(DB_PATH)
     try:
+        # spec §3.5: DB integrity check
         result = conn.execute("PRAGMA integrity_check").fetchone()
         if result and result[0] != 'ok':
             conn.close()
@@ -254,112 +256,11 @@ def _handle_corrupt_db() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mojibake recovery (one-time, on first server startup after upgrade)
-# ---------------------------------------------------------------------------
-# Pre-1.2.0 builds on Windows misdecoded UTF-8 stdin via cp932, persisting
-# mojibake (e.g. 「縺薙ｓ縺ｫ縺｡縺ｯ」 instead of 「こんにちは」). The recovery
-# attempts a best-effort cp932 → utf-8 roundtrip; rows that round-trip cleanly
-# are rewritten with a `[recovered] ` prefix so the operator can audit them,
-# and the FTS index is resynced. Lossy `errors='replace'` rows from the
-# original misdecoding cannot be fully restored — the prefix marks them as
-# "we tried."
-import re as _re
-_MOJIBAKE_HINT_RE = _re.compile(
-    "[" + "".join(["縺", "繧", "菫", "繝", "髢", "蜈", "邨", "閧", "笆"]) + "]"
-)
-
-
-def _looks_mojibake(text):
-    if not text or not isinstance(text, str):
-        return False
-    return len(_MOJIBAKE_HINT_RE.findall(text)) >= 2
-
-
-def _try_recover_mojibake(text):
-    if not _looks_mojibake(text):
-        return None
-    try:
-        round_tripped = text.encode('cp932', errors='replace').decode(
-            'utf-8', errors='replace'
-        )
-    except Exception:
-        return None
-    if _looks_mojibake(round_tripped):
-        return None
-    if not round_tripped.strip():
-        return None
-    return round_tripped
-
-
-def run_mojibake_recovery() -> int:
-    """One-time scan + best-effort cp932->utf-8 roundtrip on existing rows.
-
-    Idempotent via marker file `MOJIBAKE_RECOVERED`. Returns the count of rows
-    rewritten.
-    """
-    if os.path.exists(MOJIBAKE_RECOVERED):
-        return 0
-    if not os.path.exists(DB_PATH):
-        with open(MOJIBAKE_RECOVERED, 'w', encoding='utf-8') as f:
-            f.write('ok')
-        return 0
-
-    from .core.database import get_connection, strip_fts_punctuation
-    try:
-        conn = get_connection(DB_PATH)
-    except Exception as e:
-        print(f"[N3MC] mojibake recovery: DB open failed: {e}", file=sys.stderr)
-        return 0
-
-    recovered = 0
-    try:
-        rows = conn.execute(
-            "SELECT rowid, id, content FROM memories WHERE content IS NOT NULL"
-        ).fetchall()
-        for r in rows:
-            recovered_text = _try_recover_mojibake(r['content'])
-            if recovered_text is None:
-                continue
-            new_content = '[recovered] ' + recovered_text
-            try:
-                conn.execute(
-                    "UPDATE memories SET content = ? WHERE rowid = ?",
-                    (new_content, r['rowid']),
-                )
-                conn.execute(
-                    "DELETE FROM memories_fts WHERE rowid = ?", (r['rowid'],)
-                )
-                conn.execute(
-                    "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
-                    (r['rowid'], strip_fts_punctuation(new_content)),
-                )
-                conn.commit()
-                recovered += 1
-            except Exception as e:
-                conn.rollback()
-                print(
-                    f"[N3MC] mojibake recovery: rewrite failed for {r['id']}: {e}",
-                    file=sys.stderr,
-                )
-        if recovered:
-            print(
-                f"[N3MC] mojibake recovery: rewrote {recovered} row(s) "
-                f"with [recovered] prefix",
-                file=sys.stderr,
-            )
-        with open(MOJIBAKE_RECOVERED, 'w', encoding='utf-8') as f:
-            f.write('ok')
-    finally:
-        conn.close()
-    return recovered
-
-
-# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
 
     class BufferRequest(BaseModel):
@@ -372,6 +273,8 @@ try:
     class SearchRequest(BaseModel):
         query: str
         session_id: Optional[str] = None
+        since: Optional[str] = None
+        until: Optional[str] = None
 
     # Global server state (populated in lifespan)
     _srv_cfg: dict = {}
@@ -388,6 +291,7 @@ try:
 
         conn = get_connection(DB_PATH)
         try:
+            # spec §3.5: DB integrity check on startup
             ok = conn.execute("PRAGMA integrity_check").fetchone()
             if ok and ok[0] != 'ok':
                 conn.close()
@@ -398,17 +302,12 @@ try:
         finally:
             conn.close()
 
+        # Preload embedding model (covers first-time download wait)
         try:
             from .core.processor import get_model
             get_model(_srv_cfg.get('embed_model'))
         except Exception as e:
             logger.warning(f"Model preload failed: {e}")
-
-        # One-time cp932->utf-8 mojibake recovery for pre-1.2.0 rows.
-        try:
-            run_mojibake_recovery()
-        except Exception as e:
-            logger.warning(f"Mojibake recovery skipped: {e}")
 
         yield
 
@@ -421,8 +320,7 @@ try:
     @app.post('/buffer')
     async def ep_buffer(req: BufferRequest):
         from .core.database import (
-            get_connection, check_exact_duplicate, insert_memory,
-            search_vector,
+            get_connection, check_exact_duplicate, insert_memory, search_vector,
         )
         from .core.processor import embed_passage, cosine_sim_from_l2, purify_text
         from uuid_extensions import uuid7
@@ -431,11 +329,11 @@ try:
         if not content.strip():
             return {'status': 'skipped', 'count': 0, 'reason': 'empty'}
 
-        local   = req.local_id   or _srv_cfg.get('local_id')
-        sess    = req.session_id or _srv_session
-        tid     = req.turn_id
-        agent   = req.agent_name
-        thresh  = _srv_cfg.get('dedup_threshold', 0.95)
+        local  = req.local_id   or _srv_cfg.get('local_id')
+        sess   = req.session_id or _srv_session
+        tid    = req.turn_id
+        agent  = req.agent_name
+        thresh = _srv_cfg.get('dedup_threshold', 0.95)
 
         conn = get_connection(DB_PATH)
         try:
@@ -449,7 +347,9 @@ try:
                 logger.warning(f"Embed error: {e}")
             if vec is not None:
                 try:
-                    rows = search_vector(conn, vec, k=5)
+                    # spec §5: dedup window k=20 — k=5 missed near-duplicates
+                    # in busy DBs where ≥5 highly-similar records crowd top-k.
+                    rows = search_vector(conn, vec, k=20)
                     for row in rows:
                         if cosine_sim_from_l2(row['distance']) >= thresh:
                             return {'status': 'skipped', 'count': 0, 'reason': 'cosine_duplicate'}
@@ -474,7 +374,10 @@ try:
     async def ep_search(req: SearchRequest):
         from .core.processor import hybrid_search
         sess = req.session_id or _srv_session
-        result = hybrid_search(DB_PATH, req.query or '', _srv_cfg, sess)
+        result = hybrid_search(
+            DB_PATH, req.query or '', _srv_cfg, sess,
+            since=req.since, until=req.until,
+        )
         return result
 
     @app.post('/repair')
@@ -488,9 +391,11 @@ try:
         conn = get_connection(DB_PATH)
         repaired = 0
         try:
+            # spec §3: FTS punct cleaning — one-time migration with marker
             marker = os.path.join(MEMORY_DIR, 'fts_punct_cleaned')
             if not os.path.exists(marker):
                 offset = 0
+                cleaned_count = 0
                 while True:
                     rows = conn.execute(
                         "SELECT rowid, content FROM memories_fts LIMIT 200 OFFSET ?",
@@ -505,22 +410,17 @@ try:
                                 "UPDATE memories_fts SET content = ? WHERE rowid = ?",
                                 (clean, row[0])
                             )
-                            repaired += 1
+                            cleaned_count += 1
                     conn.commit()
                     offset += 200
                     if len(rows) < 200:
                         break
-                with open(marker, 'w') as f:
+                with open(marker, 'w', encoding='utf-8') as f:
                     f.write('done')
+                if cleaned_count > 0:
+                    print(f"FTS punctuation cleaned: {cleaned_count} record(s).", file=sys.stderr)
 
-            # Vector model marker: records which embedding model the on-disk
-            # vectors were generated by. If the user changes `embed_model` in
-            # config.json without running a re-embed, the marker still points
-            # to the old model — surface a warning so the user can decide
-            # whether to delete the marker and re-run `--repair` to force a
-            # full re-embed of every record. This is a manual upgrade path;
-            # automatic re-embedding is intentionally not triggered here
-            # because re-embedding a large DB can take many minutes.
+            # spec §5: vec_model.txt marker — warn if embed model changed
             current_model = (_srv_cfg or {}).get('embed_model', 'intfloat/multilingual-e5-base')
             vec_marker = os.path.join(MEMORY_DIR, 'vec_model.txt')
             if not os.path.exists(vec_marker):
@@ -538,16 +438,17 @@ try:
                         file=sys.stderr,
                     )
 
+            # spec §3.5: batch 200 records at a time to avoid memory exhaustion
             offset = 0
             while True:
                 rows = find_unindexed_memories(conn, limit=200, offset=offset)
                 if not rows:
                     break
                 for row in rows:
-                    rowid      = row['rowid']
-                    content    = row['content']
-                    has_vec    = row['vec_rowid'] is not None
-                    has_fts    = row['fts_rowid'] is not None
+                    rowid   = row['rowid']
+                    content = row['content']
+                    has_vec = row['vec_rowid'] is not None
+                    has_fts = row['fts_rowid'] is not None
 
                     if not has_vec:
                         try:
@@ -598,6 +499,19 @@ try:
         finally:
             conn.close()
 
+    # spec §3: Pro-only endpoints — stub returns 403 in Free edition
+    @app.delete('/delete/{memory_id}')
+    async def ep_delete(memory_id: str):
+        raise HTTPException(status_code=403, detail='Pro feature')
+
+    @app.post('/gc')
+    async def ep_gc():
+        raise HTTPException(status_code=403, detail='Pro feature')
+
+    @app.post('/import')
+    async def ep_import():
+        raise HTTPException(status_code=403, detail='Pro feature')
+
 except ImportError:
     app = None  # type: ignore
 
@@ -609,7 +523,7 @@ except ImportError:
 def _read_turn_id() -> Optional[str]:
     if os.path.exists(TURN_ID_FILE):
         try:
-            tid = open(TURN_ID_FILE, 'r').read().strip()
+            tid = open(TURN_ID_FILE, 'r', encoding='utf-8').read().strip()
             return tid or None
         except Exception:
             pass
@@ -618,13 +532,13 @@ def _read_turn_id() -> Optional[str]:
 
 def _write_turn_id(tid: str) -> None:
     os.makedirs(MEMORY_DIR, exist_ok=True)
-    with open(TURN_ID_FILE, 'w') as f:
+    with open(TURN_ID_FILE, 'w', encoding='utf-8') as f:
         f.write(tid)
 
 
 def _clear_turn_id() -> None:
     if os.path.exists(TURN_ID_FILE):
-        open(TURN_ID_FILE, 'w').close()
+        open(TURN_ID_FILE, 'w', encoding='utf-8').close()
 
 
 def _extract_text(prompt) -> str:
@@ -647,13 +561,29 @@ def _extract_text(prompt) -> str:
     return str(prompt) if prompt else ''
 
 
-def _do_buffer(text: str, cfg: dict, agent_name: Optional[str] = None,
-               session_id: Optional[str] = None, turn_id: Optional[str] = None) -> None:
+def _normalize_timestamp(date_str: str, end_of_day: bool = False) -> str:
+    """Normalize a date or datetime string for timestamp comparison."""
+    if not date_str:
+        return date_str
+    # Already has time component
+    if 'T' in date_str or ' ' in date_str:
+        return date_str
+    # Date only → add time
+    suffix = 'T23:59:59' if end_of_day else 'T00:00:00'
+    return date_str + suffix
+
+
+def _do_buffer(
+    text: str, cfg: dict,
+    agent_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+) -> None:
     payload = {
-        'content': text,
+        'content':    text,
         'agent_name': agent_name,
         'session_id': session_id,
-        'turn_id': turn_id,
+        'turn_id':    turn_id,
     }
     try:
         _post(cfg, '/buffer', payload)
@@ -663,22 +593,35 @@ def _do_buffer(text: str, cfg: dict, agent_name: Optional[str] = None,
             _buffer_direct(text, cfg, agent_name=agent_name,
                            session_id=session_id, turn_id=turn_id)
         except Exception as e2:
-            print(f"⚠️ Physical save failed. Current memories may be lost. {e2}",
-                  file=sys.stderr)
+            print(
+                f"⚠️ 物理保存に失敗。現在の記憶は失われる可能性があります。 {e2}",
+                file=sys.stderr,
+            )
 
 
-def _do_search_and_write(query: str, cfg: dict) -> None:
+def _do_search_and_write(
+    query: str, cfg: dict,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> None:
     os.makedirs(MEMORY_DIR, exist_ok=True)
     empty_md = "# Recalled Memory Context\n\n_No relevant memories found._\n"
 
+    # spec §5: even empty query must write (clears stale context)
     if not query or not query.strip():
         with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
             f.write(empty_md)
         print(empty_md)
         return
 
+    payload: dict = {'query': query}
+    if since:
+        payload['since'] = since
+    if until:
+        payload['until'] = until
+
     try:
-        result = _post(cfg, '/search', {'query': query})
+        result = _post(cfg, '/search', payload)
     except Exception as e:
         msg = f"# Recalled Memory Context\n\n_(memory search unavailable: {e})_\n"
         with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
@@ -691,6 +634,8 @@ def _do_search_and_write(query: str, cfg: dict) -> None:
         md = render_memory_context(result, query)
     except Exception as e:
         md = f"# Recalled Memory Context\n\n_(memory rendering failed: {e})_\n"
+
+    # spec §5: write to BOTH file AND stdout
     with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
         f.write(md)
     print(md)
@@ -705,7 +650,11 @@ def cmd_buffer(text: str, cfg: dict, agent_name: Optional[str] = None) -> None:
     _do_buffer(text, cfg, agent_name=agent_name)
 
 
-def cmd_search(query: str, cfg: dict) -> None:
+def cmd_search(
+    query: str, cfg: dict,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> None:
     if not ensure_server(cfg):
         os.makedirs(MEMORY_DIR, exist_ok=True)
         msg = "# Recalled Memory Context\n\n_(memory server failed to start)_\n"
@@ -713,7 +662,7 @@ def cmd_search(query: str, cfg: dict) -> None:
             f.write(msg)
         print(msg)
         return
-    _do_search_and_write(query, cfg)
+    _do_search_and_write(query, cfg, since=since, until=until)
 
 
 def cmd_repair(cfg: dict) -> None:
@@ -727,26 +676,89 @@ def cmd_repair(cfg: dict) -> None:
         print(f"Repair failed: {e}", file=sys.stderr)
 
 
-def cmd_list(cfg: dict) -> None:
-    ensure_server(cfg)
+def cmd_list(
+    cfg: dict,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    fmt: str = 'tsv',
+) -> None:
+    # spec §3.6: --since/--until filtering done at DB level via direct connection
+    from .core.database import get_connection, init_db, migrate_schema, get_all_memories
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    if not os.path.exists(DB_PATH):
+        print("Total: 0 records")
+        return
+
+    conn = get_connection(DB_PATH)
     try:
-        result = _get(cfg, '/list')
-        for r in result.get('records', []):
-            content_80 = r['content'][:80].replace('\n', ' ').replace('\r', ' ')
-            agent = r.get('agent_name') or '-'
-            print(f"{r['id']}\t{r['timestamp']}\t{agent}\t{content_80}")
-        print(f"Total: {result.get('total', 0)} records")
-    except Exception as e:
-        print(f"List failed: {e}", file=sys.stderr)
+        init_db(conn)
+        migrate_schema(conn)
+        rows = get_all_memories(conn, since=since, until=until)
+        if fmt == 'jsonl':
+            for r in rows:
+                print(json.dumps({
+                    'id':         r['id'],
+                    'timestamp':  r['timestamp'],
+                    'agent_name': r['agent_name'],
+                    'content':    r['content'],
+                }, ensure_ascii=False))
+        else:
+            for r in rows:
+                # spec §6 test 2: [UUIDv7]\t[timestamp]\t[agent_name]\t[content[:80]]
+                content_80 = r['content'][:80].replace('\n', ' ').replace('\r', ' ')
+                agent = r['agent_name'] or '-'
+                print(f"{r['id']}\t{r['timestamp']}\t{agent}\t{content_80}")
+        print(f"Total: {len(rows)} records")
+    finally:
+        conn.close()
+
+
+def cmd_recall_thread(
+    turn_id: str,
+    cfg: dict,
+    before: int = 2,
+    after: int = 2,
+    fmt: str = 'tsv',
+) -> None:
+    """spec §3.6: return turn_id's records plus N surrounding turns."""
+    from .core.database import get_connection, init_db, migrate_schema, get_thread_context
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    if not os.path.exists(DB_PATH):
+        print(f"No DB found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = get_connection(DB_PATH)
+    try:
+        init_db(conn)
+        migrate_schema(conn)
+        rows = get_thread_context(conn, turn_id, before=before, after=after)
+        if fmt == 'jsonl':
+            for r in rows:
+                print(json.dumps({
+                    'id':         r['id'],
+                    'timestamp':  r['timestamp'],
+                    'agent_name': r['agent_name'],
+                    'turn_id':    r['turn_id'],
+                    'content':    r['content'],
+                }, ensure_ascii=False))
+        else:
+            for r in rows:
+                content_80 = r['content'][:80].replace('\n', ' ').replace('\r', ' ')
+                agent = r['agent_name'] or '-'
+                print(f"{r['id']}\t{r['timestamp']}\t{agent}\t{content_80}")
+        print(f"Total: {len(rows)} records")
+    finally:
+        conn.close()
 
 
 def cmd_stop(cfg: dict) -> None:
+    """spec §4: ensure behavior.md and CLAUDE.md @import exist (idempotent)."""
     cp = claude_paths()
     os.makedirs(cp['RULES_DIR'], exist_ok=True)
     if not os.path.exists(cp['BEHAVIOR_MD']):
         _write_behavior_md(cp['BEHAVIOR_MD'])
 
-    # Absolute path because `~/.n3mc/.memory/` is global, not project-relative.
+    # Absolute path for global memory_context.md
     import_line = f"@{CONTEXT_FILE}"
     os.makedirs(cp['CLAUDE_DIR'], exist_ok=True)
 
@@ -754,10 +766,15 @@ def cmd_stop(cfg: dict) -> None:
         with open(cp['CLAUDE_MD'], 'r', encoding='utf-8') as f:
             content = f.read()
         import re
+        # spec §4: remove legacy N3MC_AUTO_START/END zones
         content = re.sub(
             r'<!-- N3MC_AUTO_START -->.*?<!-- N3MC_AUTO_END -->',
             '', content, flags=re.DOTALL
         ).strip() + '\n'
+        # spec §4: remove legacy relative-path @import forms
+        content = re.sub(
+            r'@\.\./[^\n]*memory_context\.md[^\n]*\n?', '', content
+        )
         if import_line not in content:
             content = content.rstrip() + '\n\n' + import_line + '\n'
         with open(cp['CLAUDE_MD'], 'w', encoding='utf-8') as f:
@@ -780,8 +797,14 @@ recorded character-for-character; there is no length filter and no skip-pattern
 filter. Make NO acknowledgement when a save succeeds — silence is correct.
 
 ## Active RAG
-When prior context would help, run `--search "<keywords>"` proactively. The
-command is auto-allowed via `permissions.allow`.
+When prior context would help, run a search proactively. **Always invoke via
+`python -m n3memorycore.n3memory --search "<keywords>"`**, NOT the bare `n3mc`
+console script. Claude Code spawns a bash subprocess whose `PATH` does not
+reliably include the Python `Scripts/` directory where the `n3mc` entry-point
+lives, so `n3mc --search ...` works in interactive shells but fails in
+production with `command not found`. `python -m` resolves through the Python
+interpreter (which is on `PATH`) and is portable across venvs and platforms.
+Both invocation forms are auto-allowed via `permissions.allow`.
 
 ## Recall Acknowledgment
 When `--search` results actually shape your reply (you are recalling something
@@ -799,6 +822,7 @@ If a save fails physically, surface the warning prominently:
 
 
 def cmd_hook_submit(cfg: dict) -> None:
+    """spec §4.5: UserPromptSubmit hook — repair → buffer(claude) → search → buffer(user)."""
     raw = sys.stdin.read()
     try:
         data = json.loads(raw)
@@ -810,13 +834,15 @@ def cmd_hook_submit(cfg: dict) -> None:
 
     ensure_server(cfg)
 
-    # Repair
+    # Step 0 already written by n3mc_hook.py before this is called
+
+    # Step 1: Repair unindexed records
     try:
         _post(cfg, '/repair', {})
     except Exception as e:
         logger.warning(f"Repair failed during hook: {e}")
 
-    # Save Claude's previous response
+    # Step 2: Save Claude's previous response
     if last_claude.strip():
         from .core.processor import chunk_text, add_chunk_prefixes, purify_text
         cleaned = purify_text(last_claude)
@@ -825,11 +851,11 @@ def cmd_hook_submit(cfg: dict) -> None:
         for chunk in add_chunk_prefixes(chunks, 'claude'):
             _do_buffer(chunk, cfg, agent_name='claude-code', turn_id=prev_tid)
 
-    # Search
+    # Step 3: Search memory for current query
     q = user_text[:cfg.get('search_query_max_chars', 2000)]
     _do_search_and_write(q, cfg)
 
-    # Save user message
+    # Step 4: Save user message (spec §5: no length filter, no skip patterns)
     if user_text.strip():
         from .core.processor import chunk_text, add_chunk_prefixes
         new_tid = str(uuid.uuid4())
@@ -840,6 +866,7 @@ def cmd_hook_submit(cfg: dict) -> None:
 
 
 def cmd_save_claude_turn(cfg: dict) -> None:
+    """spec §4.5: Stop hook helper — save last_assistant_message via chunking."""
     raw = sys.stdin.read()
     try:
         data = json.loads(raw)
@@ -869,24 +896,18 @@ def cmd_save_claude_turn(cfg: dict) -> None:
 
 def run_server(cfg: dict) -> None:
     import uvicorn
-    uvicorn.run(app, host='127.0.0.1', port=cfg.get('server_port', 18520),
-                log_level='error')
+    uvicorn.run(
+        app, host='127.0.0.1', port=cfg.get('server_port', 18520),
+        log_level='error',
+    )
 
 
 # ---------------------------------------------------------------------------
-# n3mc init  —  register hooks in ~/.claude/settings.json
+# n3mc --init  —  register hooks in ~/.claude/settings.json
 # ---------------------------------------------------------------------------
 
 def _resolve_hook_command(script_name: str) -> str:
-    """Resolve the absolute path to the entry-point script (e.g. n3mc-hook).
-
-    Always returned with forward slashes — the bash shell Claude Code spawns
-    interprets backslashes as escape sequences (\\n -> newline, \\t -> tab),
-    so a Windows-style \\Users\\... path silently corrupts when bash parses it.
-
-    Falls back to `python -m n3memorycore.n3mc_hook` form if the entry-point
-    script is not on PATH (e.g. running from a non-installed checkout).
-    """
+    """Resolve entry-point script path with forward slashes (bash-safe)."""
     import shutil
     import pathlib
     exe = shutil.which(script_name)
@@ -901,7 +922,7 @@ def _resolve_hook_command(script_name: str) -> str:
 
 
 def cmd_init() -> None:
-    """Set up ~/.n3mc/ data dir and register hooks in ~/.claude/settings.json."""
+    """Set up ~/.n3mc/ and register hooks in ~/.claude/settings.json."""
     os.makedirs(MEMORY_DIR, exist_ok=True)
     print(f"Data directory: {HOME_DIR}")
 
@@ -924,11 +945,7 @@ def cmd_init() -> None:
     stop_cmd = _resolve_hook_command('n3mc-stop-hook')
 
     def _replace_hook(event: str, markers: tuple, command: str) -> None:
-        # Drop existing entries that reference our scripts (any path, any form),
-        # then add the freshly-resolved one. Markers must cover BOTH the
-        # hyphenated entry-point form (n3mc-hook.EXE) AND the underscored
-        # module form (n3memorycore.n3mc_hook) — the resolved exe contains
-        # the hyphen, the python -m fallback contains the underscore.
+        # spec §4: markers cover both hyphen (exe) and underscore (module) forms
         existing = hooks.get(event, [])
         new_entries = []
         for entry in existing:
@@ -971,11 +988,23 @@ def main() -> None:
     grp.add_argument('--search', metavar='QUERY')
     grp.add_argument('--repair', action='store_true')
     grp.add_argument('--list',   action='store_true')
+    grp.add_argument('--recall-thread', metavar='TURN_ID', dest='recall_thread')
     grp.add_argument('--stop',   action='store_true')
     grp.add_argument('--hook-submit',      action='store_true', dest='hook_submit')
     grp.add_argument('--save-claude-turn', action='store_true', dest='save_claude_turn')
     grp.add_argument('--run-server',       action='store_true', dest='run_server')
+
     parser.add_argument('--agent-id', dest='agent_id', default=None)
+    # spec §3.6: time range filters for --search and --list
+    parser.add_argument('--since', default=None, help='Filter from date (YYYY-MM-DD or ISO)')
+    parser.add_argument('--until', default=None, help='Filter until date (YYYY-MM-DD or ISO)')
+    # spec §3.6: --recall-thread context window
+    parser.add_argument('--before', type=int, default=2, help='Turns before target (default 2)')
+    parser.add_argument('--after',  type=int, default=2, help='Turns after target (default 2)')
+    # spec §3.6: output format
+    parser.add_argument('--format', dest='fmt', default='tsv',
+                        choices=['tsv', 'jsonl'], help='Output format for --list/--recall-thread')
+
     args = parser.parse_args()
 
     if args.init:
@@ -984,6 +1013,10 @@ def main() -> None:
 
     cfg = _load_config()
 
+    # Normalize since/until
+    since = _normalize_timestamp(args.since) if args.since else None
+    until = _normalize_timestamp(args.until, end_of_day=True) if args.until else None
+
     if args.run_server:
         run_server(cfg)
     elif args.buffer is not None:
@@ -991,11 +1024,16 @@ def main() -> None:
         if text.strip():
             cmd_buffer(text, cfg, agent_name=args.agent_id)
     elif args.search is not None:
-        cmd_search(args.search, cfg)
+        cmd_search(args.search, cfg, since=since, until=until)
     elif args.repair:
         cmd_repair(cfg)
     elif args.list:
-        cmd_list(cfg)
+        cmd_list(cfg, since=since, until=until, fmt=args.fmt)
+    elif args.recall_thread:
+        cmd_recall_thread(
+            args.recall_thread, cfg,
+            before=args.before, after=args.after, fmt=args.fmt,
+        )
     elif args.stop:
         cmd_stop(cfg)
     elif args.hook_submit:
