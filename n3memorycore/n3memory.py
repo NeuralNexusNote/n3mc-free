@@ -13,6 +13,7 @@ for _s_name in ("stdin", "stdout", "stderr"):
 import argparse
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -520,8 +521,26 @@ except ImportError:
 # CLI helpers
 # ---------------------------------------------------------------------------
 
-def _read_turn_id() -> Optional[str]:
-    if os.path.exists(TURN_ID_FILE):
+def _turn_id_file(cc_session_id: str = '') -> str:
+    """Resolve turn_id file path. Session-specific when cc_session_id is
+    given, else fall back to the legacy single-file path."""
+    if cc_session_id:
+        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', cc_session_id)[:64]
+        return os.path.join(MEMORY_DIR, f'turn_id_{safe_id}.txt')
+    return TURN_ID_FILE
+
+
+def _read_turn_id(cc_session_id: str = '') -> Optional[str]:
+    f = _turn_id_file(cc_session_id)
+    if os.path.exists(f):
+        try:
+            tid = open(f, 'r', encoding='utf-8').read().strip()
+            return tid or None
+        except Exception:
+            pass
+    # Legacy fallback: check the plain turn_id.txt — covers in-flight
+    # upgrades from pre-session-id builds.
+    if cc_session_id and os.path.exists(TURN_ID_FILE):
         try:
             tid = open(TURN_ID_FILE, 'r', encoding='utf-8').read().strip()
             return tid or None
@@ -530,15 +549,16 @@ def _read_turn_id() -> Optional[str]:
     return None
 
 
-def _write_turn_id(tid: str) -> None:
+def _write_turn_id(tid: str, cc_session_id: str = '') -> None:
     os.makedirs(MEMORY_DIR, exist_ok=True)
-    with open(TURN_ID_FILE, 'w', encoding='utf-8') as f:
+    with open(_turn_id_file(cc_session_id), 'w', encoding='utf-8') as f:
         f.write(tid)
 
 
-def _clear_turn_id() -> None:
-    if os.path.exists(TURN_ID_FILE):
-        open(TURN_ID_FILE, 'w', encoding='utf-8').close()
+def _clear_turn_id(cc_session_id: str = '') -> None:
+    f = _turn_id_file(cc_session_id)
+    if os.path.exists(f):
+        open(f, 'w', encoding='utf-8').close()
 
 
 def _extract_text(prompt) -> str:
@@ -603,6 +623,7 @@ def _do_search_and_write(
     query: str, cfg: dict,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    current_session: Optional[str] = None,
 ) -> None:
     os.makedirs(MEMORY_DIR, exist_ok=True)
     empty_md = "# Recalled Memory Context\n\n_No relevant memories found._\n"
@@ -619,6 +640,9 @@ def _do_search_and_write(
         payload['since'] = since
     if until:
         payload['until'] = until
+    # Pass cc_session_id so same-session records get b_session=1.0 boost.
+    if current_session:
+        payload['session_id'] = current_session
 
     try:
         result = _post(cfg, '/search', payload)
@@ -831,6 +855,9 @@ def cmd_hook_submit(cfg: dict) -> None:
 
     user_text   = _extract_text(data.get('message') or data.get('prompt') or '')
     last_claude = data.get('last_assistant_message') or ''
+    # Claude Code's session ID, supplied by the hook payload. Empty string
+    # for older Claude Code builds — _do_buffer / search fall back gracefully.
+    cc_session_id = data.get('session_id', '')
 
     ensure_server(cfg)
 
@@ -847,22 +874,25 @@ def cmd_hook_submit(cfg: dict) -> None:
         from .core.processor import chunk_text, add_chunk_prefixes, purify_text
         cleaned = purify_text(last_claude)
         chunks  = chunk_text(cleaned)
-        prev_tid = _read_turn_id()
+        prev_tid = _read_turn_id(cc_session_id)
         for chunk in add_chunk_prefixes(chunks, 'claude'):
-            _do_buffer(chunk, cfg, agent_name='claude-code', turn_id=prev_tid)
+            _do_buffer(chunk, cfg, agent_name='claude-code',
+                       session_id=cc_session_id or None, turn_id=prev_tid)
 
-    # Step 3: Search memory for current query
+    # Step 3: Search memory for current query — pass cc_session_id so
+    # same-session records get b_session=1.0 boost
     q = user_text[:cfg.get('search_query_max_chars', 2000)]
-    _do_search_and_write(q, cfg)
+    _do_search_and_write(q, cfg, current_session=cc_session_id or None)
 
     # Step 4: Save user message (spec §5: no length filter, no skip patterns)
     if user_text.strip():
         from .core.processor import chunk_text, add_chunk_prefixes
         new_tid = str(uuid.uuid4())
-        _write_turn_id(new_tid)
+        _write_turn_id(new_tid, cc_session_id)
         chunks = chunk_text(user_text)
         for chunk in add_chunk_prefixes(chunks, 'user'):
-            _do_buffer(chunk, cfg, agent_name='claude-code', turn_id=new_tid)
+            _do_buffer(chunk, cfg, agent_name='claude-code',
+                       session_id=cc_session_id or None, turn_id=new_tid)
 
 
 def cmd_save_claude_turn(cfg: dict) -> None:
@@ -874,6 +904,8 @@ def cmd_save_claude_turn(cfg: dict) -> None:
         data = {}
 
     last_claude = data.get('last_assistant_message') or ''
+    cc_session_id = data.get('session_id', '')  # Claude Code's session ID
+
     if not last_claude.strip():
         return
 
@@ -881,13 +913,14 @@ def cmd_save_claude_turn(cfg: dict) -> None:
     cleaned = purify_text(last_claude)
     chunks  = chunk_text(cleaned)
 
-    tid = _read_turn_id() or str(uuid.uuid4())
+    tid = _read_turn_id(cc_session_id) or str(uuid.uuid4())
     ensure_server(cfg)
     try:
         for chunk in add_chunk_prefixes(chunks, 'claude'):
-            _do_buffer(chunk, cfg, agent_name='claude-code', turn_id=tid)
+            _do_buffer(chunk, cfg, agent_name='claude-code',
+                       session_id=cc_session_id or None, turn_id=tid)
     finally:
-        _clear_turn_id()
+        _clear_turn_id(cc_session_id)
 
 
 # ---------------------------------------------------------------------------
