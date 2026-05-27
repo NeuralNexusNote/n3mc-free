@@ -271,7 +271,10 @@ Force the following on every connection:
 ```sql
 PRAGMA synchronous = FULL;
 PRAGMA journal_mode = WAL;
+PRAGMA wal_autocheckpoint = 1000;
 ```
+
+- `PRAGMA wal_autocheckpoint = 1000;` — Automatic checkpoint when WAL grows past 1000 pages (~4MB). Prevents unbounded WAL growth during long-running sessions.
 
 ### Immediate Physical Writes (No Modifications or Optimizations Allowed)
 On `--buffer` or API-based saves, complete INSERT and COMMIT at that instant.
@@ -513,11 +516,12 @@ When `config.json` is empty or corrupted, `_load_config` follows this recovery p
 
 ### DB Corruption Detection and Recovery
 
-On server startup (`run_server`) and in the `_buffer_direct` fallback path, run `PRAGMA integrity_check`:
+At server startup (`lifespan`), run the full `PRAGMA integrity_check` exactly once. In the `_buffer_direct` fallback path, run **`PRAGMA quick_check`** instead — `integrity_check` walks every row of every table and takes seconds-to-minutes on large DBs, which is unacceptable for a fallback path triggered on every HTTP failure, so the lightweight `quick_check` is used there. In either case:
 
 1. If the result is not `ok`, rename the current DB to `.corrupt.bak`
-2. Create a new empty DB
-3. Output a warning message to stderr (including recovery instructions)
+2. Also delete the `n3memory.db-wal` and `n3memory.db-shm` sidecar files (failing to remove the sidecars allows the newly recreated empty DB to replay the old WAL, breaking consistency)
+3. Create a new empty DB
+4. Output a warning message to stderr (including recovery instructions)
 
 If `PRAGMA` execution inside `get_connection` raises a `DatabaseError`, re-raise with an error message that includes recovery instructions.
 
@@ -871,6 +875,14 @@ Every [user] and [claude i/N] row recorded for the same conversational turn shar
 5. **Rendering (v1.2.0+)**: `memory_context.md` puts a **`## Top matches (use these to answer the question)` block FIRST** (v1.2.0+ renderer; carried forward unchanged in v1.3.0). Top matches contain all high-scoring records in score order, **including records that also belong to a Q-A pair** (do NOT suppress them from the result list). Q-A pairs follow as a **`## Previous matching Q-A exchanges (supplementary context)`** block placed AFTER Top matches. Overlap between sections is allowed: a record may appear in both Top matches and a Q-A pair — harmless because Claude reads Top matches first.
    **Important background**: Earlier spec drafts had the reverse ordering (Q-A pairs at top, pair members suppressed from results). This caused a critical failure mode in databases dominated by recurring conversation themes (e.g., a user who regularly discusses project management): the chunks of one popular turn_id would occupy the top of the score ranking, and pair extraction would yank them out of `results`, leaving `## Top matches` empty of useful data. Claude, encountering 5KB of unrelated conversation history at the top of memory_context.md, would conclude "the answer isn't here" and fall back to MCP / training, falsely reporting "I don't have that information" even though the actual data record existed in the Pro DB. The new ordering eliminates this failure mode.
 6. **Schema**: `memories.turn_id TEXT` with index `idx_memories_turn_id`. `insert_memory(..., turn_id=None)` is the keyword-only parameter. `get_memories_by_turn_id(conn, turn_id)` is the helper used by retrieval.
+
+### embed_query Failure Warning
+
+If `embed_query` raises an exception (model not loaded, GPU failure, etc.), the search continues with BM25 alone and zero vector candidates. **Because this fallback significantly reduces recall, emit a single `Warning: vector search degraded (embed_query failed: <reason>)` message to stderr** — do not let recall silently degrade.
+
+### Top-K Chunk-Duplication Cap
+
+When a long Claude turn is split into many chunks, hybrid search can fill the entire Top-K with sibling chunks of one `turn_id`. To prevent this, the result-shaping stage of `hybrid_search` enforces **a per-`turn_id` cap of at most 2 chunks** in the Top-K list; subsequent siblings are dropped from Top-K (they remain available in the `pairs` Q-A section). Records with `turn_id` NULL (manual `--buffer` etc.) are exempt from the cap.
 
 ---
 

@@ -271,7 +271,10 @@ from .core.processor import (
 ```sql
 PRAGMA synchronous = FULL;
 PRAGMA journal_mode = WAL;
+PRAGMA wal_autocheckpoint = 1000;
 ```
+
+- `PRAGMA wal_autocheckpoint = 1000;` — WAL ファイルが 1000 ページ（約 4MB）を超えたら自動的にチェックポイント。長期稼働で WAL が肥大化することを防止。
 
 ### 即時物理保存（変更・最適化禁止）
 `--buffer` または API経由の保存時、その瞬間に INSERT および COMMIT を完遂せよ。
@@ -509,11 +512,12 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 ### DB 破損時の検出と復旧
 
-サーバー起動時（`run_server`）および `_buffer_direct` フォールバック時に `PRAGMA integrity_check` を実行する：
+サーバー起動時（`lifespan`）には `PRAGMA integrity_check` を 1 回だけ実行する。一方 `_buffer_direct` フォールバック経路では **`PRAGMA quick_check`** を実行する（`integrity_check` は全テーブル全行走査で大型 DB ではフォールバックの度に数秒〜数分を要し、HTTP 失敗ごとに走らせる経路としては不適切なため、軽量な `quick_check` を使う）。いずれも：
 
 1. 結果が `ok` でない場合、現在の DB を `.corrupt.bak` にリネーム
-2. 新しい空の DB を作成
-3. stderr に警告メッセージを出力（復旧手順を含む）
+2. `n3memory.db-wal` および `n3memory.db-shm` のサイドカーファイルも削除する（これを怠ると、新規作成された空 DB が古い WAL を読んでしまい一貫性が崩れる可能性がある）
+3. 新しい空の DB を作成
+4. stderr に警告メッセージを出力（復旧手順を含む）
 
 `get_connection` 内で `PRAGMA` 実行時に `DatabaseError` が発生した場合は、復旧手順を含むエラーメッセージを付与して re-raise する。
 
@@ -866,6 +870,14 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 5. **レンダリング（v1.2.0+）**: `memory_context.md` は **`## Top matches (use these to answer the question)` ブロックを先頭** に置く（v1.2.0+ レンダラー、v1.3.0 で挙動は変わらず）。Top matches はスコア順の高スコア record を含み、**Q-A pair に含まれているレコードも除外せずそのまま含める**（pair 所属で result から消さない）。Q-A pairs は **`## Previous matching Q-A exchanges (supplementary context)`** ブロックとして Top matches **の後** に配置する補助情報。Top matches と Q-A pairs に同じ record が重複出現することを許容する（無害 — Claude は Top matches を先に読んで使うため）。
    **重要な背景**: 旧仕様は逆順（Q-A pairs を先頭、pair 化 record を results から排他）だった。これは特定の話題の会話が頻出する DB（例：プロジェクト管理に関する会話を毎日繰り返すユーザー）で、その turn_id 内の chunks が score-ranked top を独占し、pair 抽出によって `## Top matches` から data record が消える致命的失敗パターンを引き起こした。Claude が context window 先頭で「無関係な履歴」を見て「答えがない」と誤判断し、Pro の data record が DB に存在するのに「見つかりません」と回答する根本原因となっていた。新仕様で完全に解消。
 6. **スキーマ**: `memories.turn_id TEXT` 列 + `idx_memories_turn_id` インデックス。`insert_memory(..., turn_id=None)` はキーワード専用引数。取得には `get_memories_by_turn_id(conn, turn_id)` を使用します。
+
+### embed_query 失敗時の警告出力
+
+`embed_query` が例外を投げた場合（モデル未ロード・GPU 障害等）、ベクトル候補ゼロのまま BM25 のみで検索を続行する。**ただしこのフォールバックは精度が著しく低下するため、stderr に `Warning: vector search degraded (embed_query failed: <reason>)` を 1 回出力する**。サイレントに精度劣化させない。
+
+### Top-K のチャンク重複対策
+
+1 つの長い Claude 応答が複数チャンクに分割されると、ハイブリッド検索で同一 `turn_id` の兄弟チャンクが Top-K を埋め尽くす病的ケースが発生する。これを防ぐため、`hybrid_search` の結果整形時に **同一 `turn_id` あたり最大 2 チャンクまで** とし、3 件目以降は Top-K リストから除外する（除外されたチャンクは `pairs`（Q-A 兄弟）セクションには出力される）。`turn_id` が NULL のレコード（手動 `--buffer` 等）はこの cap の対象外。
 
 ---
 
