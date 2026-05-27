@@ -523,7 +523,7 @@ If `PRAGMA` execution inside `get_connection` raises a `DatabaseError`, re-raise
 
 ### Migration Batch Processing
 
-Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) execute in **batches of 200**. To prevent OOM on large DBs, use `LIMIT/OFFSET` pagination instead of `fetchall()`.
+Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) execute in **batches of 200**. To prevent OOM on large DBs, fetch using `LIMIT 200` instead of `fetchall()`. **Always keep `OFFSET` at `0`** — repaired records automatically drop out of the `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` result set, so incrementing `OFFSET` across batches would skip the remaining unrepaired records (e.g., 400 unrepaired → 200 repaired → `OFFSET 200` returns 0 rows → remaining 200 permanently skipped). Exit immediately if a batch produces zero progress (e.g., embedding model unavailable) to prevent infinite loops.
 
 ---
 
