@@ -4,6 +4,45 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-05-30
+
+Patch release aligning the server with the v1.3.2 spec. No API changes,
+no schema changes; existing user DBs continue to operate without
+regeneration.
+
+### Fixed
+- **`--repair` skipped records on large DBs**: the unindexed-record loop
+  incremented `OFFSET` each batch, but repaired records drop out of the
+  `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` result set, so advancing
+  the offset skipped still-unrepaired rows. `OFFSET` is now fixed at `0`,
+  with a `batch_repaired == 0` guard to prevent an infinite loop when the
+  embedding model is unavailable.
+- **Heavy integrity check in the fallback path**: `_buffer_direct` now
+  runs `PRAGMA quick_check` instead of `integrity_check`. The full check
+  walks every row and took seconds-to-minutes on large DBs on every HTTP
+  failure; `quick_check` is the appropriate lightweight check there.
+  Startup `lifespan` still uses the full `integrity_check` (once).
+- **WAL growth on long-running servers**: `PRAGMA wal_autocheckpoint = 1000`
+  is now set on every connection, checkpointing the WAL once it exceeds
+  ~4 MB.
+- **Top-K crowding by one conversation turn**: `hybrid_search` now caps
+  each `turn_id` at 2 chunks in the Top matches list (siblings still
+  appear in the Q-A `pairs` section). `turn_id IS NULL` records are exempt.
+- **Silent vector-search degradation**: when `embed_query` raises,
+  `hybrid_search` now prints `Warning: vector search degraded ...` to
+  stderr once and continues with BM25 only, instead of degrading silently.
+- **Stale WAL sidecars after corruption recovery**: `_handle_corrupt_db`
+  now removes `n3memory.db-wal` and `n3memory.db-shm` alongside renaming
+  the corrupt DB, so the fresh empty DB cannot read a stale WAL.
+- **`--init` confirmation message** restored to Japanese.
+- **`__version__` mismatch**: `n3memorycore.__version__` was `1.3.2`
+  while `pyproject.toml` was `1.3.3`. Both are now `1.3.4`.
+
+### Changed
+- **`memory_context.md` rendering** aligned to the v1.2.0+ layout: each
+  Top match is headed `## [N] score=X (timestamp, agent)`, and Q-A pairs
+  are grouped under `### Exchange` blocks after the Top matches.
+
 ## [1.3.3] - 2026-05-09
 
 Patch release hardening the dedup window, aligning the server with the
