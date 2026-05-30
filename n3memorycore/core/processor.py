@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # spec §5: closed fenced code blocks → [code omitted]; inline backticks preserved
 _CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```')
 
-# spec §5: strip lone UTF-16 surrogate halves (Windows cp932 guard)
+# Windows cp932 guard: strip lone UTF-16 surrogate halves
 _LONE_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
@@ -91,7 +92,7 @@ def chunk_text(text: str, max_chars: int = 400, overlap: int = 40) -> list:
     if len(text) <= max_chars:
         return [text]
 
-    # Paragraph split
+    # Paragraph split (highest priority)
     paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
     if len(paragraphs) > 1:
         chunks = _merge_chunks(paragraphs, max_chars, overlap, sep='\n\n')
@@ -224,7 +225,11 @@ def hybrid_search(
                         'bm25_score': None,
                     }
             except Exception as e:
-                logger.warning(f"Vector search error: {e}")
+                # spec §5: warn on stderr; continue with BM25 only
+                print(
+                    f"Warning: vector search degraded (embed_query failed: {e})",
+                    file=sys.stderr,
+                )
 
         # FTS search
         fts_results = {}
@@ -236,15 +241,15 @@ def hybrid_search(
                 for row in rows:
                     rid = row['id']
                     fts_results[rid] = {
-                        'id':          rid,
-                        'content':     row['content'],
-                        'timestamp':   row['timestamp'],
-                        'session_id':  row['session_id'],
-                        'turn_id':     row['turn_id'],
-                        'agent_name':  row['agent_name'],
-                        'bm25_score':  row['bm25_score'],
+                        'id':           rid,
+                        'content':      row['content'],
+                        'timestamp':    row['timestamp'],
+                        'session_id':   row['session_id'],
+                        'turn_id':      row['turn_id'],
+                        'agent_name':   row['agent_name'],
+                        'bm25_score':   row['bm25_score'],
                         'max_abs_bm25': max_abs,
-                        'cos_sim':     None,
+                        'cos_sim':      None,
                     }
             except Exception as e:
                 logger.warning(f"FTS search error: {e}")
@@ -268,28 +273,41 @@ def hybrid_search(
             decay = time_decay(meta['timestamp'], half_life)
 
             sess = meta.get('session_id')
-            # spec §3: b_session = 1.0 if session matches, 0.6 otherwise
+            # spec §3: b_session = 1.0 on match, 0.6 on mismatch/NULL
             b_session = 1.0 if (current_session_id and sess == current_session_id) else 0.6
 
             score = (cs * 0.7 + kr * 0.3) * decay * b_session
 
             scored.append({
-                'id':               rid,
-                'content':          meta['content'],
-                'timestamp':        meta['timestamp'],
-                'session_id':       sess,
-                'turn_id':          meta.get('turn_id'),
-                'agent_name':       meta.get('agent_name'),
-                'score':            score,
-                'cos_sim':          cs,
+                'id':                rid,
+                'content':           meta['content'],
+                'timestamp':         meta['timestamp'],
+                'session_id':        sess,
+                'turn_id':           meta.get('turn_id'),
+                'agent_name':        meta.get('agent_name'),
+                'score':             score,
+                'cos_sim':           cs,
                 'keyword_relevance': kr,
             })
 
         scored.sort(key=lambda x: x['score'], reverse=True)
         filtered = [r for r in scored if r['score'] >= min_score]
-        results = filtered[:limit]
 
-        # Q-A pair collection: spec §5 — results include pair records too
+        # spec §5: top-K turn_id chunk dedup — max 2 chunks per turn_id
+        results = []
+        turn_id_counts: dict = {}
+        for r in filtered:
+            tid = r.get('turn_id')
+            if tid is not None:
+                count = turn_id_counts.get(tid, 0)
+                if count >= 2:
+                    continue
+                turn_id_counts[tid] = count + 1
+            results.append(r)
+            if len(results) >= limit:
+                break
+
+        # spec §5: Q-A pair collection; results include pair records too
         pairs = {}
         seen_turn_ids = set()
         for r in results:
@@ -317,25 +335,26 @@ def render_memory_context(search_result: dict, query: str) -> str:
     results = search_result.get('results', [])
     pairs = search_result.get('pairs', {})
 
-    lines = [f"# Recalled Memory Context\n検索クエリ: {query}\n"]
+    lines = [f"# Recalled Memory Context\nSearch query: {query}\n"]
 
     if not results:
         lines.append("_No relevant memories found._\n")
     else:
         # spec §5: Top matches block first (pair records NOT excluded)
-        lines.append("## Top matches (use these to answer the question)\n")
+        lines.append("## Top matches (use these to answer the question)")
         for i, r in enumerate(results, 1):
-            lines.append(f"### [{i}] score={r['score']:.4f}")
+            ts = (r.get('timestamp') or '')[:19].replace('T', ' ')
+            agent = r.get('agent_name') or '-'
+            lines.append(f"## [{i}] score={r['score']:.4f}  ({ts}, {agent})")
             lines.append(r['content'])
             lines.append("")
 
     if pairs:
-        lines.append("\n## Previous matching Q-A exchanges (supplementary context)\n")
+        lines.append("## Previous matching Q-A exchanges (supplementary context)")
         for tid, siblings in pairs.items():
-            lines.append(f"**Turn:** `{tid}`\n")
+            lines.append("### Exchange")
             for s in siblings:
                 lines.append(s.get('content', '[content missing]'))
                 lines.append("")
-            lines.append("---")
 
     return '\n'.join(lines)

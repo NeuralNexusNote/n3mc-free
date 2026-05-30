@@ -217,8 +217,8 @@ def _buffer_direct(
 
     conn = get_connection(DB_PATH)
     try:
-        # spec §3.5: DB integrity check
-        result = conn.execute("PRAGMA integrity_check").fetchone()
+        # spec §3.5: use quick_check in fallback path (lighter than integrity_check)
+        result = conn.execute("PRAGMA quick_check").fetchone()
         if result and result[0] != 'ok':
             conn.close()
             _handle_corrupt_db()
@@ -245,10 +245,16 @@ def _buffer_direct(
 def _handle_corrupt_db() -> None:
     import shutil
     corrupt = DB_PATH + '.corrupt.bak'
-    try:
-        shutil.move(DB_PATH, corrupt)
-    except Exception:
-        pass
+    # spec §3.5: rename DB and remove WAL sidecar files
+    for path in (DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm'):
+        if os.path.exists(path):
+            try:
+                if path == DB_PATH:
+                    shutil.move(path, corrupt)
+                else:
+                    os.remove(path)
+            except Exception:
+                pass
     print(
         f"Warning: DB corruption detected. Renamed to {corrupt}. "
         "A new empty DB will be created.",
@@ -292,7 +298,7 @@ try:
 
         conn = get_connection(DB_PATH)
         try:
-            # spec §3.5: DB integrity check on startup
+            # spec §3.5: integrity_check on startup (once, not in fallback path)
             ok = conn.execute("PRAGMA integrity_check").fetchone()
             if ok and ok[0] != 'ok':
                 conn.close()
@@ -348,8 +354,6 @@ try:
                 logger.warning(f"Embed error: {e}")
             if vec is not None:
                 try:
-                    # spec §5: dedup window k=20 — k=5 missed near-duplicates
-                    # in busy DBs where ≥5 highly-similar records crowd top-k.
                     rows = search_vector(conn, vec, k=20)
                     for row in rows:
                         if cosine_sim_from_l2(row['distance']) >= thresh:
@@ -398,6 +402,7 @@ try:
                 offset = 0
                 cleaned_count = 0
                 while True:
+                    # FTS cleaning uses OFFSET (UPDATE keeps records in result set)
                     rows = conn.execute(
                         "SELECT rowid, content FROM memories_fts LIMIT 200 OFFSET ?",
                         (offset,)
@@ -439,17 +444,18 @@ try:
                         file=sys.stderr,
                     )
 
-            # spec §3.5: batch 200 records at a time to avoid memory exhaustion
-            offset = 0
+            # spec §3.5: batch 200 at a time; OFFSET always 0 (repaired records
+            # disappear from WHERE clause automatically)
             while True:
-                rows = find_unindexed_memories(conn, limit=200, offset=offset)
+                rows = find_unindexed_memories(conn, limit=200)  # OFFSET=0 always
                 if not rows:
                     break
+                batch_repaired = 0
                 for row in rows:
-                    rowid   = row['rowid']
-                    content = row['content']
-                    has_vec = row['vec_rowid'] is not None
-                    has_fts = row['fts_rowid'] is not None
+                    rowid    = row['rowid']
+                    content  = row['content']
+                    has_vec  = row['vec_rowid'] is not None
+                    has_fts  = row['fts_rowid'] is not None
 
                     if not has_vec:
                         try:
@@ -458,6 +464,7 @@ try:
                                 "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
                                 (rowid, serialize_vector(vec))
                             )
+                            batch_repaired += 1
                         except Exception as e:
                             logger.warning(f"Repair embed rowid={rowid}: {e}")
 
@@ -467,10 +474,14 @@ try:
                             "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
                             (rowid, stripped)
                         )
+                        batch_repaired += 1
+
                     repaired += 1
 
                 conn.commit()
-                offset += 200
+                # spec §3.5: exit if no progress (e.g. embed model unavailable)
+                if batch_repaired == 0:
+                    break
                 if len(rows) < 200:
                     break
 
@@ -522,8 +533,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _turn_id_file(cc_session_id: str = '') -> str:
-    """Resolve turn_id file path. Session-specific when cc_session_id is
-    given, else fall back to the legacy single-file path."""
+    """Resolve turn_id file path (session-specific or legacy)."""
     if cc_session_id:
         safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', cc_session_id)[:64]
         return os.path.join(MEMORY_DIR, f'turn_id_{safe_id}.txt')
@@ -538,8 +548,7 @@ def _read_turn_id(cc_session_id: str = '') -> Optional[str]:
             return tid or None
         except Exception:
             pass
-    # Legacy fallback: check the plain turn_id.txt — covers in-flight
-    # upgrades from pre-session-id builds.
+    # Legacy fallback
     if cc_session_id and os.path.exists(TURN_ID_FILE):
         try:
             tid = open(TURN_ID_FILE, 'r', encoding='utf-8').read().strip()
@@ -582,13 +591,10 @@ def _extract_text(prompt) -> str:
 
 
 def _normalize_timestamp(date_str: str, end_of_day: bool = False) -> str:
-    """Normalize a date or datetime string for timestamp comparison."""
     if not date_str:
         return date_str
-    # Already has time component
     if 'T' in date_str or ' ' in date_str:
         return date_str
-    # Date only → add time
     suffix = 'T23:59:59' if end_of_day else 'T00:00:00'
     return date_str + suffix
 
@@ -640,7 +646,6 @@ def _do_search_and_write(
         payload['since'] = since
     if until:
         payload['until'] = until
-    # Pass cc_session_id so same-session records get b_session=1.0 boost.
     if current_session:
         payload['session_id'] = current_session
 
@@ -706,7 +711,6 @@ def cmd_list(
     until: Optional[str] = None,
     fmt: str = 'tsv',
 ) -> None:
-    # spec §3.6: --since/--until filtering done at DB level via direct connection
     from .core.database import get_connection, init_db, migrate_schema, get_all_memories
     os.makedirs(MEMORY_DIR, exist_ok=True)
     if not os.path.exists(DB_PATH):
@@ -782,14 +786,13 @@ def cmd_stop(cfg: dict) -> None:
     if not os.path.exists(cp['BEHAVIOR_MD']):
         _write_behavior_md(cp['BEHAVIOR_MD'])
 
-    # Absolute path for global memory_context.md
+    # Absolute path for the global memory_context.md
     import_line = f"@{CONTEXT_FILE}"
     os.makedirs(cp['CLAUDE_DIR'], exist_ok=True)
 
     if os.path.exists(cp['CLAUDE_MD']):
         with open(cp['CLAUDE_MD'], 'r', encoding='utf-8') as f:
             content = f.read()
-        import re
         # spec §4: remove legacy N3MC_AUTO_START/END zones
         content = re.sub(
             r'<!-- N3MC_AUTO_START -->.*?<!-- N3MC_AUTO_END -->',
@@ -853,15 +856,11 @@ def cmd_hook_submit(cfg: dict) -> None:
     except Exception:
         data = {}
 
-    user_text   = _extract_text(data.get('message') or data.get('prompt') or '')
-    last_claude = data.get('last_assistant_message') or ''
-    # Claude Code's session ID, supplied by the hook payload. Empty string
-    # for older Claude Code builds — _do_buffer / search fall back gracefully.
+    user_text     = _extract_text(data.get('message') or data.get('prompt') or '')
+    last_claude   = data.get('last_assistant_message') or ''
     cc_session_id = data.get('session_id', '')
 
     ensure_server(cfg)
-
-    # Step 0 already written by n3mc_hook.py before this is called
 
     # Step 1: Repair unindexed records
     try:
@@ -872,15 +871,14 @@ def cmd_hook_submit(cfg: dict) -> None:
     # Step 2: Save Claude's previous response
     if last_claude.strip():
         from .core.processor import chunk_text, add_chunk_prefixes, purify_text
-        cleaned = purify_text(last_claude)
-        chunks  = chunk_text(cleaned)
+        cleaned  = purify_text(last_claude)
+        chunks   = chunk_text(cleaned)
         prev_tid = _read_turn_id(cc_session_id)
         for chunk in add_chunk_prefixes(chunks, 'claude'):
             _do_buffer(chunk, cfg, agent_name='claude-code',
                        session_id=cc_session_id or None, turn_id=prev_tid)
 
-    # Step 3: Search memory for current query — pass cc_session_id so
-    # same-session records get b_session=1.0 boost
+    # Step 3: Search memory for current query
     q = user_text[:cfg.get('search_query_max_chars', 2000)]
     _do_search_and_write(q, cfg, current_session=cc_session_id or None)
 
@@ -903,8 +901,8 @@ def cmd_save_claude_turn(cfg: dict) -> None:
     except Exception:
         data = {}
 
-    last_claude = data.get('last_assistant_message') or ''
-    cc_session_id = data.get('session_id', '')  # Claude Code's session ID
+    last_claude   = data.get('last_assistant_message') or ''
+    cc_session_id = data.get('session_id', '')
 
     if not last_claude.strip():
         return
@@ -1028,13 +1026,10 @@ def main() -> None:
     grp.add_argument('--run-server',       action='store_true', dest='run_server')
 
     parser.add_argument('--agent-id', dest='agent_id', default=None)
-    # spec §3.6: time range filters for --search and --list
     parser.add_argument('--since', default=None, help='Filter from date (YYYY-MM-DD or ISO)')
     parser.add_argument('--until', default=None, help='Filter until date (YYYY-MM-DD or ISO)')
-    # spec §3.6: --recall-thread context window
     parser.add_argument('--before', type=int, default=2, help='Turns before target (default 2)')
     parser.add_argument('--after',  type=int, default=2, help='Turns after target (default 2)')
-    # spec §3.6: output format
     parser.add_argument('--format', dest='fmt', default='tsv',
                         choices=['tsv', 'jsonl'], help='Output format for --list/--recall-thread')
 
@@ -1046,7 +1041,6 @@ def main() -> None:
 
     cfg = _load_config()
 
-    # Normalize since/until
     since = _normalize_timestamp(args.since) if args.since else None
     until = _normalize_timestamp(args.until, end_of_day=True) if args.until else None
 

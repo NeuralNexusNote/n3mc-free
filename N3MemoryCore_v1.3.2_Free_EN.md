@@ -284,7 +284,8 @@ On `--buffer` or API-based saves, complete INSERT and COMMIT at that instant.
 - Asynchronous writes (`asyncio`, thread queues, background tasks, etc.)
 - Transaction batching (combining multiple INSERTs into one transaction)
 
-**Reason**: Data is lost if the process is forcibly terminated immediately after saving. Durability takes priority over speed. This is not a performance choice but an immutable design constraint.
+> **Note: Background of immediate physical save**
+> Data is lost if the process is forcibly terminated immediately after saving. Durability takes priority over speed. This is not a performance choice but an immutable design constraint.
 
 ### Identifiers
 
@@ -391,7 +392,8 @@ Additionally, `migrate_schema()` detects if the existing `memories_fts` table wa
 
 `agent_name TEXT` — identifies the AI agent that wrote the record (e.g. `"claude-code"`). `NULL` for records written before v1.1 or without agent tagging.
 
-**Rationale for FTS5 Tokenizer Selection**: `porter unicode61` is adopted for English-optimized stemming. Porter stemming normalizes word forms (e.g., "running" → "run", "memories" → "memori"), giving significantly better BM25 precision for English text compared to `trigram` substring matching. Word-boundary tokenization (`unicode61`) is more meaningful than character-level trigrams for English.
+> **Note: Rationale for FTS5 Tokenizer Selection**
+> `porter unicode61` is adopted for English-optimized stemming. Porter stemming normalizes word forms (e.g., "running" → "run", "memories" → "memori"), giving significantly better BM25 precision for English text compared to `trigram` substring matching. Word-boundary tokenization (`unicode61`) is more meaningful than character-level trigrams for English.
 
 **FTS5 Constraint**: The FTS5 `porter unicode61` tokenizer splits on word boundaries and cannot meaningfully process single-character queries. For queries shorter than 2 characters, skip keyword search and rank using vector search (cos_sim) only. In English, single characters and very short tokens such as `"I"` fall into this category.
 
@@ -512,7 +514,8 @@ When `config.json` is empty or corrupted, `_load_config` follows this recovery p
 2. If `owner_id` or `local_id` is missing, **recover the most frequent value from existing DB records** (`SELECT owner_id FROM memories GROUP BY owner_id ORDER BY COUNT(*) DESC LIMIT 1`)
 3. Only generate a new UUID if the DB also has no records
 
-> **Design intent**: If `owner_id`/`local_id` are silently regenerated, bias calculations for all existing memories become incorrect. DB recovery prevents this silent failure.
+> **Note: Background of DB-based ID recovery**
+> If `owner_id`/`local_id` are silently regenerated, bias calculations for all existing memories become incorrect. DB recovery prevents this silent failure.
 
 ### DB Corruption Detection and Recovery
 
@@ -680,10 +683,12 @@ SETTINGS.parent.mkdir(parents=True, exist_ok=True)
 SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 ```
 
-- **Why match by script-name marker, not full command string**: the user may have moved the install root or upgraded Python; matching on script/module name keeps the algorithm idempotent across path edits without creating duplicates.
 - **Markers MUST cover both hyphen and underscore forms**: the resolved entry-point path is `n3mc-hook.EXE` (hyphen); the `python -m` fallback writes `n3memorycore.n3mc_hook` (underscore). Checking only one form fails to dedupe entries written in the other form, and each `n3mc --init` re-run leaks a fresh duplicate (real-world incidents observed up to 4 stacked entries).
 - **Do NOT use `git add`-style trust** (`if "hooks" not in settings: settings["hooks"] = {...}`): an empty `hooks: {}` key still passes that check and the user ends up with no hooks. Always inspect the inner arrays.
 - **Cross-platform path**: forward slashes only inside the `command` string, even on Windows. Always normalize `shutil.which()` results via `pathlib.Path(exe).as_posix()`. The bash shell Claude Code spawns interprets backslashes as escape sequences (`\n` → newline, `\t` → tab), so a raw `\Users\...` path silently corrupts during shell parsing.
+
+> **Note: Why match by script-name marker**
+> Why match by script-name marker, not full command string — the user may have moved the install root or upgraded Python; matching on script/module name keeps the algorithm idempotent across path edits without creating duplicates.
 
 ### ② Project Settings (`.claude/settings.json`) — Permission Registration
 
@@ -782,7 +787,8 @@ echo '{"session_id":"...","stop_hook_active":true,"last_assistant_message":"Clau
 
 Reads the same Stop-hook JSON from stdin, extracts `last_assistant_message`, applies `chunk_text(max_chars=400, overlap=40)`, and saves each chunk as a `[claude]` / `[claude i/N]` record via HTTP `/buffer` calls in a single process. The `turn_id` is read from `~/.n3mc/.memory/turn_id.txt` (set earlier by `--hook-submit` when it saved the user message); after the save loop the file is cleared. If the file is missing, a fresh UUID4 turn_id is generated. Called by the `n3mc-stop-hook` entry point (`n3memorycore/n3mc_stop_hook.py`) only; the AI does not invoke this manually.
 
-> **Why a dedicated subcommand and not `--buffer -`?** The Stop hook itself reads stdin to extract the JSON envelope; using `--buffer -` would either double-consume stdin or require N subprocess invocations (one per chunk). `--save-claude-turn` performs all chunked saves in a single process, in order, sharing one HTTP keep-alive to the resident server, and it is the canonical "buffer" call referenced in the per-turn subprocess count below.
+> **Note: Why a dedicated subcommand**
+> Why a dedicated subcommand and not `--buffer -`? The Stop hook itself reads stdin to extract the JSON envelope; using `--buffer -` would either double-consume stdin or require N subprocess invocations (one per chunk). `--save-claude-turn` performs all chunked saves in a single process, in order, sharing one HTTP keep-alive to the resident server, and it is the canonical "buffer" call referenced in the per-turn subprocess count below.
 
 ### Response Format
 
@@ -815,9 +821,13 @@ Reads the same Stop-hook JSON from stdin, extracts `last_assistant_message`, app
 
 ## 5. Operational Protocol (Fully Automatic Saving & Active RAG)
 
-> **Audience distinction**: The instructions below are classified as **[AI Behavioral Guidelines]** (instructions to Claude itself) and **[Implementation Specs]** (processing to be implemented as a program).
+> **Audience distinction**: The instructions below are classified as **[AI Behavioral Guidelines]** (instructions to Claude itself) and **[Implementation Specs]** (processing to be implemented as a program). This section is divided into the following four subsections:
+> - **5.1 Complete-Recording Contract** — the invariants of "what is always saved" (6 guarantees)
+> - **5.2 Hook Automation Flow** — the execution model and ordering of UserPromptSubmit / Stop
+> - **5.3 AI Behavioral Guidelines** — usage rules Claude itself must honor
+> - **5.4 Implementation Specification Details** — the remaining server / hook implementation requirements
 
-### Complete-Recording Contract
+### 5.1 Complete-Recording Contract
 
 N3MC is marketed as **complete preservation** (完全保存). The hook write path therefore honors these six guarantees:
 
@@ -828,20 +838,30 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 5. On HTTP POST failure to the embedding server, writes fall back to `_buffer_direct` (direct SQLite insert without an embedding; re-indexed by the next `--repair`). Silent drops are forbidden; every failure path either succeeds via fallback or emits to stderr.
 6. Image-only prompts still trigger repair + search + Claude-turn save + audit-log entry. Only Step 4 (user save) is skipped because there is no user text to record.
 
+### 5.2 Hook Automation Flow
+
+> The concrete execution model that realizes the "Complete-Recording Contract" above. The `audit.log` write always runs first as Step 0 (the last-resort guarantee for contract item 4).
+
 - **[Automated] Auto-repair, search, and conversation saving**: The `UserPromptSubmit` hook (`n3memorycore/n3mc_hook.py`, registered as `n3mc-hook`) calls `n3mc --hook-submit`, which performs the following steps in a single process. **Step 0 — audit log (always first)**: before anything else, every hook invocation appends one JSON record `{"ts", "hook", "raw", "payload"}` to the append-only `~/.n3mc/.memory/audit.log`. This is the last-resort authoritative transcript; it is written BEFORE anything can fail, so even if every later step errors out, the raw input is preserved. Then: `--repair` (fix unindexed data), `--buffer` (auto-save Claude's previous response with complete preservation — long content is chunked via `chunk_text(max_chars=400, overlap=40)` and saved as `[claude]` / `[claude i/N]` records), `--search` (retrieve memories), and `--buffer` (auto-save the user message with complete preservation — chunked and saved as `[user]` / `[user i/N]` records). **No length filter, no skip-pattern filter**: every non-empty input is recorded character-for-character with no truncation. When Claude Code passes an image+text prompt, the `prompt` field may be a JSON array; `_extract_text()` extracts only `type=="text"` parts. If the result is empty (image-only prompt), only Step 4 (user save) is skipped because there is no user text to record — repair, Claude-turn save, search, and the audit-log entry still run. The raw multimodal payload is captured in `audit.log`.
 - **[Implementation Spec] Hook subprocess execution method (must not be changed)**: Subprocess calls within `n3memorycore/n3mc_hook.py` and `n3memorycore/n3mc_stop_hook.py` must use **`subprocess.run` (synchronous/blocking)**, waiting for each command to complete before proceeding to the next. **Do not use `Popen` (async/fire-and-forget).** **Reason**: `--repair` → `--search` has an execution order dependency (search results are incomplete if repair hasn't finished). Additionally, if control returns to Claude before `--search` finishes writing to `memory_context.md`, the search results cannot be read. Asynchronizing for speed destroys data integrity and search accuracy. Note: only the FastAPI server startup (§3 Clean CLI) uses `Popen` (since it does not need to wait for startup to complete).
 - **[Automated] Auto-save of Claude's responses**: The `Stop` hook (`n3memorycore/n3mc_stop_hook.py`, registered as `n3mc-stop-hook`) first writes its Step 0 audit-log record (in-process), then invokes two synchronous subprocesses in order:
   1. `python -m n3memorycore.n3memory --save-claude-turn` (stdin = Stop-hook JSON) — chunked save of `last_assistant_message` with `[claude]` / `[claude i/N]` prefixes, sharing the existing turn_id for Q-A pairing. No length filter is applied; every non-empty response is recorded. **Do not use `--buffer -` here**: the Stop hook already consumed stdin to write the audit log.
-  2. `python -m n3memorycore.n3memory --stop` — idempotent `@import` setup in `<cwd>/.claude/CLAUDE.md` (see "`--stop` Hook Specification" above).
+  2. `python -m n3memorycore.n3memory --stop` — idempotent `@import` setup in `<cwd>/.claude/CLAUDE.md` (see §4 "`--stop` Hook Specification").
 
   Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (`--save-claude-turn` + `--stop`) = 3 calls.
 - **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records. Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired.
+### 5.3 AI Behavioral Guidelines
+
 - **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. **Every non-empty user message and every non-empty Claude response is recorded in FULL, character-for-character, with no truncation.** There is no length filter (the previous `len(text) >= 10` / `>= 3` thresholds are REMOVED) and no skip-pattern filter (the previous `_SKIP_PATTERNS` "ok / yes / thanks" routine-response filter is REMOVED). Short acknowledgements such as `ok` or `yes` are now recorded like any other input.
 - **[AI Behavioral Guidelines] Silence on successful save**: When a save succeeds, make no report or acknowledgment — maintain silence.
-- **[Implementation Specs] Fatal failure warning**: Only when a DB write fails, or the DB record count does not change after INSERT, display the following prominently:
-  > ⚠️ Physical save failed. Current memories may be lost.
 - **[AI Behavioral Guidelines] Active RAG**: When knowledge is insufficient, proactively execute `--search` to retrieve relevant memories. The command is auto-approved via `permissions.allow` — no confirmation needed.
 - **[AI Behavioral Guidelines] Recall acknowledgment**: When `--search` results **actually shape your reply** (you are recalling information saved in an earlier turn), open the reply with a short acknowledgment **in the user's language**, e.g. Japanese 「前回の回答がメモリに保存されています。」 or English "Pulling this from earlier memory in this session." **If no relevant memory was found, or if retrieved snippets did not influence your answer, do not announce anything.** Never announce the mere act of searching — only the act of recalling. This lets the user see the memory layer is alive each turn.
+- **[AI Behavioral Guidelines] Utilizing CLAUDE.md**: At the start of the next session, read `.claude/CLAUDE.md` and inherit the behavioral guidelines from the previous session. Memory context is loaded via `@import` from `memory_context.md` (see §4).
+
+### 5.4 Implementation Specification Details
+
+- **[Implementation Specs] Fatal failure warning**: Only when a DB write fails, or the DB record count does not change after INSERT, display the following prominently:
+  > ⚠️ Physical save failed. Current memories may be lost.
 - **[Implementation Spec] Context injection (both stdout and file are required)**: `--search` results must be **printed to stdout via `print()`** and simultaneously **written to file** `~/.n3mc/.memory/memory_context.md`. **Both must be performed.** Without stdout output, Claude cannot see the search results and will respond "I don't have that memory" even when the data exists in the DB. File write alone does not deliver results to Claude.
 - **[Implementation Spec] Memory-context freshness on every invocation (no stale context)**: `cmd_search` MUST overwrite `memory_context.md` and print to stdout on **every** invocation, regardless of outcome. Failure paths emit a degraded-state placeholder so Claude does not silently consume last turn's results as if they were current:
   - **Empty query** (image-only prompt, or `--search ""`) → write `# Recalled Memory Context\n\n_No relevant memories found._\n` and print it to stdout. Empty does not mean "skip the write" — the write IS the signal that no relevant memory exists for this turn.
@@ -849,8 +869,8 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   - **Successful results** → write the rendered markdown (Previous matching exchange(s) + Other memories) to both channels.
 
   Stale `memory_context.md` from a prior turn becoming the new session's `@import`-resolved context is treated as a **correctness bug**, not a performance trade-off. The fresh write is mandatory on every `cmd_search` invocation, including via `--hook-submit` for image-only prompts (spec §5 "Image-only prompts still trigger ... search").
-- **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
 - **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | n3mc --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3memorycore/n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id ID` argument to tag the record with the agent identifier (e.g., `n3mc --buffer "text" --agent-id "claude-code"`).
+- **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
 - **[Customization] Language localization**: Not applicable. Skip patterns (`_SKIP_PATTERNS`) have been REMOVED in favor of the complete-recording contract; there is nothing language-specific to localize in the hook filter layer.
 - **[Implementation Specs] Deduplication & HTTP-failure fallback**:
   - While server is running: Skip saving if cos_sim ≥ `dedup_threshold` (0.95) or exact string match.
@@ -861,7 +881,6 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Implementation Specs] delete_memory transactional**: `delete_memory` calls `_load_vec_extension(conn)` first, then wraps all three DELETEs (memories_fts, memories_vec, memories) in a try/except with `conn.rollback()` on failure. All three indexes succeed or all roll back together.
 - **[Implementation Specs] lifespan startup**: Use FastAPI's `@asynccontextmanager` lifespan pattern (`async def lifespan(app: FastAPI)` with `yield`, passed to `FastAPI(lifespan=lifespan)`) instead of the deprecated `@app.on_event("startup")`.
 - **[Implementation Specs] Vector model marker**: On every `--repair` call, the server writes the currently-active embedding model name into `~/.n3mc/.memory/vec_model.txt` (creating it on first run). If the file exists with a name that differs from `cfg['embed_model']`, the server prints a warning to stderr — the on-disk vectors were generated by a different model than the one currently configured, so similarity search will be degraded until the vectors are regenerated. The reference implementation does NOT auto-trigger re-embedding (the operation can take many minutes on a large DB); the user is responsible for the manual upgrade procedure documented in §3 "Switching to a language-specialised model".
-- **[AI Behavioral Guidelines] Utilizing CLAUDE.md**: At the start of the next session, read `.claude/CLAUDE.md` and inherit the behavioral guidelines from the previous session. Memory context is loaded via `@import` from `memory_context.md` (see §4).
 
 ### Q-A Pairing Contract
 Every [user] and [claude i/N] row recorded for the same conversational turn shares a `turn_id` (UUID4). This lets N3MemoryCore reassemble the full previous exchange when a similar question returns later, instead of surfacing only isolated chunks.
@@ -873,8 +892,10 @@ Every [user] and [claude i/N] row recorded for the same conversational turn shar
 
    **Critical implementation rule**: `hybrid_search` returns `{"results", "pairs"}`, but **`results` MUST NOT exclude records that also belong to a pair**. `results` contains all score-ranked hits in full (pair members are kept). `pairs` is a separate supplementary list of siblings grouped by turn_id. Overlap is allowed because the renderer places `## Top matches` first and `## Previous matching Q-A exchanges` second, so Claude reads the highest-confidence answer first regardless of overlap.
 5. **Rendering (v1.2.0+)**: `memory_context.md` puts a **`## Top matches (use these to answer the question)` block FIRST** (v1.2.0+ renderer; carried forward unchanged in v1.3.0). Top matches contain all high-scoring records in score order, **including records that also belong to a Q-A pair** (do NOT suppress them from the result list). Q-A pairs follow as a **`## Previous matching Q-A exchanges (supplementary context)`** block placed AFTER Top matches. Overlap between sections is allowed: a record may appear in both Top matches and a Q-A pair — harmless because Claude reads Top matches first.
-   **Important background**: Earlier spec drafts had the reverse ordering (Q-A pairs at top, pair members suppressed from results). This caused a critical failure mode in databases dominated by recurring conversation themes (e.g., a user who regularly discusses project management): the chunks of one popular turn_id would occupy the top of the score ranking, and pair extraction would yank them out of `results`, leaving `## Top matches` empty of useful data. Claude, encountering 5KB of unrelated conversation history at the top of memory_context.md, would conclude "the answer isn't here" and fall back to MCP / training, falsely reporting "I don't have that information" even though the actual data record existed in the Pro DB. The new ordering eliminates this failure mode.
 6. **Schema**: `memories.turn_id TEXT` with index `idx_memories_turn_id`. `insert_memory(..., turn_id=None)` is the keyword-only parameter. `get_memories_by_turn_id(conn, turn_id)` is the helper used by retrieval.
+
+> **Note: Background of the rendering order**
+> Earlier spec drafts had the reverse ordering (Q-A pairs at top, pair members suppressed from results). This caused a critical failure mode in databases dominated by recurring conversation themes (e.g., a user who regularly discusses project management): the chunks of one popular turn_id would occupy the top of the score ranking, and pair extraction would yank them out of `results`, leaving `## Top matches` empty of useful data. Claude, encountering 5KB of unrelated conversation history at the top of memory_context.md, would conclude "the answer isn't here" and fall back to MCP / training, falsely reporting "I don't have that information" even though the actual data record existed in the Pro DB. The new ordering eliminates this failure mode.
 
 ### embed_query Failure Warning
 

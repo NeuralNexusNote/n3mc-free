@@ -3,12 +3,11 @@
 All persistent data lives under a single home directory, resolved at
 import time from (in priority order):
 
-1. `$N3MC_HOME` environment variable
-2. `~/.n3mc/`  (default)
+1. $N3MC_HOME environment variable
+2. ~/.n3mc/  (default)
 
-Per-project Claude Code config (`.claude/CLAUDE.md`, `.claude/rules/`) is
-resolved against the current working directory at use time, since it is
-project-scoped, not user-scoped.
+Per-project Claude Code config (.claude/CLAUDE.md, .claude/rules/) is
+resolved against the current working directory at use time.
 """
 import os
 
@@ -31,7 +30,7 @@ CONFIG_FILE  = os.path.join(HOME_DIR,   'config.json')
 
 
 def claude_paths(cwd: str = None) -> dict:
-    """Resolve per-project Claude Code config paths against `cwd`."""
+    """Resolve per-project Claude Code config paths against cwd."""
     cwd = cwd or os.getcwd()
     claude_dir = os.path.join(cwd, '.claude')
     return {

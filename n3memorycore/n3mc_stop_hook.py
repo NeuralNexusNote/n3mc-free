@@ -1,5 +1,6 @@
 import sys
 
+# spec §3: reconfigure streams to UTF-8 at module top — before any stdin read
 for _s_name in ("stdin", "stdout", "stderr"):
     _s = getattr(sys, _s_name, None)
     if _s is not None and hasattr(_s, 'reconfigure'):
@@ -20,9 +21,9 @@ def _write_audit(hook: str, raw: str, payload: dict) -> None:
     from .core.processor import sanitize_surrogates
     os.makedirs(MEMORY_DIR, exist_ok=True)
     record = json.dumps({
-        'ts': datetime.now(timezone.utc).isoformat(),
-        'hook': hook,
-        'raw': sanitize_surrogates(raw[:4096]),
+        'ts':      datetime.now(timezone.utc).isoformat(),
+        'hook':    hook,
+        'raw':     sanitize_surrogates(raw[:4096]),
         'payload': sanitize_surrogates(payload),
     }, ensure_ascii=False)
     try:
@@ -40,8 +41,11 @@ def main():
     except Exception:
         payload = {'raw': raw}
 
+    # spec §5: Step 0 — audit log written before any other processing
     _write_audit('Stop', raw, payload)
 
+    # spec §5: --save-claude-turn first, then --stop (both synchronous)
+    # Do NOT use --buffer -: Stop hook already consumed stdin above.
     proc = subprocess.run(
         [sys.executable, '-m', 'n3memorycore.n3memory', '--save-claude-turn'],
         input=raw,

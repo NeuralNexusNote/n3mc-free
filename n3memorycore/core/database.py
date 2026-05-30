@@ -7,7 +7,6 @@ from typing import Optional, List
 logger = logging.getLogger(__name__)
 
 # spec §3: trigram tokenizer for Japanese substring matching
-# Punctuation is stripped (not replaced with space) before FTS indexing.
 _FTS_PUNCT_RE = re.compile(
     r'[「」『』【】（）()\[\]{}<>〈〉《》・、。,.!！?？;；:：\-―─…\'\"“”‘’]'
 )
@@ -29,6 +28,7 @@ def deserialize_vector(data: bytes) -> list:
 
 
 def _load_vec_extension(conn: sqlite3.Connection) -> None:
+    # spec §5: idempotent — duplicate load is a no-op
     try:
         conn.enable_load_extension(True)
         try:
@@ -62,8 +62,10 @@ def get_connection(db_path: str) -> sqlite3.Connection:
             f"Failed to load sqlite-vec extension: {e}. "
             "Recovery: pip install sqlite-vec"
         ) from e
+    # spec §3: SQLite durability settings
     conn.execute("PRAGMA synchronous = FULL")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA wal_autocheckpoint = 1000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -81,7 +83,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             turn_id    TEXT
         )
     """)
-    # spec §3: standalone FTS5 with trigram tokenizer for Japanese support
+    # spec §3: standalone FTS5 with trigram tokenizer
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             content,
@@ -125,17 +127,14 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)")
         conn.commit()
 
-    # spec §3: migrate FTS tokenizer FROM porter unicode61 TO trigram
+    # spec §3: migrate FTS tokenizer from porter unicode61 to trigram
     cursor = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
     )
     row = cursor.fetchone()
     if row and row[0]:
         sql_lower = row[0].lower()
-        # If already trigram, nothing to do
         if 'trigram' not in sql_lower:
-            # Old table used porter unicode61; re-create with trigram
-            # Fetch all existing FTS rowids so we can re-insert
             existing_fts = conn.execute(
                 "SELECT rowid, content FROM memories_fts"
             ).fetchall()
@@ -175,6 +174,7 @@ def insert_memory(
         (id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id),
     )
     rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    # spec §3: FTS stores punctuation-stripped text; memories stores original
     stripped = strip_fts_punctuation(content)
     conn.execute(
         "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)", (rowid, stripped)
@@ -206,50 +206,6 @@ def search_vector(
         return cursor.fetchall()
     except Exception as e:
         logger.warning(f"Vector search failed: {e}")
-        return []
-
-
-def search_fts(
-    conn: sqlite3.Connection,
-    query: str,
-    limit: int = 50,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> List[sqlite3.Row]:
-    # spec §3: trigram requires at least 3 UTF-8 bytes
-    stripped = strip_fts_punctuation(query)
-    if len(stripped.encode('utf-8')) < 3:
-        return []
-
-    # spec §3: trigram does not need double-quote wrapping
-    fts_query = stripped[:_FTS_MAX_TERMS * 20]
-
-    time_clauses = []
-    params: list = [fts_query]
-    if since:
-        time_clauses.append("m.timestamp >= ?")
-        params.append(since)
-    if until:
-        time_clauses.append("m.timestamp <= ?")
-        params.append(until)
-    time_sql = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
-    params.append(limit)
-
-    try:
-        cursor = conn.execute(
-            f"""SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
-                      m.agent_name, m.session_id, m.turn_id,
-                      bm25(memories_fts) AS bm25_score, m.rowid
-               FROM memories_fts
-               JOIN memories m ON memories_fts.rowid = m.rowid
-               WHERE memories_fts MATCH ?{time_sql}
-               ORDER BY bm25_score
-               LIMIT ?""",
-            params,
-        )
-        return cursor.fetchall()
-    except Exception as e:
-        logger.warning(f"FTS search failed: {e}")
         return []
 
 
@@ -288,6 +244,50 @@ def search_vector_with_filter(
         return []
 
 
+def search_fts(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 50,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    # spec §3: trigram requires ≥3 UTF-8 bytes
+    stripped = strip_fts_punctuation(query)
+    if len(stripped.encode('utf-8')) < 3:
+        return []
+
+    # spec §3: character-based limit for trigram (no word splitting)
+    fts_query = stripped[:_FTS_MAX_TERMS * 20]
+
+    time_clauses = []
+    params: list = [fts_query]
+    if since:
+        time_clauses.append("m.timestamp >= ?")
+        params.append(since)
+    if until:
+        time_clauses.append("m.timestamp <= ?")
+        params.append(until)
+    time_sql = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
+    params.append(limit)
+
+    try:
+        cursor = conn.execute(
+            f"""SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
+                      m.agent_name, m.session_id, m.turn_id,
+                      bm25(memories_fts) AS bm25_score, m.rowid
+               FROM memories_fts
+               JOIN memories m ON memories_fts.rowid = m.rowid
+               WHERE memories_fts MATCH ?{time_sql}
+               ORDER BY bm25_score
+               LIMIT ?""",
+            params,
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logger.warning(f"FTS search failed: {e}")
+        return []
+
+
 def get_all_memories(
     conn: sqlite3.Connection,
     since: Optional[str] = None,
@@ -313,7 +313,7 @@ def get_all_memories(
 
 
 def delete_memory(conn: sqlite3.Connection, memory_id: str) -> bool:
-    # spec §5: load vec extension, then 3 DELETEs in try/except with rollback
+    # spec §5: load vec extension first, then transactional 3-table DELETE
     _load_vec_extension(conn)
     row = conn.execute(
         "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
@@ -346,6 +346,9 @@ def check_exact_duplicate(conn: sqlite3.Connection, content: str) -> bool:
 def find_unindexed_memories(
     conn: sqlite3.Connection, limit: int = 200, offset: int = 0
 ) -> List[sqlite3.Row]:
+    # spec §3.5: OFFSET should always be 0 in repair loops — repaired records
+    # disappear from this result set automatically, so incrementing OFFSET
+    # skips remaining unrepaired records.
     cursor = conn.execute(
         """SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
                   m.agent_name, m.session_id, m.turn_id, m.rowid,
@@ -383,11 +386,7 @@ def get_thread_context(
     before: int = 2,
     after: int = 2,
 ) -> List[sqlite3.Row]:
-    """Return records for turn_id plus N surrounding turns (before/after).
-
-    Uses idx_memories_turn_id. Returns rows ordered by rowid (chronological).
-    """
-    # Find rowid range for the target turn
+    """Return records for turn_id plus N surrounding turns (before/after)."""
     target_rows = conn.execute(
         "SELECT MIN(rowid) AS min_r, MAX(rowid) AS max_r FROM memories WHERE turn_id = ?",
         (turn_id,),
@@ -398,7 +397,6 @@ def get_thread_context(
     min_r = target_rows['min_r']
     max_r = target_rows['max_r']
 
-    # Distinct turn_ids that appear strictly before min_r, ordered DESC by their last rowid
     before_turns_rows = conn.execute(
         """SELECT DISTINCT turn_id FROM memories
            WHERE rowid < ? AND turn_id IS NOT NULL AND turn_id != ?
@@ -409,7 +407,6 @@ def get_thread_context(
     ).fetchall()
     before_turn_ids = [r[0] for r in before_turns_rows]
 
-    # Distinct turn_ids that appear strictly after max_r, ordered ASC by their first rowid
     after_turns_rows = conn.execute(
         """SELECT DISTINCT turn_id FROM memories
            WHERE rowid > ? AND turn_id IS NOT NULL AND turn_id != ?
