@@ -910,7 +910,7 @@ When a long Claude turn is split into many chunks, hybrid search can fill the en
 ## 6. Autonomous Evaluation ([N3MC v1.3.2 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
-> **Definition of "implementation complete"**: Run `n3mc --init` → autonomously execute tests 1–10 below → report ⭐⭐⭐⭐⭐. All three steps must finish before the implementation is considered done.
+> **Definition of "implementation complete"**: Run `n3mc --init` → autonomously execute tests 1–7 below → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
 
