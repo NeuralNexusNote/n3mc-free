@@ -1003,7 +1003,7 @@ def cmd_init() -> None:
     print(f"Hooks registered in: {settings_path}")
     print(f"  UserPromptSubmit -> {hook_cmd}")
     print(f"  Stop             -> {stop_cmd}")
-    print("Done. Restart Claude Code for hooks to take effect.")
+    print("Done. Claude Code を再起動すると、次のセッションから会話が自動保存されます。")
 
 
 # ---------------------------------------------------------------------------
