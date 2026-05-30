@@ -910,6 +910,8 @@ When a long Claude turn is split into many chunks, hybrid search can fill the en
 ## 6. Autonomous Evaluation ([N3MC v1.3.2 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
+> **Definition of "implementation complete"**: Run `n3mc --init` → autonomously execute tests 1–10 below → report ⭐⭐⭐⭐⭐. All three steps must finish before the implementation is considered done.
+
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
 
 2. **Force-termination Test (Proof of Durability)**: Save one record via `--buffer`, immediately force-terminate the process (Ctrl+C), then physically prove that the record remains in the DB after restart by running `--list`. The output format for `--list` is as follows (one record per line, tab-separated, exactly four columns):
