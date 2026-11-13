@@ -11,11 +11,32 @@ _FTS_PUNCT_RE = re.compile(
     r'[「」『』【】（）()\[\]{}<>〈〉《》・、。,.!！?？;；:：\-―─…\'\"“”‘’]'
 )
 _FTS_MAX_TERMS = 30
+_FTS_CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')
 
 
 def strip_fts_punctuation(text: str) -> str:
     cleaned = _FTS_PUNCT_RE.sub('', text)
     return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def _build_fts_query(query: str) -> str:
+    """spec §3 (v1.4.0): build a safe FTS5 MATCH string.
+
+    Punctuation strip → control chars to space → char limit → skip if < 3
+    bytes → quote every whitespace-separated term as an FTS5 string so ASCII
+    symbols left after the strip (\\ / # = @ * $ % ...) and bare AND/OR/NOT/NEAR
+    are matched literally instead of raising "fts5: syntax error".
+    Returns "" when the keyword search should be skipped.
+    """
+    stripped = strip_fts_punctuation(_FTS_CTRL_RE.sub(' ', query or ''))
+    fts_query = stripped[:_FTS_MAX_TERMS * 20]  # trigram: limit by characters
+    if len(fts_query.encode('utf-8')) < 3:
+        return ''                                 # → skip keyword search
+    return ' '.join('"' + t.replace('"', '""') + '"' for t in fts_query.split())
+
+
+# Public alias (pre-v1.4.0 draft name).
+build_fts_query = _build_fts_query
 
 
 def serialize_vector(vec: list) -> bytes:
@@ -209,39 +230,108 @@ def search_vector(
         return []
 
 
+_MEMORY_COLS = ("m.id, m.content, m.timestamp, m.owner_id, m.local_id, "
+                "m.agent_name, m.session_id, m.turn_id")
+
+
+def _time_filter(since: Optional[str], until: Optional[str]):
+    clauses, params = [], []
+    if since:
+        clauses.append("timestamp >= ?")
+        params.append(since)
+    if until:
+        clauses.append("timestamp <= ?")
+        params.append(until)
+    return " AND ".join(clauses), params
+
+
+def _rows_with_distance(conn, dist_rows) -> List[dict]:
+    """Join (rowid, distance) pairs back to memories, keeping distance order."""
+    if not dist_rows:
+        return []
+    rowids = [r[0] for r in dist_rows]
+    placeholders = ','.join('?' * len(rowids))
+    rows = conn.execute(
+        f"SELECT {_MEMORY_COLS}, m.rowid AS rowid FROM memories m "
+        f"WHERE m.rowid IN ({placeholders})",
+        rowids,
+    ).fetchall()
+    by_rowid = {r['rowid']: r for r in rows}
+    out = []
+    for rowid, dist in dist_rows:
+        r = by_rowid.get(rowid)
+        if r is None:
+            continue
+        d = dict(r)
+        d['distance'] = dist
+        out.append(d)
+    return out
+
+
+def _search_vector_exact(
+    conn: sqlite3.Connection,
+    embedding: list,
+    k: int = 50,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> List[dict]:
+    """spec §3 (v1.4.0) fallback when KNN with `rowid IN (subquery)` raises
+    OperationalError (older sqlite-vec): compute vec_distance_l2 for every
+    filtered row and sort by distance."""
+    where, tparams = _time_filter(since, until)
+    sub = f"SELECT rowid FROM memories WHERE {where}" if where else "SELECT rowid FROM memories"
+    dist_rows = conn.execute(
+        f"""SELECT mv.rowid, vec_distance_l2(mv.embedding, ?) AS distance
+            FROM memories_vec mv
+            WHERE mv.rowid IN ({sub})
+            ORDER BY distance
+            LIMIT ?""",
+        [serialize_vector(embedding)] + tparams + [k],
+    ).fetchall()
+    return _rows_with_distance(conn, [(r[0], r[1]) for r in dist_rows])
+
+
 def search_vector_with_filter(
     conn: sqlite3.Connection,
     embedding: list,
     k: int = 50,
     since: Optional[str] = None,
     until: Optional[str] = None,
-) -> List[sqlite3.Row]:
-    vec_bytes = serialize_vector(embedding)
-    time_clauses = []
-    params: list = [vec_bytes, k]
-    if since:
-        time_clauses.append("m.timestamp >= ?")
-        params.append(since)
-    if until:
-        time_clauses.append("m.timestamp <= ?")
-        params.append(until)
-    time_sql = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
+) -> List[dict]:
+    """spec §3 (v1.4.0): KNN restricted to the filtered rowids.
 
+    vec0 picks the global top-k first, so filtering afterwards drops almost
+    every in-range record. Two stages: memories_vec (rowid IN subquery) →
+    memories. Falls back to exact vec_distance_l2 on OperationalError.
+    """
+    where, tparams = _time_filter(since, until)
+    if not where:
+        return [dict(r) for r in search_vector(conn, embedding, k=k)]
+    vec_bytes = serialize_vector(embedding)
     try:
-        cursor = conn.execute(
-            f"""SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
-                      m.agent_name, m.session_id, m.turn_id, mv.distance, m.rowid
-               FROM memories_vec mv
-               JOIN memories m ON mv.rowid = m.rowid
-               WHERE mv.embedding MATCH ?
-                 AND k = ?{time_sql}
-               ORDER BY mv.distance""",
-            params,
-        )
-        return cursor.fetchall()
-    except Exception as e:
-        logger.warning(f"Vector search (filtered) failed: {e}")
-        return []
+        dist_rows = conn.execute(
+            f"""SELECT rowid, distance FROM memories_vec
+                WHERE embedding MATCH ? AND k = ?
+                  AND rowid IN (SELECT rowid FROM memories WHERE {where})""",
+            [vec_bytes, k] + tparams,
+        ).fetchall()
+        return _rows_with_distance(conn, [(r[0], r[1]) for r in dist_rows])
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Filtered KNN unavailable ({e}); using exact search")
+        try:
+            return _search_vector_exact(conn, embedding, k=k, since=since, until=until)
+        except Exception as e2:
+            logger.warning(f"Vector search (filtered) failed: {e2}")
+            return []
+
+
+def get_vector(conn: sqlite3.Connection, rowid: int) -> Optional[list]:
+    row = conn.execute(
+        "SELECT embedding FROM memories_vec WHERE rowid = ?", (rowid,)
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return deserialize_vector(row[0])
 
 
 def search_fts(
@@ -251,13 +341,10 @@ def search_fts(
     since: Optional[str] = None,
     until: Optional[str] = None,
 ) -> List[sqlite3.Row]:
-    # spec §3: trigram requires ≥3 UTF-8 bytes
-    stripped = strip_fts_punctuation(query)
-    if len(stripped.encode('utf-8')) < 3:
+    # spec §3 (v1.4.0): strip → ctrl chars → limit → ≥3 bytes → quote terms
+    fts_query = _build_fts_query(query)
+    if not fts_query:
         return []
-
-    # spec §3: character-based limit for trigram (no word splitting)
-    fts_query = stripped[:_FTS_MAX_TERMS * 20]
 
     time_clauses = []
     params: list = [fts_query]
@@ -336,10 +423,24 @@ def count_memories(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
 
 
-def check_exact_duplicate(conn: sqlite3.Connection, content: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM memories WHERE content = ? LIMIT 1", (content,)
-    ).fetchone()
+def check_exact_duplicate(
+    conn: sqlite3.Connection, content: str, turn_id: Optional[str] = None
+) -> bool:
+    """spec §5.4 (v1.4.0): exact-text duplicate only.
+
+    With turn_id: compare within the same turn only (a re-made setting whose
+    unchanged chunks equal the old version's must still be saved).
+    Without turn_id (manual --buffer): compare globally.
+    """
+    if turn_id:
+        row = conn.execute(
+            "SELECT 1 FROM memories WHERE content = ? AND turn_id = ? LIMIT 1",
+            (content, turn_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM memories WHERE content = ? LIMIT 1", (content,)
+        ).fetchone()
     return row is not None
 
 

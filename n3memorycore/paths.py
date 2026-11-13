@@ -24,7 +24,11 @@ MEMORY_DIR   = os.path.join(HOME_DIR,   '.memory')
 DB_PATH      = os.path.join(MEMORY_DIR, 'n3memory.db')
 PID_FILE     = os.path.join(MEMORY_DIR, 'n3mc.pid')
 TURN_ID_FILE = os.path.join(MEMORY_DIR, 'turn_id.txt')
+# v1.4.0: memory_context.md is no longer written. The constant is kept only so
+# that --stop can delete a leftover file from v1.3.x (spec §4).
 CONTEXT_FILE = os.path.join(MEMORY_DIR, 'memory_context.md')
+CONTEXT_RETIRED_MARKER = os.path.join(MEMORY_DIR, '.memory_context_retired')
+NOTICES_FILE = os.path.join(MEMORY_DIR, 'notices.json')
 AUDIT_LOG    = os.path.join(MEMORY_DIR, 'audit.log')
 CONFIG_FILE  = os.path.join(HOME_DIR,   'config.json')
 

@@ -86,8 +86,8 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 
 | File | Description |
 |---|---|
-| `N3MemoryCore_v1.3.2_Free_JP.md` | Free edition (Japanese) |
-| `N3MemoryCore_v1.3.2_Free_EN.md` | Free edition (English) |
+| `N3MemoryCore_v1.4.0_Free_JP.md` | Free edition (Japanese) |
+| `N3MemoryCore_v1.4.0_Free_EN.md` | Free edition (English) |
 
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
@@ -197,6 +197,24 @@ Once setup is complete, everything works automatically from the next session:
 - Claude responds with full context ("Regarding what we discussed last time...")
 - Saving and searching happen in the background — no action needed on your part
 
+### Tuning recall (vector_min_cos)
+
+N3MC finds records whose meaning is close to your question with vector search.
+`vector_min_cos` is the threshold for "how close is close enough to be a
+candidate" (default 0.85).
+
+| If you | What happens |
+|---|---|
+| lower it (e.g. 0.80–0.83) | Records are found even when the wording differs, and short questions recall more. Less related records also come in, and the injected context gets longer |
+| raise it (e.g. 0.88) | Fewer loosely related records and shorter injected context. Related records are also dropped more easily |
+
+A sensible range is 0.80–0.88. Set it in `~/.n3mc/config.json`, e.g.
+`"vector_min_cos": 0.83`. It takes effect from the next question (the server
+restarts automatically). If the file has a typo and cannot be read, it is left
+untouched and N3MC runs with defaults until you fix it; a notice about this
+appears at the top of the recalled context once a day. Write numbers without
+quotes.
+
 ### Backup and restore
 
 To migrate memories to another environment or keep a safe backup, save these 2 files
@@ -253,6 +271,7 @@ N3MemoryCore is built from a specification, so extending it is as simple as aski
 - **PostgreSQL migration** — Move from SQLite to PostgreSQL + pgvector for team-scale deployments
 - **Custom search logic** — Tune bias coefficients and ranking formulas
 - **Alternative embedding models** — Swap in a different model to suit your use case
+- **Keyword-search tokenizer** — The default FTS5 `trigram` tokenizer was chosen because it works both for languages written without spaces (Japanese, Chinese, …) and for languages like English (the PyPI package is used in every country). Adapt the final tokenizer to your own language and environment (e.g. `porter unicode61` to fold English word forms, or a morphological analyzer for higher Japanese precision). Claude Code can do it for you, including rebuilding the existing DB's FTS index
 - **Custom ID fields** — Add fields like `project_id` or `tag` to organize memories your way
 - **PDF import** — Extract text from PDF files and store them as searchable memories
 - **Hashtag support** — Claude auto-tags memories with `#hashtags` for filtered search (e.g. `--search "#AWS"`) — works with existing FTS, no DB changes needed

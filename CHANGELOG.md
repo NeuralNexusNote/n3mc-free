@@ -4,6 +4,63 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-14
+
+Spec files renamed `v1.3.2 → v1.4.0`. Fixes found while running the Pro
+edition, applied to Free through the specification. No schema changes;
+existing user DBs keep working without regeneration.
+
+### Fixed
+- **Search returned HTTP 500 for prompts with symbols**: ASCII symbols left
+  after punctuation stripping (`\ / # = @ * $ %` …) and bare `AND/OR/NOT`
+  reached FTS5 `MATCH` and raised `fts5: syntax error`, so the recalled
+  context became "memory search unavailable" (about 12% of prompts in the
+  Pro measurement). Every term is now quoted as an FTS5 string, control
+  characters become spaces, and an FTS failure no longer fails the search.
+- **Records were dropped by similarity dedup**: `/buffer` skipped a new
+  record when an existing one had cos_sim ≥ 0.95. Chunks of long, uniformly
+  shaped replies and re-made settings hit that threshold, so parts of a
+  conversation were never stored. Only exact-text duplicates are skipped
+  now, and only within the same `turn_id` (globally for manual `--buffer`).
+- **`--since` / `--until` vector search lost in-range records**: the KNN
+  picked the global top-k before filtering. The filtered rowids are now
+  searched directly (`rowid IN` KNN, exact `vec_distance_l2` fallback).
+- **Overwriting a mistyped `config.json`**: an unreadable file was replaced
+  with defaults, losing user settings. The file is now left untouched;
+  wrongly typed items are ignored individually, with a notice.
+- **Stop cleared `turn_id`**: a second Stop in the same prompt started a new
+  exchange. The file is kept; the same-turn exact check prevents doubles.
+
+### Changed
+- **`memory_context.md` retired**: search results go to stdout only (the
+  hook output is what reaches Claude). `--stop` no longer adds an `@import`
+  to `.claude/CLAUDE.md`; it removes the old one (with a backup, keeping
+  LF/CRLF) and deletes the leftover file once.
+- **Shorter, more relevant recalled context**: vector candidates below
+  `vector_min_cos` (0.85) are dropped, results below 0.6 × the top score are
+  cut, identical contents are collapsed, and Q-A exchanges are limited to
+  the top `pair_top_n` (3) turns and `pair_max_chars` (3,000) characters,
+  with an "omitted" line pointing to the new `--show-turn` command.
+- **Newest version first**: exchanges whose first answer chunk is ≥ 0.98
+  similar are treated as versions of the same content and re-ordered
+  newest first. Every entry shows `saved=` in local time.
+- **Server identity and replacement**: `/health` returns `root`,
+  `code_version` (code + `config.json` content) and `pid`. A server of this
+  folder with old code or old settings is replaced automatically (new
+  `/shutdown`; psutil only for v1.3.x servers). A server of another folder
+  on the same port is never stopped or written to: saves go straight to
+  this folder's DB and search is skipped, with a notice.
+- **Notices**: problems that need a human (port conflict, unreadable
+  config, hand-edited rules file, stale server) are shown at the top of the
+  recalled context once a day and logged in `audit.log`.
+- **Rules file versioning**: `.claude/rules/n3mc-behavior.md` carries a
+  version marker and is updated only when it matches a known template.
+- `<task-notification>` prompts are neither searched nor saved.
+- `bind_host` (default `127.0.0.1`) with a startup warning for other values.
+
+### Removed
+- `dedup_threshold` and `context_char_limit` config keys (ignored if present).
+
 ## [1.3.4] - 2026-05-30
 
 Patch release aligning the server with the v1.3.2 spec. No API changes,

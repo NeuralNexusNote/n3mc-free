@@ -6,6 +6,8 @@
       "Bash(python -m n3memorycore.n3memory --list*)",
       "Bash(python -m n3memorycore.n3memory --repair*)",
       "Bash(python -m n3memorycore.n3memory --stop*)",
+      "Bash(python -m n3memorycore.n3memory --show-turn *)",
+      "Bash(python -m n3memorycore.n3memory --recall-thread *)",
       "Bash(n3mc --search *)",
       "Bash(n3mc --buffer *)",
       "Bash(n3mc --list*)",

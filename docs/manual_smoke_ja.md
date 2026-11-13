@@ -40,8 +40,9 @@ python scripts/smoke_ja.py --quick
 
 自動スモークの後、以下 1 点だけ目視確認します:
 
-5. **`.memory/memory_context.md` を開き、直近数ターンの `[claude ...]` 行に
-   mojibake (`縺`, `繧`, `菫`, `繝` 等) や `\udcXX` が含まれていない**こと。
+5. **`python -m n3memorycore.n3memory --search "<直近の話題>"` の出力（stdout）で、
+   直近数ターンの `[claude ...]` 行に mojibake (`縺`, `繧`, `菫`, `繝` 等) や
+   `\udcXX` が含まれていない**こと。（v1.4.0 から `memory_context.md` は作られない）
 
 `[recovered]` プレフィックス付きの古い行は過去の破損データを部分復元したもの
 なので、残っていて正常です。新しく追加される行には `[recovered]` は付きません。

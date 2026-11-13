@@ -24,7 +24,6 @@ def client(tmp_path_factory):
         'owner_id':               str(uuid.uuid4()),
         'local_id':               str(uuid.uuid4()),
         'server_port':            18521,
-        'dedup_threshold':        0.95,
         'half_life_days':         90,
         'bm25_min_threshold':     0.1,
         'search_result_limit':    20,
@@ -47,11 +46,19 @@ def client(tmp_path_factory):
     get_model(cfg.get('embed_model'))
 
     tc = TestClient(n3memory.app, raise_server_exceptions=True)
+    tc.n3mc_db_path = db_path
     yield tc
 
     n3memory.DB_PATH      = original_db
     n3memory._srv_cfg     = original_cfg
     n3memory._srv_session = original_sess
+
+
+@pytest.fixture(autouse=True)
+def _use_module_db(client, monkeypatch):
+    """conftest isolates paths per test; point the app back at this module's DB."""
+    from n3memorycore import n3memory
+    monkeypatch.setattr(n3memory, 'DB_PATH', client.n3mc_db_path)
 
 
 # ---------------------------------------------------------------------------

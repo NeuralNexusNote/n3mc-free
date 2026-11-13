@@ -161,11 +161,10 @@ class TestCompleteRecording:
 
 # ---------------------------------------------------------------------------
 class TestStopIdempotency:
-    """spec §4: --stop @import and behavior.md must be idempotent."""
+    """spec §4 (v1.4.0): --stop never adds an @import; behavior.md is created."""
 
-    def test_import_not_duplicated(self, tmp_path, monkeypatch):
+    def test_no_import_added(self, tmp_path, monkeypatch):
         from n3memorycore import n3memory
-        from n3memorycore.paths import CONTEXT_FILE
 
         claude_dir = tmp_path / '.claude'
         claude_dir.mkdir()
@@ -184,13 +183,14 @@ class TestStopIdempotency:
             }
         )
 
+        claude_md.write_text('# My project\n', encoding='utf-8')
         cfg = {}
         n3memory.cmd_stop(cfg)
         n3memory.cmd_stop(cfg)  # second call must be idempotent
 
         content = claude_md.read_text(encoding='utf-8')
-        import_line = f"@{CONTEXT_FILE}"
-        assert content.count(import_line) == 1
+        assert content == '# My project\n'
+        assert 'memory_context' not in content
 
     def test_rules_file_created(self, tmp_path, monkeypatch):
         from n3memorycore import n3memory

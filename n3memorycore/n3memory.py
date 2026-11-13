@@ -11,83 +11,278 @@ for _s_name in ("stdin", "stdout", "stderr"):
             pass
 
 import argparse
+import hashlib
 import json
 import logging
 import re
+import shutil
 import subprocess
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from .paths import (
-    HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, TURN_ID_FILE,
-    CONTEXT_FILE, AUDIT_LOG, CONFIG_FILE, claude_paths,
+from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE, claude_paths
+from .paths import TURN_ID_FILE, CONTEXT_FILE, CONTEXT_RETIRED_MARKER
+from .core.database import (
+    get_connection, init_db, migrate_schema, insert_memory,
+    check_exact_duplicate, search_vector, find_unindexed_memories,
+    strip_fts_punctuation, serialize_vector,
+)
+from .core.processor import (
+    embed_passage, cosine_sim_from_l2, hybrid_search,
+    chunk_text, add_chunk_prefixes, purify_text, render_memory_context,
 )
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_CODE_FILES = (
+    os.path.join(_PKG_DIR, 'n3memory.py'),
+    os.path.join(_PKG_DIR, 'core', 'database.py'),
+    os.path.join(_PKG_DIR, 'core', 'processor.py'),
+)
+
+# Set by ensure_server() when the port answers with another folder's server
+# (spec §3 "When the port belongs to another folder's server"). None = not foreign.
+_FOREIGN_SERVER_ROOT: Optional[str] = None
+
+# spec §4.5: inputs that are not typed by the user — no search, no save,
+# no new turn_id.
+_SYSTEM_PROMPT_PREFIXES = ('<task-notification>',)
+
+_HEADING = "# Recalled Memory Context"
+
+# spec §3 Session ID fallback for direct (non-HTTP) writes from this CLI
+# process: N3MC_SESSION_ID, else a per-process UUIDv4.
+_CLI_SESSION_ID = os.environ.get('N3MC_SESSION_ID') or str(uuid.uuid4())
+
+_FATAL_SAVE_MSG = "⚠️ Physical save failed. Current memories may be lost."
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+
+
 # ---------------------------------------------------------------------------
-# Config
+# Audit log + notices (spec §3 "Notices")
+# ---------------------------------------------------------------------------
+
+def _append_audit(record: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        rec = {'ts': datetime.now(timezone.utc).isoformat()}
+        rec.update(record)
+        with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f"Warning: audit log write failed: {e}", file=sys.stderr)
+
+
+def _load_notices() -> dict:
+    try:
+        with open(NOTICES_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_notices(notices: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(NOTICES_FILE), exist_ok=True)
+        if not notices:
+            if os.path.exists(NOTICES_FILE):
+                os.remove(NOTICES_FILE)
+            return
+        with open(NOTICES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(notices, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Warning: notices write failed: {e}", file=sys.stderr)
+
+
+def _notify(key: str, message: str) -> None:
+    """A notice that needs a human: stderr + audit.log (once per text) +
+    notices.json (shown at the top of search output once a day)."""
+    print(f"N3MC: {message}", file=sys.stderr)
+    notices = _load_notices()
+    prev = notices.get(key)
+    if prev and prev.get('message') == message:
+        return
+    _append_audit({'hook': 'notice', 'key': key, 'message': message})
+    notices[key] = {'message': message, 'last_shown': None}
+    _save_notices(notices)
+
+
+def _clear_notice(key: str) -> None:
+    notices = _load_notices()
+    if key in notices:
+        del notices[key]
+        _save_notices(notices)
+
+
+def _take_notices() -> list:
+    """Notices due for display (not shown in the last 24 h)."""
+    notices = _load_notices()
+    if not notices:
+        return []
+    now = time.time()
+    due = []
+    for v in notices.values():
+        last = v.get('last_shown')
+        if not last or now - float(last) >= 86400:
+            due.append(v.get('message', ''))
+            v['last_shown'] = now
+    if due:
+        _save_notices(notices)
+    return due
+
+
+def _status_md(body: str) -> str:
+    """Heading + due notices + body (used for every non-result output).
+
+    Without notices this is exactly "# Recalled Memory Context\\n\\n<body>\\n"
+    (spec §5.4 degraded-state placeholders)."""
+    parts = [_HEADING, ""]
+    for n in _take_notices():
+        parts += [f"> ⚠️ N3MC notice: {n}", ""]
+    parts.append(body)
+    return "\n".join(parts) + "\n"
+
+
+def _emit(text: str) -> None:
+    """Write search output to stdout as-is (stdout only; no file)."""
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Config (spec §3 identifiers, §3.5)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG: dict = {
-    "owner_id":               None,
-    "local_id":               None,
-    "server_port":            18520,
-    "embed_model":            "intfloat/multilingual-e5-base",
-    "dedup_threshold":        0.95,
-    "half_life_days":         90,
-    "bm25_min_threshold":     0.1,
-    "search_result_limit":    20,
-    "context_char_limit":     3000,
-    "min_score":              0.2,
-    "search_query_max_chars": 2000,
+    "owner_id":                 None,
+    "local_id":                 None,
+    "bind_host":                "127.0.0.1",  # keep 127.0.0.1: the API has no auth
+    "server_port":              18520,
+    "embed_model":              "intfloat/multilingual-e5-base",
+    "half_life_days":           90,
+    "bm25_min_threshold":       0.1,
+    "search_result_limit":      20,
+    "min_score":                0.2,
+    "search_query_max_chars":   2000,
+    "vector_min_cos":           0.85,   # measured with multilingual-e5-base
+    "relative_min_score_ratio": 0.6,
+    "pair_top_n":               3,
+    "pair_max_chars":           3000,
+    "version_order_enabled":    True,
+    "version_sim_threshold":    0.98,   # measured with multilingual-e5-base
+    "version_min_chars":        100,
 }
 
 
+def _config_value_ok(key: str, value) -> bool:
+    if key not in _DEFAULT_CONFIG:
+        return True
+    default = _DEFAULT_CONFIG[key]
+    if default is None:
+        return True
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, str):
+        return isinstance(value, str)
+    return True
+
+
+def _recover_ids_from_db(cfg: dict) -> None:
+    """spec §3.5: recover owner_id / local_id from the most frequent DB value."""
+    try:
+        import sqlite3
+        if not os.path.exists(DB_PATH):
+            return
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            for col in ('owner_id', 'local_id'):
+                if cfg.get(col):
+                    continue
+                row = conn.execute(
+                    f"SELECT {col} FROM memories WHERE {col} IS NOT NULL "
+                    f"GROUP BY {col} ORDER BY COUNT(*) DESC LIMIT 1"
+                ).fetchone()
+                if row and row[0]:
+                    cfg[col] = row[0]
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _fill_ids(cfg: dict) -> None:
+    _recover_ids_from_db(cfg)
+    for col in ('owner_id', 'local_id'):
+        if not cfg.get(col):
+            cfg[col] = str(uuid.uuid4())
+
+
 def _load_config() -> dict:
+    """spec §3.5 (v1.4.0): never overwrite a config.json the user mistyped."""
     os.makedirs(MEMORY_DIR, exist_ok=True)
     cfg = dict(_DEFAULT_CONFIG)
 
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                cfg.update(json.load(f))
-        except Exception as e:
-            print(f"Warning: config.json parse error: {e}", file=sys.stderr)
-            # spec §3.5: recover owner_id / local_id from DB on config corruption
-            try:
-                import sqlite3
-                if os.path.exists(DB_PATH):
-                    conn = sqlite3.connect(DB_PATH)
-                    for col in ('owner_id', 'local_id'):
-                        row = conn.execute(
-                            f"SELECT {col} FROM memories "
-                            f"GROUP BY {col} ORDER BY COUNT(*) DESC LIMIT 1"
-                        ).fetchone()
-                        if row:
-                            cfg[col] = row[0]
-                    conn.close()
-            except Exception:
-                pass
-
-    changed = False
-    if not cfg.get('owner_id'):
-        cfg['owner_id'] = str(uuid.uuid4())
-        changed = True
-    if not cfg.get('local_id'):
-        cfg['local_id'] = str(uuid.uuid4())
-        changed = True
-    for k, v in _DEFAULT_CONFIG.items():
-        if k not in cfg or cfg[k] is None:
-            cfg[k] = v
-            changed = True
-
-    if changed:
+    if not os.path.exists(CONFIG_FILE):
+        _fill_ids(cfg)
         _save_config(cfg)
+        return cfg
+
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("the top level is not a JSON object")
+    except Exception as e:
+        _notify(
+            'config_unreadable',
+            f"config.json cannot be read ({e}). N3MC runs with default "
+            f"settings until it is fixed; the file was NOT modified: {CONFIG_FILE}",
+        )
+        _fill_ids(cfg)   # this run only — not saved
+        return cfg
+    _clear_notice('config_unreadable')
+
+    bad = []
+    for k, v in data.items():
+        if _config_value_ok(k, v):
+            cfg[k] = v
+        else:
+            bad.append(k)
+    if bad:
+        _notify(
+            'config_type',
+            "config.json: these items have the wrong type and are ignored "
+            f"(defaults are used): {', '.join(sorted(bad))}. "
+            "Write numbers without quotes, e.g. \"vector_min_cos\": 0.83.",
+        )
+    else:
+        _clear_notice('config_type')
+
+    for col in ('owner_id', 'local_id'):
+        if not cfg.get(col):
+            cfg[col] = None
+    if not cfg.get('owner_id') or not cfg.get('local_id'):
+        _fill_ids(cfg)
+
+    missing = [k for k in _DEFAULT_CONFIG
+               if k not in data or (data.get(k) is None and cfg.get(k) is not None)]
+    if missing and not bad:
+        merged = dict(data)
+        for k in missing:
+            merged[k] = cfg[k]
+        _save_config(merged)
     return cfg
 
 
@@ -95,6 +290,29 @@ def _save_config(cfg: dict) -> None:
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def _code_version() -> str:
+    """spec §3: hash of the server code + config.json content (key order and
+    whitespace do not matter)."""
+    h = hashlib.sha256()
+    for path in _CODE_FILES:
+        try:
+            with open(path, 'rb') as f:
+                h.update(f.read())
+        except Exception:
+            h.update(path.encode('utf-8'))
+    try:
+        with open(CONFIG_FILE, 'rb') as f:
+            raw = f.read()
+    except Exception:
+        raw = b''
+    try:
+        obj = json.loads(raw.decode('utf-8'))
+        h.update(json.dumps(obj, sort_keys=True).encode('utf-8'))
+    except Exception:
+        h.update(raw)
+    return h.hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -121,16 +339,34 @@ def _get(cfg: dict, path: str, timeout: int = 30) -> dict:
         return json.loads(resp.read().decode('utf-8'))
 
 
-def _health_check(cfg: dict) -> bool:
+def _get_health(cfg: dict) -> Optional[dict]:
     try:
         r = _get(cfg, '/health', timeout=5)
-        return r.get('status') == 'ok'
+        return r if isinstance(r, dict) and r.get('status') == 'ok' else None
     except Exception:
-        return False
+        return None
+
+
+def _health_check(cfg: dict) -> bool:
+    return _get_health(cfg) is not None
+
+
+def _health_decision(health: Optional[dict]) -> str:
+    """spec §3: 'none' | 'ok' | 'stale' | 'foreign' | 'legacy'."""
+    if not health:
+        return 'none'
+    root = health.get('root')
+    if not root:
+        return 'legacy'
+    if _norm(root) != _norm(HOME_DIR):
+        return 'foreign'
+    if health.get('code_version') != _code_version():
+        return 'stale'
+    return 'ok'
 
 
 # ---------------------------------------------------------------------------
-# Server management
+# Server management (spec §3 "Server check and replacement (ensure_server)")
 # ---------------------------------------------------------------------------
 
 def _process_alive(pid: int) -> bool:
@@ -151,52 +387,233 @@ def _process_alive(pid: int) -> bool:
         return False
 
 
+def _is_own_server_process(pid: int) -> bool:
+    """True only if psutil confirms pid is `n3memorycore.n3memory --run-server`
+    whose data folder (N3MC_HOME) is ours."""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    if not pid:
+        return False
+    try:
+        p = psutil.Process(int(pid))
+        cmdline = ' '.join(p.cmdline())
+        # spec §3: command line contains both markers
+        if 'n3memorycore.n3memory' not in cmdline or '--run-server' not in cmdline:
+            return False
+        env = p.environ()
+        home = env.get('N3MC_HOME')
+        if home:
+            their_home = home
+        else:
+            user_home = env.get('USERPROFILE') or env.get('HOME') or os.path.expanduser('~')
+            their_home = os.path.join(user_home, '.n3mc')
+        return _norm(their_home) == _norm(HOME_DIR)
+    except Exception:
+        # psutil missing / access denied / process gone → cannot verify
+        return False
+
+
+def _server_pid(cfg: dict, health: Optional[dict]) -> Optional[int]:
+    """PID from /health's `pid`, else the process listening on the port."""
+    pid = (health or {}).get('pid')
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        return pid
+    return _listener_pid(cfg.get('server_port', 18520))
+
+
+def _listener_pid(port: int) -> Optional[int]:
+    try:
+        import psutil
+        for c in psutil.net_connections(kind='tcp'):
+            if c.laddr and c.laddr.port == port and c.status == 'LISTEN' and c.pid:
+                return c.pid
+    except Exception:
+        pass
+    return None
+
+
+def _request_shutdown(cfg: dict) -> bool:
+    try:
+        r = _post(cfg, '/shutdown', {'root': HOME_DIR}, timeout=5)
+        return isinstance(r, dict) and r.get('status') == 'ok'
+    except Exception:
+        return False
+
+
+def _wait_port_free(cfg: dict, max_wait: float = 15) -> bool:
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if not _health_check(cfg):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _stop_stale_server(cfg: dict, health: dict) -> bool:
+    """Ask /shutdown first; for servers without it (v1.3.x) terminate only a
+    process psutil confirms as ours. Never use the PID file's number."""
+    if _request_shutdown(cfg):
+        return _wait_port_free(cfg)
+
+    pid = _server_pid(cfg, health)
+    if pid and _is_own_server_process(pid):
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
+        # Remove the PID file only if it names the process we just stopped.
+        try:
+            with open(PID_FILE, 'r', encoding='utf-8') as f:
+                same = f.read().strip() == str(pid)
+            if same:
+                os.remove(PID_FILE)
+        except Exception:
+            pass
+        return _wait_port_free(cfg)
+
+    _notify('stale_server', _STALE_SERVER_MSG)
+    return False
+
+
+_STALE_SERVER_MSG = (
+    "Cannot stop the old server. Another N3MC folder may be using the same "
+    "`server_port`. Check `server_port` in each folder's `config.json` and "
+    "restart manually."
+)
+
+
 def _wait_for_server(cfg: dict, max_wait: int = 60) -> bool:
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        if _health_check(cfg):
+        if _health_decision(_get_health(cfg)) == 'ok':
             return True
         time.sleep(0.5)
     return False
 
 
-def ensure_server(cfg: dict) -> bool:
-    os.makedirs(MEMORY_DIR, exist_ok=True)
+def _server_answered() -> bool:
+    """spec §3: once our own server responds, clear the server notices."""
+    _clear_notice('stale_server')
+    _clear_notice('port_conflict')
+    return True
 
-    if os.path.exists(PID_FILE):
+
+def _start_server(cfg: dict) -> bool:
+    # spec §3: atomic exclusive-create of the PID file prevents two CLIs from
+    # launching two servers at the same time.
+    try:
+        pid_fh = open(PID_FILE, 'x', encoding='utf-8')
+    except FileExistsError:
+        # Another process is starting the server right now — wait for it.
+        if _wait_for_server(cfg, max_wait=60):
+            return _server_answered()
+        print("Warning: N3MC server did not start in time.", file=sys.stderr)
+        return False
+    try:
+        # spec §3 Clean CLI: stderr/stdout → DEVNULL to silence model load warnings
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        pid_fh.write(str(proc.pid))
+    except Exception:
+        pid_fh.close()
         try:
-            with open(PID_FILE, 'r') as f:
-                pid = int(f.read().strip())
-            if _process_alive(pid) and _health_check(cfg):
-                return True
+            os.remove(PID_FILE)
         except Exception:
             pass
+        raise
+    pid_fh.close()
+    if not _wait_for_server(cfg, max_wait=60):
+        print("Warning: N3MC server did not start in time.", file=sys.stderr)
+        return False
+    return _server_answered()
+
+
+_LEGACY_FOREIGN_ROOT = '(unknown: the server did not report its folder)'
+
+
+def _notify_port_conflict(cfg: dict, root: str) -> None:
+    port = cfg.get('server_port', 18520)
+    _notify(
+        'port_conflict',
+        f"Port {port} is used by the N3MC server of another folder ({root}). "
+        "This folder saves directly to its own DB and skips memory search "
+        f"until `server_port` in {CONFIG_FILE} is changed to a free port.",
+    )
+
+
+def ensure_server(cfg: dict) -> bool:
+    """Return True when a server of this folder with the current code answers.
+
+    False with _FOREIGN_SERVER_ROOT set: the port belongs to another folder's
+    server (save directly, do not search). False otherwise: start failure.
+    """
+    global _FOREIGN_SERVER_ROOT
+    _FOREIGN_SERVER_ROOT = None
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+
+    health = _get_health(cfg)
+    decision = _health_decision(health)
+    if decision == 'ok':
+        return _server_answered()
+    if decision == 'foreign':
+        # Another folder's server: do not stop it, do not use it.
+        _FOREIGN_SERVER_ROOT = health.get('root')
+        _notify_port_conflict(cfg, _FOREIGN_SERVER_ROOT)
+        return False
+    if decision == 'legacy':
+        # No `root` (v1.3.x or older): stop it only if psutil confirms it is
+        # ours; otherwise treat it as another folder's server.
+        if not _is_own_server_process(_server_pid(cfg, health)):
+            _FOREIGN_SERVER_ROOT = _LEGACY_FOREIGN_ROOT
+            _notify_port_conflict(cfg, _LEGACY_FOREIGN_ROOT)
+            return False
+        if not _stop_stale_server(cfg, health):
+            _FOREIGN_SERVER_ROOT = _LEGACY_FOREIGN_ROOT
+            return False
+    elif decision == 'stale':
+        # Same root, different code_version: stop it and restart.
+        if not _stop_stale_server(cfg, health):
+            # Could not stop it (notice `stale_server` emitted). It serves our
+            # own DB, so keep using it until a human restarts it.
+            return True
+
+    # No server answers. spec §3 "PID file handling"
+    if os.path.exists(PID_FILE):
+        pid = None
+        try:
+            with open(PID_FILE, 'r', encoding='utf-8') as f:
+                pid = int(f.read().strip())
+        except Exception:
+            pid = None
+        if pid and _process_alive(pid) and _is_own_server_process(pid):
+            # This folder's server is starting up: keep the PID file and wait.
+            if _wait_for_server(cfg, max_wait=60):
+                return _server_answered()
+            print("Warning: N3MC server did not start in time.", file=sys.stderr)
+            return False
+        # Dead / reused / unverifiable PID: delete without waiting.
         try:
             os.remove(PID_FILE)
         except Exception:
             pass
 
-    # spec §3 Clean CLI: stderr/stdout → DEVNULL to silence model load warnings
-    proc = subprocess.Popen(
-        [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
-        stderr=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-    )
-    try:
-        with open(PID_FILE, 'x') as f:
-            f.write(str(proc.pid))
-    except FileExistsError:
-        pass  # Another process is starting the server concurrently
-    # spec §5: wait up to 60s (covers first-time model download)
-    if not _wait_for_server(cfg, max_wait=60):
-        print("Warning: N3MC server did not start in time.", file=sys.stderr)
-        return False
-    return True
+    return _start_server(cfg)
 
 
 # ---------------------------------------------------------------------------
-# Direct buffer fallback (no embedding — used when server is down)
+# Direct buffer fallback (no embedding — used when server is down/foreign)
 # ---------------------------------------------------------------------------
 
 def _buffer_direct(
@@ -206,14 +623,12 @@ def _buffer_direct(
     session_id: Optional[str] = None,
     turn_id: Optional[str] = None,
 ) -> None:
-    from .core.database import (
-        get_connection, init_db, migrate_schema,
-        insert_memory, check_exact_duplicate,
-    )
-    from .core.processor import sanitize_surrogates
+    from .core.database import count_memories
     from uuid_extensions import uuid7
 
-    content = sanitize_surrogates(content)
+    content = purify_text(content) if content else content
+    if not content or not content.strip():
+        return
 
     conn = get_connection(DB_PATH)
     try:
@@ -223,27 +638,29 @@ def _buffer_direct(
             conn.close()
             _handle_corrupt_db()
             conn = get_connection(DB_PATH)
-            init_db(conn)
-
+        init_db(conn)
         migrate_schema(conn)
-        if check_exact_duplicate(conn, content):
+        # spec §5.4: exact text only (same turn_id when given) — same rule as /buffer
+        if check_exact_duplicate(conn, content, turn_id=turn_id):
             return
 
+        before = count_memories(conn)
         ts = datetime.now(timezone.utc).isoformat()
         insert_memory(
             conn, str(uuid7()), content, ts,
             owner_id=cfg['owner_id'],
             local_id=cfg.get('local_id'),
             agent_name=agent_name,
-            session_id=session_id,
+            session_id=session_id or _CLI_SESSION_ID,
             turn_id=turn_id,
         )
+        if count_memories(conn) == before:
+            raise RuntimeError("record count did not change after INSERT")
     finally:
         conn.close()
 
 
 def _handle_corrupt_db() -> None:
-    import shutil
     corrupt = DB_PATH + '.corrupt.bak'
     # spec §3.5: rename DB and remove WAL sidecar files
     for path in (DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm'):
@@ -257,7 +674,9 @@ def _handle_corrupt_db() -> None:
                 pass
     print(
         f"Warning: DB corruption detected. Renamed to {corrupt}. "
-        "A new empty DB will be created.",
+        "A new empty DB will be created. Recovery: restore a backup of "
+        "n3memory.db (together with its config.json) into "
+        f"{MEMORY_DIR}, or try `sqlite3 {corrupt} .recover` to salvage records.",
         file=sys.stderr,
     )
 
@@ -265,6 +684,17 @@ def _handle_corrupt_db() -> None:
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
+
+def _exit_server_process() -> None:
+    try:
+        with open(PID_FILE, 'r') as f:
+            if f.read().strip() == str(os.getpid()):
+                f.close()
+                os.remove(PID_FILE)
+    except Exception:
+        pass
+    os._exit(0)
+
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -283,15 +713,20 @@ try:
         since: Optional[str] = None
         until: Optional[str] = None
 
+    class ShutdownRequest(BaseModel):
+        root: str
+
     # Global server state (populated in lifespan)
     _srv_cfg: dict = {}
     _srv_session: str = ""
+    _srv_code_version: str = ""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _srv_cfg, _srv_session
+        global _srv_cfg, _srv_session, _srv_code_version
         _srv_cfg = _load_config()
-        _srv_session = os.environ.get('N3MC_SESSION_ID', str(uuid.uuid4()))
+        _srv_code_version = _code_version()  # after _load_config may rewrite it
+        _srv_session = os.environ.get('N3MC_SESSION_ID') or str(uuid.uuid4())
         os.makedirs(MEMORY_DIR, exist_ok=True)
 
         from .core.database import get_connection, init_db, migrate_schema
@@ -322,29 +757,43 @@ try:
 
     @app.get('/health')
     async def ep_health():
+        return {
+            'status':       'ok',
+            'root':         os.path.abspath(HOME_DIR),
+            'code_version': _srv_code_version or _code_version(),
+            'pid':          os.getpid(),
+        }
+
+    @app.post('/shutdown')
+    async def ep_shutdown(req: ShutdownRequest):
+        if _norm(req.root) != _norm(HOME_DIR):
+            raise HTTPException(status_code=403, detail='root mismatch')
+        threading.Timer(0.3, _exit_server_process).start()
         return {'status': 'ok'}
 
     @app.post('/buffer')
     async def ep_buffer(req: BufferRequest):
+        # Looked up at call time so tests can patch processor.embed_passage.
         from .core.database import (
-            get_connection, check_exact_duplicate, insert_memory, search_vector,
+            get_connection, check_exact_duplicate, insert_memory, count_memories,
         )
-        from .core.processor import embed_passage, cosine_sim_from_l2, purify_text
+        from .core.processor import embed_passage, purify_text
         from uuid_extensions import uuid7
 
         content = purify_text(req.content) if req.content else ''
         if not content.strip():
             return {'status': 'skipped', 'count': 0, 'reason': 'empty'}
 
-        local  = req.local_id   or _srv_cfg.get('local_id')
-        sess   = req.session_id or _srv_session
-        tid    = req.turn_id
-        agent  = req.agent_name
-        thresh = _srv_cfg.get('dedup_threshold', 0.95)
+        local = req.local_id   or _srv_cfg.get('local_id')
+        sess  = req.session_id or _srv_session
+        tid   = req.turn_id
+        agent = req.agent_name
 
         conn = get_connection(DB_PATH)
         try:
-            if check_exact_duplicate(conn, content):
+            # spec §5.4 (v1.4.0): exact text only (same turn when turn_id is
+            # given); checked before computing the embedding. No similarity dedup.
+            if check_exact_duplicate(conn, content, turn_id=tid):
                 return {'status': 'skipped', 'count': 0, 'reason': 'exact_duplicate'}
 
             vec = None
@@ -352,15 +801,8 @@ try:
                 vec = embed_passage(content)
             except Exception as e:
                 logger.warning(f"Embed error: {e}")
-            if vec is not None:
-                try:
-                    rows = search_vector(conn, vec, k=20)
-                    for row in rows:
-                        if cosine_sim_from_l2(row['distance']) >= thresh:
-                            return {'status': 'skipped', 'count': 0, 'reason': 'cosine_duplicate'}
-                except Exception as e:
-                    logger.warning(f"Dedup search error: {e}")
 
+            before = count_memories(conn)
             ts = datetime.now(timezone.utc).isoformat()
             insert_memory(
                 conn, str(uuid7()), content, ts,
@@ -371,6 +813,10 @@ try:
                 session_id=sess,
                 turn_id=tid,
             )
+            if count_memories(conn) == before:
+                # spec §5.4: record count unchanged after INSERT → fatal
+                return {'status': 'error',
+                        'message': 'record count did not change after INSERT'}
             return {'status': 'ok', 'count': 1}
         finally:
             conn.close()
@@ -379,11 +825,10 @@ try:
     async def ep_search(req: SearchRequest):
         from .core.processor import hybrid_search
         sess = req.session_id or _srv_session
-        result = hybrid_search(
+        return hybrid_search(
             DB_PATH, req.query or '', _srv_cfg, sess,
             since=req.since, until=req.until,
         )
-        return result
 
     @app.post('/repair')
     async def ep_repair():
@@ -399,16 +844,19 @@ try:
             # spec §3: FTS punct cleaning — one-time migration with marker
             marker = os.path.join(MEMORY_DIR, 'fts_punct_cleaned')
             if not os.path.exists(marker):
-                offset = 0
+                last_rowid = -1
                 cleaned_count = 0
                 while True:
-                    # FTS cleaning uses OFFSET (UPDATE keeps records in result set)
+                    # Batches of 200 without OFFSET: cleaned rows stay in
+                    # memories_fts, so page by rowid (keyset) instead.
                     rows = conn.execute(
-                        "SELECT rowid, content FROM memories_fts LIMIT 200 OFFSET ?",
-                        (offset,)
+                        "SELECT rowid, content FROM memories_fts WHERE rowid > ? "
+                        "ORDER BY rowid LIMIT 200",
+                        (last_rowid,)
                     ).fetchall()
                     if not rows:
                         break
+                    last_rowid = rows[-1][0]
                     for row in rows:
                         clean = strip_fts_punctuation(row[1])
                         if clean != row[1]:
@@ -418,7 +866,6 @@ try:
                             )
                             cleaned_count += 1
                     conn.commit()
-                    offset += 200
                     if len(rows) < 200:
                         break
                 with open(marker, 'w', encoding='utf-8') as f:
@@ -541,17 +988,13 @@ def _turn_id_file(cc_session_id: str = '') -> str:
 
 
 def _read_turn_id(cc_session_id: str = '') -> Optional[str]:
+    # spec §2: turn_id_<session>.txt per Claude Code session_id; turn_id.txt
+    # only when there is no session_id (never another session's file).
     f = _turn_id_file(cc_session_id)
     if os.path.exists(f):
         try:
-            tid = open(f, 'r', encoding='utf-8').read().strip()
-            return tid or None
-        except Exception:
-            pass
-    # Legacy fallback
-    if cc_session_id and os.path.exists(TURN_ID_FILE):
-        try:
-            tid = open(TURN_ID_FILE, 'r', encoding='utf-8').read().strip()
+            with open(f, 'r', encoding='utf-8') as fh:
+                tid = fh.read().strip()
             return tid or None
         except Exception:
             pass
@@ -562,12 +1005,6 @@ def _write_turn_id(tid: str, cc_session_id: str = '') -> None:
     os.makedirs(MEMORY_DIR, exist_ok=True)
     with open(_turn_id_file(cc_session_id), 'w', encoding='utf-8') as f:
         f.write(tid)
-
-
-def _clear_turn_id(cc_session_id: str = '') -> None:
-    f = _turn_id_file(cc_session_id)
-    if os.path.exists(f):
-        open(f, 'w', encoding='utf-8').close()
 
 
 def _extract_text(prompt) -> str:
@@ -605,6 +1042,19 @@ def _do_buffer(
     session_id: Optional[str] = None,
     turn_id: Optional[str] = None,
 ) -> None:
+    def _direct():
+        try:
+            _buffer_direct(text, cfg, agent_name=agent_name,
+                           session_id=session_id, turn_id=turn_id)
+        except Exception as e2:
+            # spec §5.4: fatal failure warning (DB write failed)
+            print(f"{_FATAL_SAVE_MSG} ({e2})", file=sys.stderr)
+
+    # spec §3: another folder's server owns the port → never write to its DB
+    if _FOREIGN_SERVER_ROOT is not None:
+        _direct()
+        return
+
     payload = {
         'content':    text,
         'agent_name': agent_name,
@@ -612,33 +1062,34 @@ def _do_buffer(
         'turn_id':    turn_id,
     }
     try:
-        _post(cfg, '/buffer', payload)
+        result = _post(cfg, '/buffer', payload)
     except Exception as e:
         print(f"Warning: HTTP buffer failed ({e}), using direct write.", file=sys.stderr)
-        try:
-            _buffer_direct(text, cfg, agent_name=agent_name,
-                           session_id=session_id, turn_id=turn_id)
-        except Exception as e2:
-            print(
-                f"⚠️ 物理保存に失敗。現在の記憶は失われる可能性があります。 {e2}",
-                file=sys.stderr,
-            )
+        _direct()
+        return
+    if isinstance(result, dict) and result.get('status') == 'error':
+        print(f"Warning: /buffer failed ({result.get('message')}), using direct write.",
+              file=sys.stderr)
+        _direct()
 
 
-def _do_search_and_write(
+def _do_search(
     query: str, cfg: dict,
     since: Optional[str] = None,
     until: Optional[str] = None,
     current_session: Optional[str] = None,
 ) -> None:
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    empty_md = "# Recalled Memory Context\n\n_No relevant memories found._\n"
-
-    # spec §5: even empty query must write (clears stale context)
+    """spec §5.4 (v1.4.0): print the result to stdout only (no file), on
+    every invocation, including degraded states."""
     if not query or not query.strip():
-        with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
-            f.write(empty_md)
-        print(empty_md)
+        _emit(_status_md("_No relevant memories found._"))
+        return
+
+    if _FOREIGN_SERVER_ROOT is not None:
+        _emit(_status_md(
+            "_(memory search unavailable: another N3MC folder's server is "
+            f"using port {cfg.get('server_port')})_"
+        ))
         return
 
     payload: dict = {'query': query}
@@ -651,23 +1102,19 @@ def _do_search_and_write(
 
     try:
         result = _post(cfg, '/search', payload)
+        if not isinstance(result, dict):
+            raise RuntimeError('invalid /search response')
+        if result.get('status') == 'error':
+            raise RuntimeError(result.get('message') or '/search error')
     except Exception as e:
-        msg = f"# Recalled Memory Context\n\n_(memory search unavailable: {e})_\n"
-        with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
-            f.write(msg)
-        print(msg)
+        _emit(_status_md(f"_(memory search unavailable: {e})_"))
         return
 
     try:
-        from .core.processor import render_memory_context
-        md = render_memory_context(result, query)
+        md = render_memory_context(result, query, notices=_take_notices())
     except Exception as e:
-        md = f"# Recalled Memory Context\n\n_(memory rendering failed: {e})_\n"
-
-    # spec §5: write to BOTH file AND stdout
-    with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
-        f.write(md)
-    print(md)
+        md = _status_md(f"_(memory search unavailable: rendering failed: {e})_")
+    _emit(md)
 
 
 # ---------------------------------------------------------------------------
@@ -684,18 +1131,20 @@ def cmd_search(
     since: Optional[str] = None,
     until: Optional[str] = None,
 ) -> None:
-    if not ensure_server(cfg):
-        os.makedirs(MEMORY_DIR, exist_ok=True)
-        msg = "# Recalled Memory Context\n\n_(memory server failed to start)_\n"
-        with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
-            f.write(msg)
-        print(msg)
-        return
-    _do_search_and_write(query, cfg, since=since, until=until)
+    # A failed start falls through: _do_search then prints
+    # "_(memory search unavailable: <reason>)_" (spec §5.4).
+    ensure_server(cfg)
+    _do_search(query, cfg, since=since, until=until)
 
 
 def cmd_repair(cfg: dict) -> None:
-    ensure_server(cfg)
+    if not ensure_server(cfg) and _FOREIGN_SERVER_ROOT is not None:
+        print(
+            f"N3MC: --repair skipped: port {cfg.get('server_port')} is used by "
+            "another N3MC folder's server.",
+            file=sys.stderr,
+        )
+        return
     try:
         result = _post(cfg, '/repair', {})
         count = result.get('count', 0)
@@ -705,22 +1154,28 @@ def cmd_repair(cfg: dict) -> None:
         print(f"Repair failed: {e}", file=sys.stderr)
 
 
+def _open_db_readonly_ready():
+    from .core.database import get_connection, init_db, migrate_schema
+    conn = get_connection(DB_PATH)
+    init_db(conn)
+    migrate_schema(conn)
+    return conn
+
+
 def cmd_list(
     cfg: dict,
     since: Optional[str] = None,
     until: Optional[str] = None,
     fmt: str = 'tsv',
 ) -> None:
-    from .core.database import get_connection, init_db, migrate_schema, get_all_memories
+    from .core.database import get_all_memories
     os.makedirs(MEMORY_DIR, exist_ok=True)
     if not os.path.exists(DB_PATH):
         print("Total: 0 records")
         return
 
-    conn = get_connection(DB_PATH)
+    conn = _open_db_readonly_ready()
     try:
-        init_db(conn)
-        migrate_schema(conn)
         rows = get_all_memories(conn, since=since, until=until)
         if fmt == 'jsonl':
             for r in rows:
@@ -749,16 +1204,14 @@ def cmd_recall_thread(
     fmt: str = 'tsv',
 ) -> None:
     """spec §3.6: return turn_id's records plus N surrounding turns."""
-    from .core.database import get_connection, init_db, migrate_schema, get_thread_context
+    from .core.database import get_thread_context
     os.makedirs(MEMORY_DIR, exist_ok=True)
     if not os.path.exists(DB_PATH):
         print(f"No DB found at {DB_PATH}", file=sys.stderr)
         return
 
-    conn = get_connection(DB_PATH)
+    conn = _open_db_readonly_ready()
     try:
-        init_db(conn)
-        migrate_schema(conn)
         rows = get_thread_context(conn, turn_id, before=before, after=after)
         if fmt == 'jsonl':
             for r in rows:
@@ -779,40 +1232,32 @@ def cmd_recall_thread(
         conn.close()
 
 
-def cmd_stop(cfg: dict) -> None:
-    """spec §4: ensure behavior.md and CLAUDE.md @import exist (idempotent)."""
-    cp = claude_paths()
-    os.makedirs(cp['RULES_DIR'], exist_ok=True)
-    if not os.path.exists(cp['BEHAVIOR_MD']):
-        _write_behavior_md(cp['BEHAVIOR_MD'])
-
-    # Absolute path for the global memory_context.md
-    import_line = f"@{CONTEXT_FILE}"
-    os.makedirs(cp['CLAUDE_DIR'], exist_ok=True)
-
-    if os.path.exists(cp['CLAUDE_MD']):
-        with open(cp['CLAUDE_MD'], 'r', encoding='utf-8') as f:
-            content = f.read()
-        # spec §4: remove legacy N3MC_AUTO_START/END zones
-        content = re.sub(
-            r'<!-- N3MC_AUTO_START -->.*?<!-- N3MC_AUTO_END -->',
-            '', content, flags=re.DOTALL
-        ).strip() + '\n'
-        # spec §4: remove legacy relative-path @import forms
-        content = re.sub(
-            r'@\.\./[^\n]*memory_context\.md[^\n]*\n?', '', content
-        )
-        if import_line not in content:
-            content = content.rstrip() + '\n\n' + import_line + '\n'
-        with open(cp['CLAUDE_MD'], 'w', encoding='utf-8') as f:
-            f.write(content)
-    else:
-        with open(cp['CLAUDE_MD'], 'w', encoding='utf-8') as f:
-            f.write(f"# CLAUDE.md\n\n{import_line}\n")
+def cmd_show_turn(turn_id: str, cfg: dict) -> None:
+    """spec §4.5: full text of one exchange (no truncation)."""
+    from .core.database import get_memories_by_turn_id
+    from .core.processor import _fmt_saved
+    if not os.path.exists(DB_PATH):
+        print("Total: 0 records")
+        return
+    conn = _open_db_readonly_ready()
+    try:
+        rows = get_memories_by_turn_id(conn, turn_id)
+        for r in rows:
+            print(f"--- {r['id']} saved={_fmt_saved(r['timestamp'])} ---")
+            print(r['content'])
+        print(f"Total: {len(rows)} records")
+    finally:
+        conn.close()
 
 
-def _write_behavior_md(path: str) -> None:
-    text = """# N3MemoryCore Behavioral Guidelines
+# ---------------------------------------------------------------------------
+# --stop: behavior rules + memory_context retirement (spec §4)
+# ---------------------------------------------------------------------------
+
+_BEHAVIOR_MD_MARKER = '<!-- n3mc-behavior v2 -->'
+
+_BEHAVIOR_MD_CONTENT = _BEHAVIOR_MD_MARKER + """
+# N3MemoryCore Behavioral Guidelines
 
 These guidelines apply to every Claude Code session in this project. They are
 loaded automatically from `.claude/rules/` at session start.
@@ -822,6 +1267,14 @@ All conversations are saved by hooks (UserPromptSubmit + Stop). Do NOT call
 `--buffer` manually. Every non-empty user message and Claude response is
 recorded character-for-character; there is no length filter and no skip-pattern
 filter. Make NO acknowledgement when a save succeeds — silence is correct.
+
+## Recalled Memory Context
+Every turn, the UserPromptSubmit hook adds a `# Recalled Memory Context` block
+to your context. Read `## Top matches` first; use
+`## Previous matching Q-A exchanges` as supporting context. When several
+versions of the same content appear, the one with the newest `saved` time is
+the current one. If the block contains a `> ⚠️ N3MC notice:` line, tell the
+user what it says.
 
 ## Active RAG
 When prior context would help, run a search proactively. **Always invoke via
@@ -833,8 +1286,15 @@ production with `command not found`. `python -m` resolves through the Python
 interpreter (which is on `PATH`) and is portable across venvs and platforms.
 Both invocation forms are auto-allowed via `permissions.allow`.
 
+## Cut Exchanges
+A Q-A exchange may end with a line like
+`_(N more chunk(s) of this exchange omitted. Full text: ...)_`. If the omitted
+part is needed for your answer, run the command shown there
+(`python -m n3memorycore.n3memory --show-turn <turn_id>`) and read the full
+text before answering.
+
 ## Recall Acknowledgment
-When `--search` results actually shape your reply (you are recalling something
+When recalled memory actually shapes your reply (you are recalling something
 saved earlier), open the reply with a short acknowledgment in the user's
 language — e.g. "Pulling this from earlier memory in this session." or
 「前回の回答がメモリに保存されています。」 If no relevant memory was found,
@@ -844,9 +1304,119 @@ or it did not influence your answer, do NOT announce anything.
 If a save fails physically, surface the warning prominently:
 > ⚠️ Physical save failed. Current memories may be lost.
 """
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(text)
 
+# Templates shipped before the current one (sha256 of LF-normalized text,
+# first 16 hex). Add the previous template's hash whenever the template changes.
+_KNOWN_BEHAVIOR_MD_HASHES = frozenset({
+    'ade0a59b94f59f9a',  # v1.2.x – v1.3.x
+    '34ed39efe5a3833d',  # v1.2.0 scaffolding
+})
+
+
+def _behavior_md_hash(text: str) -> str:
+    t = text.replace('\r\n', '\n').replace('\r', '\n')
+    return hashlib.sha256(t.encode('utf-8')).hexdigest()[:16]
+
+
+def _backup(path: str) -> str:
+    dst = f"{path}.bak-n3mc-{datetime.now():%Y%m%d%H%M%S}"
+    shutil.copy2(path, dst)
+    return dst
+
+
+def _ensure_behavior_md(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(_BEHAVIOR_MD_CONTENT)
+        return
+    with open(path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    first_line = text.lstrip('﻿').splitlines()[0].strip() if text else ''
+    if first_line == _BEHAVIOR_MD_MARKER:
+        return
+    if _behavior_md_hash(text) in _KNOWN_BEHAVIOR_MD_HASHES:
+        _backup(path)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(_BEHAVIOR_MD_CONTENT)
+        _clear_notice('behavior_md_edited')
+        return
+    _notify(
+        'behavior_md_edited',
+        "The rules file has been edited by hand, so it was not updated. "
+        "Merge manually if needed.",
+    )
+
+
+_MEMORY_CONTEXT_IMPORT_RE = re.compile(r'^[ \t]*@[^\n]*memory_context\.md[ \t]*$')
+_N3MC_COMMENT_PREFIXES = (
+    '# N3MemoryCore — ',
+    '# N3MemoryCore - ',
+    '# Path resolves to ',
+    '# If you have not yet run ',
+)
+
+
+def _retire_memory_context(claude_md: str) -> None:
+    """spec §4 (v1.4.0): remove the legacy @…memory_context.md import from
+    <cwd>/.claude/CLAUDE.md (backup first, keep LF/CRLF) and delete the
+    leftover global memory_context.md once."""
+    if os.path.exists(claude_md):
+        try:
+            with open(claude_md, 'rb') as f:
+                text = f.read().decode('utf-8')
+        except Exception:
+            text = None
+        if text is not None:
+            # Lines keep their own endings (LF / CRLF), so the file is written
+            # back with its original line endings.
+            lines = text.splitlines(keepends=True)
+            drop = set()
+            for i, line in enumerate(lines):
+                if not _MEMORY_CONTEXT_IMPORT_RE.match(line.rstrip('\r\n')):
+                    continue
+                drop.add(i)
+                # The N3MC comment lines just before it (blank lines between
+                # the comment block and the @import go with them).
+                j = i - 1
+                first_comment = None
+                while j >= 0 and j not in drop:
+                    body = lines[j].rstrip('\r\n')
+                    if body.startswith(_N3MC_COMMENT_PREFIXES):
+                        first_comment = j
+                    elif body.strip():
+                        break
+                    j -= 1
+                if first_comment is not None:
+                    drop.update(range(first_comment, i))
+            if drop:
+                new_text = ''.join(l for k, l in enumerate(lines) if k not in drop)
+                _backup(claude_md)
+                with open(claude_md, 'wb') as f:
+                    f.write(new_text.encode('utf-8'))
+
+    # Leftover global memory_context.md: delete once, then mark as retired.
+    if not os.path.exists(CONTEXT_RETIRED_MARKER) and os.path.exists(CONTEXT_FILE):
+        try:
+            os.remove(CONTEXT_FILE)
+            os.makedirs(os.path.dirname(CONTEXT_RETIRED_MARKER), exist_ok=True)
+            with open(CONTEXT_RETIRED_MARKER, 'w', encoding='utf-8') as f:
+                f.write(datetime.now(timezone.utc).isoformat())
+        except Exception as e:
+            print(f"Warning: could not retire memory_context.md: {e}", file=sys.stderr)
+
+
+def cmd_stop(cfg: dict) -> None:
+    """spec §4: behavior rules (versioned) + memory_context retirement.
+    Writes nothing into CLAUDE.md. Does NOT stop the server."""
+    cp = claude_paths()
+    _ensure_behavior_md(cp['BEHAVIOR_MD'])
+    _retire_memory_context(cp['CLAUDE_MD'])
+
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
 
 def cmd_hook_submit(cfg: dict) -> None:
     """spec §4.5: UserPromptSubmit hook — repair → buffer(claude) → search → buffer(user)."""
@@ -860,13 +1430,22 @@ def cmd_hook_submit(cfg: dict) -> None:
     last_claude   = data.get('last_assistant_message') or ''
     cc_session_id = data.get('session_id', '')
 
-    ensure_server(cfg)
+    # spec §4.5: system inputs (e.g. <task-notification>) — no search, no save,
+    # no new turn_id; the reply to it belongs to the current exchange.
+    if user_text.lstrip().startswith(_SYSTEM_PROMPT_PREFIXES):
+        _append_audit({'hook': 'UserPromptSubmit', 'stage': 'skipped',
+                       'reason': 'system_prompt'})
+        _emit(_status_md("_No relevant memories found._"))
+        return
 
-    # Step 1: Repair unindexed records
-    try:
-        _post(cfg, '/repair', {})
-    except Exception as e:
-        logger.warning(f"Repair failed during hook: {e}")
+    server_ok = ensure_server(cfg)
+
+    # Step 1: Repair unindexed records (own server only)
+    if server_ok:
+        try:
+            _post(cfg, '/repair', {})
+        except Exception as e:
+            logger.warning(f"Repair failed during hook: {e}")
 
     # Step 2: Save Claude's previous response
     if last_claude.strip():
@@ -880,7 +1459,7 @@ def cmd_hook_submit(cfg: dict) -> None:
 
     # Step 3: Search memory for current query
     q = user_text[:cfg.get('search_query_max_chars', 2000)]
-    _do_search_and_write(q, cfg, current_session=cc_session_id or None)
+    _do_search(q, cfg, current_session=cc_session_id or None)
 
     # Step 4: Save user message (spec §5: no length filter, no skip patterns)
     if user_text.strip():
@@ -894,7 +1473,9 @@ def cmd_hook_submit(cfg: dict) -> None:
 
 
 def cmd_save_claude_turn(cfg: dict) -> None:
-    """spec §4.5: Stop hook helper — save last_assistant_message via chunking."""
+    """spec §4.5: Stop hook helper — save last_assistant_message via chunking.
+    The turn_id file is NOT cleared (the next UserPromptSubmit overwrites it);
+    a second Stop in the same turn is stopped by the same-turn exact check."""
     raw = sys.stdin.read()
     try:
         data = json.loads(raw)
@@ -911,14 +1492,14 @@ def cmd_save_claude_turn(cfg: dict) -> None:
     cleaned = purify_text(last_claude)
     chunks  = chunk_text(cleaned)
 
-    tid = _read_turn_id(cc_session_id) or str(uuid.uuid4())
+    tid = _read_turn_id(cc_session_id)
+    if not tid:
+        tid = str(uuid.uuid4())
+        _write_turn_id(tid, cc_session_id)
     ensure_server(cfg)
-    try:
-        for chunk in add_chunk_prefixes(chunks, 'claude'):
-            _do_buffer(chunk, cfg, agent_name='claude-code',
-                       session_id=cc_session_id or None, turn_id=tid)
-    finally:
-        _clear_turn_id(cc_session_id)
+    for chunk in add_chunk_prefixes(chunks, 'claude'):
+        _do_buffer(chunk, cfg, agent_name='claude-code',
+                   session_id=cc_session_id or None, turn_id=tid)
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +1508,17 @@ def cmd_save_claude_turn(cfg: dict) -> None:
 
 def run_server(cfg: dict) -> None:
     import uvicorn
+    host = cfg.get('bind_host') or '127.0.0.1'
+    if host != '127.0.0.1':
+        print(
+            f"WARNING: bind_host is {host}. The N3MC API (search, list, "
+            "/shutdown, ...) has no authentication and becomes reachable from "
+            "the network. Keep the default 127.0.0.1 unless you know what you "
+            "are doing.",
+            file=sys.stderr,
+        )
     uvicorn.run(
-        app, host='127.0.0.1', port=cfg.get('server_port', 18520),
+        app, host=host, port=cfg.get('server_port', 18520),
         log_level='error',
     )
 
@@ -939,7 +1529,6 @@ def run_server(cfg: dict) -> None:
 
 def _resolve_hook_command(script_name: str) -> str:
     """Resolve entry-point script path with forward slashes (bash-safe)."""
-    import shutil
     import pathlib
     exe = shutil.which(script_name)
     if exe:
@@ -1003,7 +1592,7 @@ def cmd_init() -> None:
     print(f"Hooks registered in: {settings_path}")
     print(f"  UserPromptSubmit -> {hook_cmd}")
     print(f"  Stop             -> {stop_cmd}")
-    print("Done. Claude Code を再起動すると、次のセッションから会話が自動保存されます。")
+    print("Done. Restart Claude Code: saving will start from the next session.")
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1609,8 @@ def main() -> None:
     grp.add_argument('--repair', action='store_true')
     grp.add_argument('--list',   action='store_true')
     grp.add_argument('--recall-thread', metavar='TURN_ID', dest='recall_thread')
+    grp.add_argument('--show-turn', metavar='TURN_ID', dest='show_turn',
+                     help='Print the full text of one exchange')
     grp.add_argument('--stop',   action='store_true')
     grp.add_argument('--hook-submit',      action='store_true', dest='hook_submit')
     grp.add_argument('--save-claude-turn', action='store_true', dest='save_claude_turn')
@@ -1061,6 +1652,8 @@ def main() -> None:
             args.recall_thread, cfg,
             before=args.before, after=args.after, fmt=args.fmt,
         )
+    elif args.show_turn:
+        cmd_show_turn(args.show_turn, cfg)
     elif args.stop:
         cmd_stop(cfg)
     elif args.hook_submit:
