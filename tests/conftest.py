@@ -15,24 +15,52 @@ _PATH_ATTRS = {
     'NOTICES_FILE':           os.path.join('.memory', 'notices.json'),
     'AUDIT_LOG':              os.path.join('.memory', 'audit.log'),
     'CONFIG_FILE':            'config.json',
+    'SERVER_LOG':             os.path.join('.memory', 'server.log'),
+    'SERVER_START_FAILED_MARKER': os.path.join('.memory', 'server_start_failed'),
+}
+
+# Hook modules write audit.log themselves (spec §7, v1.5.0).
+_HOOK_PATH_ATTRS = {
+    'MEMORY_DIR': '.memory',
+    'AUDIT_LOG':  os.path.join('.memory', 'audit.log'),
 }
 
 
 @pytest.fixture(autouse=True)
 def _isolate_real_data(tmp_path, monkeypatch):
-    """spec §7 (mandatory): never touch the real ~/.n3mc or a real server.
+    """spec §7 (mandatory): never touch the real ~/.n3mc, the real
+    ~/.claude/settings.json or a real server.
 
-    Every data path of the n3memory module points into a temp folder, and
-    HTTP / shutdown helpers are replaced by fakes that never reach the
-    network. Tests that need a server answer monkeypatch these again.
+    Every data path of the n3memory module (and the hook modules' audit.log)
+    points into a temp folder, `--init` writes a temporary settings.json,
+    and HTTP / shutdown / process-start helpers are replaced by fakes that
+    never reach the network. Tests that need a server answer monkeypatch
+    these again. The Host check is relaxed for TestClient ("testserver");
+    TestServerApi restores the real check.
     """
-    from n3memorycore import n3memory
+    from n3memorycore import n3memory, n3mc_hook, n3mc_stop_hook
 
     home = tmp_path / 'n3mc_home'
     (home / '.memory').mkdir(parents=True)
     for attr, rel in _PATH_ATTRS.items():
         if hasattr(n3memory, attr):
             monkeypatch.setattr(n3memory, attr, str(home / rel) if rel else str(home))
+    for mod in (n3mc_hook, n3mc_stop_hook):
+        for attr, rel in _HOOK_PATH_ATTRS.items():
+            if hasattr(mod, attr):
+                monkeypatch.setattr(mod, attr, str(home / rel))
+
+    # --init: a temporary ~/.claude/settings.json (never the real one)
+    user_home = tmp_path / 'user_home'
+    (user_home / '.claude').mkdir(parents=True)
+    if hasattr(n3memory, '_settings_path'):
+        monkeypatch.setattr(n3memory, '_settings_path',
+                            lambda: str(user_home / '.claude' / 'settings.json'))
+
+    def _no_spawn(*args, **kwargs):
+        raise AssertionError('tests must not start a real server process')
+    if hasattr(n3memory, '_spawn_server'):
+        monkeypatch.setattr(n3memory, '_spawn_server', _no_spawn)
 
     def _no_network(*args, **kwargs):
         raise ConnectionRefusedError('network disabled in tests')
@@ -44,6 +72,13 @@ def _isolate_real_data(tmp_path, monkeypatch):
         monkeypatch.setattr(n3memory, '_request_shutdown', lambda *a, **k: False)
     if hasattr(n3memory, '_FOREIGN_SERVER_ROOT'):
         monkeypatch.setattr(n3memory, '_FOREIGN_SERVER_ROOT', None)
+    for attr, val in (('_NO_SERVER_REASON', None), ('_QUICK_CHECK_DONE', False)):
+        if hasattr(n3memory, attr):
+            monkeypatch.setattr(n3memory, attr, val)
+    if hasattr(n3memory, '_check_host'):
+        real = n3memory._check_host
+        monkeypatch.setattr(n3memory, '_host_ok',
+                            lambda host: (host or '').lower() == 'testserver' or real(host))
     yield home
 
 

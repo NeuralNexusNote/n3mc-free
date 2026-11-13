@@ -30,8 +30,7 @@ N3MemoryCoreは、Claude Codeに長期記憶を与える仕組みです。
 - 🔍 **意味で検索** — キーワードが違っても、関連する過去の会話を引き出します。デフォルトで多言語対応（`intfloat/multilingual-e5-base`）— 日本語・英語・中国語・韓国語など約 100 言語に箱出しで対応します。単一言語で高精度を出したい場合は `config.json` で言語特化モデルへ差し替え可能
 - 🔄 **セッションをまたいで記憶** — 翌日開いても、先週の続きから話せます
 - ⚡ **自動で動く** — 保存も検索もすべて自動。ユーザーの指示は不要です
-- 🤖 **マルチエージェント対応** — 複数のAIエージェントが1つの記憶DBを共有。自分の記憶を優先しつつ、他のエージェントの知識も検索できます
-- 🏢 **チーム・組織にも対応** — サーバーをネットワークに配置すれば、チーム全員で記憶を共有できます
+- 🤖 **マルチエージェント対応** — 複数のAIエージェントが1つの記憶DBを共有できます。記録ごとに書いたエージェント（`agent_name`・`local_id`）が残ります。エージェント自身の記憶を優先して並べる機能は Pro 版のものです
 - 🔗 **DB統合が可能** — 同じ指示書から構築したDBは完全互換。引継ぎ時のナレッジ移行や、他の環境で蓄積した記憶の取り込みがシームレスに行える、統合を前提としたDB設計です
 - 💰 **トークン消費を削減** — 過去の文脈を再説明する必要がなくなります。記憶検索はローカルembeddingで行うためClaudeのトークンを消費せず、的確な文脈注入により修正のやり取りも減少します
 
@@ -85,8 +84,8 @@ Claude Codeには標準のauto-memory機能（`~/.claude/projects/.../memory/`�
 
 | ファイル | 内容 |
 |---|---|
-| `N3MemoryCore_v1.4.0_Free_JP.md` | Free版（日本語） |
-| `N3MemoryCore_v1.4.0_Free_EN.md` | Free版（英語） |
+| `N3MemoryCore_v1.5.0_Free_JP.md` | Free版（日本語） |
+| `N3MemoryCore_v1.5.0_Free_EN.md` | Free版（英語） |
 
 > 💡 **指示書内の「注釈」について**
 > 指示書（Markdown）内の各所に、AIの挙動を厳格に制御するための「設計意図」を注釈として記しています。コードを生成する前に、ぜひ一度この注釈に目を通してください。そこには、単なるコード以上の「AIを使いこなすための論理」が詰まっています。
@@ -138,6 +137,9 @@ n3mc --init
 - `~/.n3mc/` を作成（DB・設定・監査ログ・PID ファイルがここに集約）
 - `~/.n3mc/config.json` に `owner_id` / `local_id` を自動生成して書き込み
 - **ユーザーグローバル**の `~/.claude/settings.json` に `UserPromptSubmit` と `Stop` フックを登録（インストール済みの `n3mc-hook` / `n3mc-stop-hook` エントリポイントの絶対パスを指す）。「ユーザーグローバル」が重要 — リポジトリ内に限らず**どのプロジェクトディレクトリ**で起動した Claude Code セッションでもフックが発火する
+- 同じファイルの `permissions.allow` に、記憶のコマンド（`python -m n3memorycore.n3memory --search …`、`--show-turn` など）の許可を足す。どのプロジェクトでも、Claude が確認なしで記憶を検索できる。既存の許可は消さない
+- ほかのプログラムのフックには触れない。同じ PC に登録された別の N3MC（Pro など）のフックも残し、見つけたときは 1 行表示する
+- 変更する前に `settings.json` のバックアップ（`settings.json.bak-n3mc-<日時>`）を取る。JSON として読めないファイルは変更せず、その旨を表示する
 
 このコマンドは冪等です。再実行しても重複登録されません。
 
@@ -146,10 +148,10 @@ n3mc --init
 以下のワンライナーを実行 — `OK` が出力されれば成功:
 
 ```bash
-python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3memorycore.n3mc_hook' in c.get('command','').lower() or 'n3mc-hook' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3memorycore.n3mc_stop_hook' in c.get('command','').lower() or 'n3mc-stop-hook' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; assert 'Bash(python -m n3memorycore.n3memory --search *)' in s.get('permissions',{}).get('allow',[]), 'permission rules missing'; print('OK')"
 ```
 
-`OK` が出力されればフックは正しく登録されています。`AssertionError` が出る場合は `n3mc --init` を再実行してください。
+`OK` が出力されればフックと許可は正しく登録されています。`AssertionError` が出る場合は `n3mc --init` を再実行してください。
 
 #### 4. Claude Code を再起動する
 
@@ -174,7 +176,7 @@ n3mc --list
 ### トラブルシューティング（経路 B）
 
 **`pip install` 後に `n3mc: command not found`**
-Python の `Scripts/`（Windows）または `bin/`（macOS/Linux）ディレクトリが `PATH` に通っていません。`PATH` に追加するか、代替として `python -m n3memorycore.n3memory --init` を使用してください。
+Python の `Scripts/`（Windows）または `bin/`（Linux）ディレクトリが `PATH` に通っていません。`PATH` に追加するか、代替として `python -m n3memorycore.n3memory --init` を使用してください。
 
 **実際に会話したのに `--list` が 0 件**
 `n3mc --init` を実行する**前から**開いていた Claude Code セッションを使っています。完全に閉じて新規セッションを起動してください — フックはセッション起動時に読み込まれます。
@@ -252,7 +254,7 @@ owner_id  (1 つの N3MC サーバ／データ所有者)
 
 - **Claude Code**（必須）
 - **Python 3.10+**
-- **OS**: Windows 11・Ubuntu（動作確認済み） / macOS（対応設計だが未検証）
+- **OS**: Windows 11・Ubuntu（動作確認済み）。macOS は対象外です
 
 > Pythonが入っているか確認するには、ターミナルで `python --version` を実行してください。
 > 未インストールの場合、セットアップ時にClaude Codeが案内します。

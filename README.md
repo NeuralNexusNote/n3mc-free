@@ -30,8 +30,7 @@ N3MemoryCore gives Claude Code long-term memory across sessions.
 - 🔍 **Semantic search** — Finds relevant past conversations even when the exact words differ. Multilingual by default (`intfloat/multilingual-e5-base`) — works for Japanese, English, Chinese, Korean, and ~100 other languages out of the box. Swap to a language-specialised model via `config.json` if you need higher single-language precision.
 - 🔄 **Persistent across sessions** — Pick up tomorrow where you left off today.
 - ⚡ **Works automatically** — Saving and searching happen automatically. No manual steps needed.
-- 🤖 **Multi-agent ready** — Multiple AI agents share one memory DB. Each agent prioritizes its own memories while accessing the team's collective knowledge.
-- 🏢 **Team & organization support** — Deploy the server on your network and share memories across your entire team.
+- 🤖 **Multi-agent ready** — Multiple AI agents can share one memory DB; every record keeps the agent that wrote it (`agent_name`, `local_id`). Ranking each agent's own memories first is a Pro feature.
 - 🔗 **DB merge ready** — Databases built from the same specification are fully compatible. Transfer knowledge when handing off roles, or import memories accumulated in other environments — the DB structure is designed for integration from the ground up.
 - 💰 **Reduces token waste** — No more re-explaining past context. Memory search uses local embeddings (zero Claude tokens), and accurate context injection means fewer corrections and back-and-forth.
 
@@ -86,8 +85,8 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 
 | File | Description |
 |---|---|
-| `N3MemoryCore_v1.4.0_Free_JP.md` | Free edition (Japanese) |
-| `N3MemoryCore_v1.4.0_Free_EN.md` | Free edition (English) |
+| `N3MemoryCore_v1.5.0_Free_JP.md` | Free edition (Japanese) |
+| `N3MemoryCore_v1.5.0_Free_EN.md` | Free edition (English) |
 
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
@@ -139,6 +138,9 @@ This single command does **everything** needed to wire N3MC into Claude Code:
 - Creates `~/.n3mc/` (data lives here — DB, config, audit log, PID file).
 - Writes `~/.n3mc/config.json` with auto-generated `owner_id` / `local_id`.
 - Registers the `UserPromptSubmit` and `Stop` hooks in **your user-global** `~/.claude/settings.json`, pointing to the installed `n3mc-hook` / `n3mc-stop-hook` entry-point scripts. The "user-global" location is essential — it means hooks fire from **any** project directory, not just this repo.
+- Adds the permission rules for the memory commands (`python -m n3memorycore.n3memory --search …`, `--show-turn`, …) to `permissions.allow` in the same file, so Claude can search memory in any project without a confirmation prompt. Existing rules are never removed.
+- Leaves hooks of other programs alone — including another N3MC edition (e.g. Pro) registered on the same PC; `--init` prints a line when it finds one.
+- Backs up `settings.json` (`settings.json.bak-n3mc-<date-time>`) before changing it. If the file is not valid JSON, it changes nothing and tells you.
 
 The command is idempotent: re-running it is safe and won't create duplicates.
 
@@ -147,10 +149,10 @@ The command is idempotent: re-running it is safe and won't create duplicates.
 Run this one-liner — it should print `OK`:
 
 ```bash
-python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3mc' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3mc' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; print('OK')"
+python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3memorycore.n3mc_hook' in c.get('command','').lower() or 'n3mc-hook' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3memorycore.n3mc_stop_hook' in c.get('command','').lower() or 'n3mc-stop-hook' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; assert 'Bash(python -m n3memorycore.n3memory --search *)' in s.get('permissions',{}).get('allow',[]), 'permission rules missing'; print('OK')"
 ```
 
-If you see `OK`, the hooks are registered correctly. If you see an `AssertionError`, re-run `n3mc --init`.
+If you see `OK`, the hooks and permission rules are registered correctly. If you see an `AssertionError`, re-run `n3mc --init`.
 
 #### 4. Restart Claude Code
 
@@ -175,7 +177,7 @@ Override the data location by setting `N3MC_HOME=/path/to/dir` before running `n
 ### Troubleshooting (Path B)
 
 **`n3mc: command not found` after `pip install`**
-Your Python `Scripts/` (Windows) or `bin/` (macOS/Linux) directory is not on `PATH`. Either add it to `PATH`, or invoke as `python -m n3memorycore.n3memory --init` instead.
+Your Python `Scripts/` (Windows) or `bin/` (Linux) directory is not on `PATH`. Either add it to `PATH`, or invoke as `python -m n3memorycore.n3memory --init` instead.
 
 **`--list` shows zero records after a real conversation**
 You opened the Claude Code session **before** running `n3mc --init`. Close it completely and open a new session — hooks are loaded at session start.
@@ -258,7 +260,7 @@ owner_id  (one N3MC server / data owner)
 
 - **Claude Code** (required)
 - **Python 3.10+**
-- **OS**: Windows 11 and Ubuntu (tested) / macOS (designed for, but not yet verified)
+- **OS**: Windows 11 and Ubuntu (tested). macOS is not supported.
 
 > To check if Python is installed, run `python --version` in your terminal.
 > If missing, Claude Code will guide you during setup.

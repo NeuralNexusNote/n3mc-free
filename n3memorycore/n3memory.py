@@ -17,15 +17,17 @@ import logging
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE, claude_paths
 from .paths import TURN_ID_FILE, CONTEXT_FILE, CONTEXT_RETIRED_MARKER
+from .paths import SERVER_LOG, SERVER_START_FAILED_MARKER
 from .core.database import (
     get_connection, init_db, migrate_schema, insert_memory,
     check_exact_duplicate, search_vector, find_unindexed_memories,
@@ -67,6 +69,27 @@ def _norm(path: str) -> str:
     return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
 
 
+def _atomic_write_text(path: str, text: str) -> None:
+    """spec §3.5 (v1.5.0): write a temporary file in the same folder, then
+    os.replace it over the target — an interrupted write never leaves a
+    truncated file."""
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix='.' + os.path.basename(path) + '.')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Audit log + notices (spec §3 "Notices")
 # ---------------------------------------------------------------------------
@@ -98,8 +121,8 @@ def _save_notices(notices: dict) -> None:
             if os.path.exists(NOTICES_FILE):
                 os.remove(NOTICES_FILE)
             return
-        with open(NOTICES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(notices, f, ensure_ascii=False, indent=2)
+        # spec §3 "Notices" (v1.5.0): atomic, like config.json
+        _atomic_write_text(NOTICES_FILE, json.dumps(notices, ensure_ascii=False, indent=2))
     except Exception as e:
         print(f"Warning: notices write failed: {e}", file=sys.stderr)
 
@@ -184,7 +207,26 @@ _DEFAULT_CONFIG: dict = {
 }
 
 
+# spec §3.5 "Allowed values" (v1.5.0): (kind, min, max, min_exclusive)
+# kind 'int' = JSON integer only (2000.0 is rejected); 'num' = int or float.
+_CONFIG_RULES: dict = {
+    'server_port':              ('int', 1, 65535, False),
+    'search_result_limit':      ('int', 1, None, False),
+    'pair_top_n':               ('int', 1, None, False),
+    'pair_max_chars':           ('int', 1, None, False),
+    'search_query_max_chars':   ('int', 1, None, False),
+    'version_min_chars':        ('int', 1, None, False),
+    'half_life_days':           ('num', 0, None, True),
+    'bm25_min_threshold':       ('num', 0, None, False),
+    'min_score':                ('num', 0, 1, False),
+    'vector_min_cos':           ('num', 0, 1, False),
+    'relative_min_score_ratio': ('num', 0, 1, False),
+    'version_sim_threshold':    ('num', 0, 1, False),
+}
+
+
 def _config_value_ok(key: str, value) -> bool:
+    """spec §3.5 (v1.5.0): type and range check of one config.json value."""
     if key not in _DEFAULT_CONFIG:
         return True
     default = _DEFAULT_CONFIG[key]
@@ -192,10 +234,27 @@ def _config_value_ok(key: str, value) -> bool:
         return True
     if isinstance(default, bool):
         return isinstance(value, bool)
-    if isinstance(default, (int, float)):
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
     if isinstance(default, str):
         return isinstance(value, str)
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool):
+            return False                      # booleans are never numbers
+        rule = _CONFIG_RULES.get(key)
+        if rule is None:
+            return isinstance(value, (int, float))
+        kind, lo, hi, lo_exclusive = rule
+        if kind == 'int':
+            if not isinstance(value, int):
+                return False
+        elif not isinstance(value, (int, float)):
+            return False
+        if value != value:                    # NaN
+            return False
+        if lo is not None and (value <= lo if lo_exclusive else value < lo):
+            return False
+        if hi is not None and value > hi:
+            return False
+        return True
     return True
 
 
@@ -229,21 +288,56 @@ def _fill_ids(cfg: dict) -> None:
             cfg[col] = str(uuid.uuid4())
 
 
+def _read_config_file():
+    """Parse config.json. A file that another process has just created may
+    still be empty for a moment (exclusive creation, then write), so a
+    very young file that does not parse is read again briefly."""
+    for attempt in range(20):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("the top level is not a JSON object")
+            return data
+        except Exception:
+            try:
+                young = time.time() - os.path.getmtime(CONFIG_FILE) < 2.0
+            except OSError:
+                young = False
+            if not young or attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
+def _create_config(cfg: dict) -> bool:
+    """spec §3.5 (v1.5.0): create a missing config.json exclusively.
+    False when another process created it first (read that file instead)."""
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    try:
+        f = open(CONFIG_FILE, 'x', encoding='utf-8')
+    except FileExistsError:
+        return False
+    with f:
+        f.write(json.dumps(cfg, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
+    return True
+
+
 def _load_config() -> dict:
-    """spec §3.5 (v1.4.0): never overwrite a config.json the user mistyped."""
+    """spec §3.5: never overwrite a config.json the user mistyped; create a
+    missing one exclusively; update an existing one atomically."""
     os.makedirs(MEMORY_DIR, exist_ok=True)
     cfg = dict(_DEFAULT_CONFIG)
 
     if not os.path.exists(CONFIG_FILE):
         _fill_ids(cfg)
-        _save_config(cfg)
-        return cfg
+        if _create_config(cfg):
+            return cfg
+        cfg = dict(_DEFAULT_CONFIG)   # another process won: use its file
 
     try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("the top level is not a JSON object")
+        data = _read_config_file()
     except Exception as e:
         _notify(
             'config_unreadable',
@@ -263,9 +357,10 @@ def _load_config() -> dict:
     if bad:
         _notify(
             'config_type',
-            "config.json: these items have the wrong type and are ignored "
-            f"(defaults are used): {', '.join(sorted(bad))}. "
-            "Write numbers without quotes, e.g. \"vector_min_cos\": 0.83.",
+            "config.json: these items have the wrong type or are out of range "
+            f"and are ignored (defaults are used): {', '.join(sorted(bad))}. "
+            "Write numbers without quotes, e.g. \"vector_min_cos\": 0.83, and "
+            "counts as whole numbers without a decimal point, e.g. 2000.",
         )
     else:
         _clear_notice('config_type')
@@ -287,9 +382,8 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    """spec §3.5 (v1.5.0): temporary file in the same folder + os.replace."""
+    _atomic_write_text(CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
 def _code_version() -> str:
@@ -325,7 +419,8 @@ def _post(cfg: dict, path: str, payload: dict, timeout: int = 30) -> dict:
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(
         url, data=data,
-        headers={'Content-Type': 'application/json'},
+        headers={'Content-Type': 'application/json',
+                 'Host': f"127.0.0.1:{cfg['server_port']}"},   # spec §3 Host check
         method='POST',
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -335,7 +430,9 @@ def _post(cfg: dict, path: str, payload: dict, timeout: int = 30) -> dict:
 def _get(cfg: dict, path: str, timeout: int = 30) -> dict:
     import urllib.request
     url = f"http://127.0.0.1:{cfg['server_port']}{path}"
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    req = urllib.request.Request(
+        url, headers={'Host': f"127.0.0.1:{cfg['server_port']}"}, method='GET')
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
@@ -490,54 +587,156 @@ _STALE_SERVER_MSG = (
 )
 
 
-def _wait_for_server(cfg: dict, max_wait: int = 60) -> bool:
+def _wait_for_server(cfg: dict, max_wait: int = 60, proc=None) -> bool:
+    """Poll /health every 0.5 s. With `proc`, stop at once when the child
+    process exits (spec §3 "Starting the server", step 2)."""
     deadline = time.time() + max_wait
     while time.time() < deadline:
         if _health_decision(_get_health(cfg)) == 'ok':
             return True
+        if proc is not None and proc.poll() is not None:
+            return False
         time.sleep(0.5)
     return False
 
 
+# Why this command runs without the server (None = it may use the server).
+# _do_buffer then saves directly and _do_search prints the reason.
+_NO_SERVER_REASON: Optional[str] = None
+
+_STILL_STARTING = 'the memory server is still starting'
+_START_FAILED = 'the memory server could not start'
+
+# spec §3 (v1.5.0)
+_START_FAILED_BACKOFF_SECONDS = 300
+_SERVER_LOG_MAX_BYTES = 1024 * 1024
+_PID_FILE_GRACE_SECONDS = 60
+
+
 def _server_answered() -> bool:
-    """spec §3: once our own server responds, clear the server notices."""
+    """spec §3: once our own server responds, clear the server notices and
+    the start-failure marker."""
+    global _NO_SERVER_REASON
+    _NO_SERVER_REASON = None
     _clear_notice('stale_server')
     _clear_notice('port_conflict')
+    _clear_notice('server_start_failed')
+    try:
+        os.remove(SERVER_START_FAILED_MARKER)
+    except OSError:
+        pass
     return True
 
 
+def _start_failed_recently() -> bool:
+    """spec §3 step 4: a start failed less than 5 minutes ago."""
+    if not os.path.exists(SERVER_START_FAILED_MARKER):
+        return False
+    try:
+        with open(SERVER_START_FAILED_MARKER, 'r', encoding='utf-8') as f:
+            t = float(f.read().strip())
+    except Exception:
+        try:
+            t = os.path.getmtime(SERVER_START_FAILED_MARKER)
+        except OSError:
+            return False
+    return time.time() - t < _START_FAILED_BACKOFF_SECONDS
+
+
+def _open_server_log():
+    """spec §3 step 1: stderr of the server -> .memory/server.log (append),
+    truncated first when it is larger than 1 MB."""
+    os.makedirs(os.path.dirname(SERVER_LOG), exist_ok=True)
+    try:
+        if os.path.getsize(SERVER_LOG) > _SERVER_LOG_MAX_BYTES:
+            open(SERVER_LOG, 'wb').close()
+    except OSError:
+        pass
+    return open(SERVER_LOG, 'ab')
+
+
+def _detach_kwargs() -> dict:
+    """spec §3 Clean CLI (v1.5.0): keep the server alive after the hook exits."""
+    if os.name == 'nt':
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP
+                                 | subprocess.CREATE_NO_WINDOW}
+    return {'start_new_session': True}
+
+
+def _spawn_server():
+    log = _open_server_log()
+    try:
+        return subprocess.Popen(
+            [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
+            stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            **_detach_kwargs(),
+        )
+    finally:
+        log.close()   # the child keeps its own handle
+
+
+def _record_start_failure(code) -> None:
+    _notify(
+        'server_start_failed',
+        f"The N3MC memory server could not start (exit code {code}). "
+        f"See {SERVER_LOG} for the reason.",
+    )
+    try:
+        _atomic_write_text(SERVER_START_FAILED_MARKER, str(time.time()))
+    except Exception as e:
+        print(f"Warning: could not write {SERVER_START_FAILED_MARKER}: {e}",
+              file=sys.stderr)
+
+
 def _start_server(cfg: dict) -> bool:
+    """spec §3 "Starting the server (_start_server, v1.5.0)"."""
+    global _NO_SERVER_REASON
+    if _start_failed_recently():
+        _NO_SERVER_REASON = _START_FAILED + f" (see {SERVER_LOG})"
+        return False
     # spec §3: atomic exclusive-create of the PID file prevents two CLIs from
     # launching two servers at the same time.
     try:
         pid_fh = open(PID_FILE, 'x', encoding='utf-8')
     except FileExistsError:
-        # Another process is starting the server right now — wait for it.
+        # Another process is starting the server right now - wait for it.
         if _wait_for_server(cfg, max_wait=60):
             return _server_answered()
-        print("Warning: N3MC server did not start in time.", file=sys.stderr)
+        _NO_SERVER_REASON = _STILL_STARTING
         return False
     try:
-        # spec §3 Clean CLI: stderr/stdout → DEVNULL to silence model load warnings
-        proc = subprocess.Popen(
-            [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
-            stderr=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-        )
+        proc = _spawn_server()
         pid_fh.write(str(proc.pid))
-    except Exception:
+    except Exception as e:
         pid_fh.close()
         try:
             os.remove(PID_FILE)
         except Exception:
             pass
-        raise
-    pid_fh.close()
-    if not _wait_for_server(cfg, max_wait=60):
-        print("Warning: N3MC server did not start in time.", file=sys.stderr)
+        # Never let a failed launch stop the hook: run without the server.
+        print(f"Warning: could not launch the N3MC server: {e}", file=sys.stderr)
+        _NO_SERVER_REASON = _START_FAILED + f" ({e})"
         return False
-    return _server_answered()
+    pid_fh.close()
+    if _wait_for_server(cfg, max_wait=60, proc=proc):
+        return _server_answered()
+    code = proc.poll()
+    if code is not None:
+        # Exited during startup: port held by another program, missing
+        # dependency, DB cannot be opened, ...
+        _record_start_failure(code)
+        try:
+            with open(PID_FILE, 'r', encoding='utf-8') as f:
+                same = f.read().strip() == str(proc.pid)
+            if same:
+                os.remove(PID_FILE)
+        except Exception:
+            pass
+        _NO_SERVER_REASON = _START_FAILED + f" (see {SERVER_LOG})"
+        return False
+    # Still alive after 60 s: the first start downloads the model. Leave it.
+    _NO_SERVER_REASON = _STILL_STARTING
+    return False
 
 
 _LEGACY_FOREIGN_ROOT = '(unknown: the server did not report its folder)'
@@ -553,14 +752,37 @@ def _notify_port_conflict(cfg: dict, root: str) -> None:
     )
 
 
+def _psutil_available() -> bool:
+    try:
+        import psutil  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _pid_file_process_starting(pid: Optional[int]) -> bool:
+    """spec §3 "PID file handling": is the PID-file process this folder's
+    server that is still starting? Without psutil (broken install), every
+    PID-file process counts as starting for 60 s after the file's mtime."""
+    if not _psutil_available():
+        try:
+            age = time.time() - os.path.getmtime(PID_FILE)
+        except OSError:
+            return False
+        return age < _PID_FILE_GRACE_SECONDS
+    return bool(pid) and _process_alive(pid) and _is_own_server_process(pid)
+
+
 def ensure_server(cfg: dict) -> bool:
     """Return True when a server of this folder with the current code answers.
 
     False with _FOREIGN_SERVER_ROOT set: the port belongs to another folder's
-    server (save directly, do not search). False otherwise: start failure.
+    server (save directly, do not search). False with _NO_SERVER_REASON set:
+    no server for this command (still starting / failed to start).
     """
-    global _FOREIGN_SERVER_ROOT
+    global _FOREIGN_SERVER_ROOT, _NO_SERVER_REASON
     _FOREIGN_SERVER_ROOT = None
+    _NO_SERVER_REASON = None
     os.makedirs(MEMORY_DIR, exist_ok=True)
 
     health = _get_health(cfg)
@@ -597,13 +819,14 @@ def ensure_server(cfg: dict) -> bool:
                 pid = int(f.read().strip())
         except Exception:
             pid = None
-        if pid and _process_alive(pid) and _is_own_server_process(pid):
+        if _pid_file_process_starting(pid):
             # This folder's server is starting up: keep the PID file and wait.
             if _wait_for_server(cfg, max_wait=60):
                 return _server_answered()
-            print("Warning: N3MC server did not start in time.", file=sys.stderr)
+            # Still starting after 60 s: no second server, keep the PID file.
+            _NO_SERVER_REASON = _STILL_STARTING
             return False
-        # Dead / reused / unverifiable PID: delete without waiting.
+        # Dead / reused PID: delete without waiting.
         try:
             os.remove(PID_FILE)
         except Exception:
@@ -615,6 +838,25 @@ def ensure_server(cfg: dict) -> bool:
 # ---------------------------------------------------------------------------
 # Direct buffer fallback (no embedding — used when server is down/foreign)
 # ---------------------------------------------------------------------------
+
+def _quick_check_once(conn):
+    """spec §3.5 (v1.5.0): PRAGMA quick_check at most once per process.
+    Returns a fresh connection when the DB was set aside as corrupt."""
+    global _QUICK_CHECK_DONE
+    if _QUICK_CHECK_DONE:
+        return conn
+    _QUICK_CHECK_DONE = True
+    result = conn.execute("PRAGMA quick_check").fetchone()
+    if result and result[0] != 'ok':
+        conn.close()
+        _handle_corrupt_db()
+        conn = get_connection(DB_PATH)
+    return conn
+
+
+# Set once quick_check has run in this process (spec §3.5, v1.5.0).
+_QUICK_CHECK_DONE = False
+
 
 def _buffer_direct(
     content: str,
@@ -632,12 +874,9 @@ def _buffer_direct(
 
     conn = get_connection(DB_PATH)
     try:
-        # spec §3.5: use quick_check in fallback path (lighter than integrity_check)
-        result = conn.execute("PRAGMA quick_check").fetchone()
-        if result and result[0] != 'ok':
-            conn.close()
-            _handle_corrupt_db()
-            conn = get_connection(DB_PATH)
+        # spec §3.5: quick_check in the fallback path (lighter than
+        # integrity_check), once per process
+        conn = _quick_check_once(conn)
         init_db(conn)
         migrate_schema(conn)
         # spec §5.4: exact text only (same turn_id when given) — same rule as /buffer
@@ -660,25 +899,116 @@ def _buffer_direct(
         conn.close()
 
 
-def _handle_corrupt_db() -> None:
-    corrupt = DB_PATH + '.corrupt.bak'
-    # spec §3.5: rename DB and remove WAL sidecar files
-    for path in (DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm'):
-        if os.path.exists(path):
+def _corrupt_backup_path() -> str:
+    """n3memory.db.corrupt-<YYYYmmddHHMMSS>.bak (local time). A second
+    corruption within the same second gets a -<n> suffix before .bak."""
+    stamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    path = f"{DB_PATH}.corrupt-{stamp}.bak"
+    n = 1
+    while any(os.path.exists(path + sfx) for sfx in ('', '-wal', '-shm')):
+        n += 1
+        path = f"{DB_PATH}.corrupt-{stamp}-{n}.bak"
+    return path
+
+
+def _handle_corrupt_db() -> str:
+    """spec §3.5 (v1.5.0): set the DB aside under a timestamped name and
+    MOVE its -wal / -shm next to it (never delete them), then notify."""
+    corrupt = _corrupt_backup_path()
+    for src, dst in ((DB_PATH, corrupt),
+                     (DB_PATH + '-wal', corrupt + '-wal'),
+                     (DB_PATH + '-shm', corrupt + '-shm')):
+        if os.path.exists(src):
             try:
-                if path == DB_PATH:
-                    shutil.move(path, corrupt)
-                else:
-                    os.remove(path)
-            except Exception:
-                pass
+                shutil.move(src, dst)
+            except Exception as e:
+                print(f"Warning: could not move {src} to {dst}: {e}", file=sys.stderr)
     print(
-        f"Warning: DB corruption detected. Renamed to {corrupt}. "
-        "A new empty DB will be created. Recovery: restore a backup of "
-        "n3memory.db (together with its config.json) into "
-        f"{MEMORY_DIR}, or try `sqlite3 {corrupt} .recover` to salvage records.",
+        f"Warning: DB corruption detected. Set aside as {corrupt} (with its "
+        "-wal / -shm). A new empty DB will be created. Recovery: rename the "
+        "sidecars back to <name>-wal / <name>-shm if needed, then "
+        f"`sqlite3 {corrupt} .recover | sqlite3 recovered.db`.",
         file=sys.stderr,
     )
+    _notify(
+        'db_corrupt',
+        f"The memory DB failed its integrity check and was set aside as {corrupt}. "
+        "A new empty DB is in use. To recover records: "
+        f"sqlite3 {corrupt} .recover | sqlite3 recovered.db",
+    )
+    return corrupt
+
+
+# ---------------------------------------------------------------------------
+# Time bounds for --since / --until (spec §3.6, v1.5.0)
+# ---------------------------------------------------------------------------
+
+# None = the machine's local time zone. Tests set a fixed tzinfo.
+_LOCAL_TZ = None
+
+_DATE_ONLY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_DATETIME_RE = re.compile(
+    r'^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)'
+    r'(Z|z|[+-]\d{2}:?\d{2})?$'
+)
+
+
+class TimeBoundError(ValueError):
+    pass
+
+
+def _local_aware(dt: datetime) -> datetime:
+    if _LOCAL_TZ is not None:
+        return dt.replace(tzinfo=_LOCAL_TZ)
+    return dt.astimezone()     # naive → the machine's local time (DST aware)
+
+
+def _parse_time_bound(value: Optional[str], is_until: bool = False,
+                      name: Optional[str] = None) -> Optional[str]:
+    """spec §3.6 (v1.5.0): date or ISO datetime (T or space, optional
+    offset/Z) → UTC string formatted like the stored timestamps.
+    Offset-less values are local time; a date-only until is 23:59:59.999999.
+    Raises TimeBoundError on unreadable input."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    label = name or ('--until' if is_until else '--since')
+    try:
+        if _DATE_ONLY_RE.match(v):
+            d = datetime.strptime(v, '%Y-%m-%d')
+            if is_until:
+                d = d.replace(hour=23, minute=59, second=59, microsecond=999999)
+            dt = _local_aware(d)
+        else:
+            m = _DATETIME_RE.match(v)
+            if not m:
+                raise ValueError(v)
+            date_part, time_part, off = m.groups()
+            text = f"{date_part}T{time_part}"
+            if off:
+                if off in ('Z', 'z'):
+                    off = '+00:00'
+                elif ':' not in off:
+                    off = off[:3] + ':' + off[3:]
+                text += off
+            dt = datetime.fromisoformat(text)
+            dt = _local_aware(dt) if dt.tzinfo is None else dt
+    except Exception:
+        raise TimeBoundError(
+            f"{label}: cannot read '{value}' (use 2026-11-13 or 2026-11-13T09:00)"
+        ) from None
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _parse_time_range(since: Optional[str], until: Optional[str]):
+    """Both bounds; TimeBoundError when unreadable or since > until."""
+    s = _parse_time_bound(since, is_until=False)
+    u = _parse_time_bound(until, is_until=True)
+    if s and u and datetime.fromisoformat(s) > datetime.fromisoformat(u):
+        raise TimeBoundError('--since is later than --until')
+    return s, u
 
 
 # ---------------------------------------------------------------------------
@@ -696,8 +1026,162 @@ def _exit_server_process() -> None:
     os._exit(0)
 
 
+def _check_host(host: Optional[str]) -> bool:
+    """spec §3 (v1.5.0): only Host 127.0.0.1:<port> or localhost:<port>."""
+    port = (_srv_cfg or {}).get('server_port') or _DEFAULT_CONFIG['server_port']
+    h = (host or '').strip().lower()
+    return h in (f'127.0.0.1:{port}', f'localhost:{port}')
+
+
+# Looked up at request time so tests can replace the check (TestClient sends
+# Host: testserver).
+_host_ok = _check_host
+
+# Global server state (populated in lifespan)
+_srv_cfg: dict = {}
+_srv_session: str = ""
+_srv_code_version: str = ""
+
+# spec §3.5 (v1.5.0): one /repair batch per --hook-submit turn
+_HOOK_REPAIR_MAX_RECORDS = 200
+
+
+def _repair_db(max_records: Optional[int] = None) -> int:
+    """Body of /repair. max_records limits the records changed in this call
+    (FTS punctuation cleaning and index repair); None = everything."""
+    from .core.database import (
+        get_connection, find_unindexed_memories, serialize_vector,
+        strip_fts_punctuation,
+    )
+    from .core.processor import embed_passage
+
+    budget = max_records if (isinstance(max_records, int) and max_records > 0) else None
+
+    def left() -> Optional[int]:
+        return None if budget is None else budget - repaired
+
+    conn = get_connection(DB_PATH)
+    repaired = 0
+    try:
+        # spec §3: FTS punct cleaning — one-time migration with marker
+        marker = os.path.join(MEMORY_DIR, 'fts_punct_cleaned')
+        if not os.path.exists(marker):
+            last_rowid = -1
+            cleaned_count = 0
+            finished = False
+            while True:
+                if left() is not None and left() <= 0:
+                    break
+                # Batches of 200 without OFFSET: cleaned rows stay in
+                # memories_fts, so page by rowid (keyset) instead.
+                rows = conn.execute(
+                    "SELECT rowid, content FROM memories_fts WHERE rowid > ? "
+                    "ORDER BY rowid LIMIT 200",
+                    (last_rowid,)
+                ).fetchall()
+                if not rows:
+                    finished = True
+                    break
+                stopped = False
+                for row in rows:
+                    if left() is not None and left() <= 0:
+                        stopped = True
+                        break
+                    last_rowid = row[0]
+                    clean = strip_fts_punctuation(row[1])
+                    if clean != row[1]:
+                        conn.execute(
+                            "UPDATE memories_fts SET content = ? WHERE rowid = ?",
+                            (clean, row[0])
+                        )
+                        cleaned_count += 1
+                        repaired += 1
+                conn.commit()
+                if stopped:
+                    break
+                if len(rows) < 200:
+                    finished = True
+                    break
+            # The marker is written only when the migration has finished.
+            if finished:
+                with open(marker, 'w', encoding='utf-8') as f:
+                    f.write('done')
+            if cleaned_count > 0:
+                print(f"FTS punctuation cleaned: {cleaned_count} record(s).", file=sys.stderr)
+
+        # spec §5: vec_model.txt marker — warn if embed model changed
+        current_model = (_srv_cfg or {}).get('embed_model', 'intfloat/multilingual-e5-base')
+        vec_marker = os.path.join(MEMORY_DIR, 'vec_model.txt')
+        if not os.path.exists(vec_marker):
+            with open(vec_marker, 'w', encoding='utf-8') as f:
+                f.write(current_model)
+        else:
+            with open(vec_marker, 'r', encoding='utf-8') as f:
+                recorded = f.read().strip()
+            if recorded and recorded != current_model:
+                print(
+                    f"Warning: embed_model in config.json ({current_model}) "
+                    f"differs from the model used to build the vector index ({recorded}). "
+                    f"Search quality will degrade until vectors are re-embedded. "
+                    f"To rebuild: delete '{vec_marker}', then run `n3mc --repair`.",
+                    file=sys.stderr,
+                )
+
+        # spec §3.5: batch 200 at a time; OFFSET always 0 (repaired records
+        # disappear from WHERE clause automatically)
+        while True:
+            remaining = left()
+            if remaining is not None and remaining <= 0:
+                break
+            batch = 200 if remaining is None else min(200, remaining)
+            rows = find_unindexed_memories(conn, limit=batch)  # OFFSET=0 always
+            if not rows:
+                break
+            batch_repaired = 0
+            for row in rows:
+                rowid    = row['rowid']
+                content  = row['content']
+                has_vec  = row['vec_rowid'] is not None
+                has_fts  = row['fts_rowid'] is not None
+
+                if not has_vec:
+                    try:
+                        vec = embed_passage(content)
+                        conn.execute(
+                            "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                            (rowid, serialize_vector(vec))
+                        )
+                        batch_repaired += 1
+                    except Exception as e:
+                        logger.warning(f"Repair embed rowid={rowid}: {e}")
+
+                if not has_fts:
+                    stripped = strip_fts_punctuation(content)
+                    conn.execute(
+                        "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+                        (rowid, stripped)
+                    )
+                    batch_repaired += 1
+
+                repaired += 1
+
+            conn.commit()
+            # spec §3.5: exit if no progress (e.g. embed model unavailable)
+            if batch_repaired == 0:
+                break
+            if len(rows) < batch:
+                break
+    finally:
+        conn.close()
+
+    if repaired > 0:
+        print(f"Repaired {repaired} record(s).", file=sys.stderr)
+    return repaired
+
+
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 
     class BufferRequest(BaseModel):
@@ -713,13 +1197,11 @@ try:
         since: Optional[str] = None
         until: Optional[str] = None
 
+    class RepairRequest(BaseModel):
+        max_records: Optional[int] = None
+
     class ShutdownRequest(BaseModel):
         root: str
-
-    # Global server state (populated in lifespan)
-    _srv_cfg: dict = {}
-    _srv_session: str = ""
-    _srv_code_version: str = ""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -755,6 +1237,13 @@ try:
 
     app = FastAPI(lifespan=lifespan)
 
+    @app.middleware('http')
+    async def _host_guard(request: Request, call_next):
+        # spec §3 (v1.5.0): DNS-rebinding guard on every endpoint
+        if not _host_ok(request.headers.get('host')):
+            return JSONResponse({'detail': 'Host not allowed'}, status_code=403)
+        return await call_next(request)
+
     @app.get('/health')
     async def ep_health():
         return {
@@ -771,8 +1260,11 @@ try:
         threading.Timer(0.3, _exit_server_process).start()
         return {'status': 'ok'}
 
+    # spec §3 (v1.5.0): endpoints that embed or touch the DB are plain `def`
+    # (run in the thread pool, /health stays responsive); one SQLite
+    # connection per request.
     @app.post('/buffer')
-    async def ep_buffer(req: BufferRequest):
+    def ep_buffer(req: BufferRequest):
         # Looked up at call time so tests can patch processor.embed_passage.
         from .core.database import (
             get_connection, check_exact_duplicate, insert_memory, count_memories,
@@ -822,125 +1314,25 @@ try:
             conn.close()
 
     @app.post('/search')
-    async def ep_search(req: SearchRequest):
+    def ep_search(req: SearchRequest):
         from .core.processor import hybrid_search
+        try:
+            since, until = _parse_time_range(req.since, req.until)
+        except TimeBoundError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         sess = req.session_id or _srv_session
         return hybrid_search(
             DB_PATH, req.query or '', _srv_cfg, sess,
-            since=req.since, until=req.until,
+            since=since, until=until,
         )
 
     @app.post('/repair')
-    async def ep_repair():
-        from .core.database import (
-            get_connection, find_unindexed_memories, serialize_vector,
-            strip_fts_punctuation,
-        )
-        from .core.processor import embed_passage
-
-        conn = get_connection(DB_PATH)
-        repaired = 0
-        try:
-            # spec §3: FTS punct cleaning — one-time migration with marker
-            marker = os.path.join(MEMORY_DIR, 'fts_punct_cleaned')
-            if not os.path.exists(marker):
-                last_rowid = -1
-                cleaned_count = 0
-                while True:
-                    # Batches of 200 without OFFSET: cleaned rows stay in
-                    # memories_fts, so page by rowid (keyset) instead.
-                    rows = conn.execute(
-                        "SELECT rowid, content FROM memories_fts WHERE rowid > ? "
-                        "ORDER BY rowid LIMIT 200",
-                        (last_rowid,)
-                    ).fetchall()
-                    if not rows:
-                        break
-                    last_rowid = rows[-1][0]
-                    for row in rows:
-                        clean = strip_fts_punctuation(row[1])
-                        if clean != row[1]:
-                            conn.execute(
-                                "UPDATE memories_fts SET content = ? WHERE rowid = ?",
-                                (clean, row[0])
-                            )
-                            cleaned_count += 1
-                    conn.commit()
-                    if len(rows) < 200:
-                        break
-                with open(marker, 'w', encoding='utf-8') as f:
-                    f.write('done')
-                if cleaned_count > 0:
-                    print(f"FTS punctuation cleaned: {cleaned_count} record(s).", file=sys.stderr)
-
-            # spec §5: vec_model.txt marker — warn if embed model changed
-            current_model = (_srv_cfg or {}).get('embed_model', 'intfloat/multilingual-e5-base')
-            vec_marker = os.path.join(MEMORY_DIR, 'vec_model.txt')
-            if not os.path.exists(vec_marker):
-                with open(vec_marker, 'w', encoding='utf-8') as f:
-                    f.write(current_model)
-            else:
-                with open(vec_marker, 'r', encoding='utf-8') as f:
-                    recorded = f.read().strip()
-                if recorded and recorded != current_model:
-                    print(
-                        f"Warning: embed_model in config.json ({current_model}) "
-                        f"differs from the model used to build the vector index ({recorded}). "
-                        f"Search quality will degrade until vectors are re-embedded. "
-                        f"To rebuild: delete '{vec_marker}', then run `n3mc --repair`.",
-                        file=sys.stderr,
-                    )
-
-            # spec §3.5: batch 200 at a time; OFFSET always 0 (repaired records
-            # disappear from WHERE clause automatically)
-            while True:
-                rows = find_unindexed_memories(conn, limit=200)  # OFFSET=0 always
-                if not rows:
-                    break
-                batch_repaired = 0
-                for row in rows:
-                    rowid    = row['rowid']
-                    content  = row['content']
-                    has_vec  = row['vec_rowid'] is not None
-                    has_fts  = row['fts_rowid'] is not None
-
-                    if not has_vec:
-                        try:
-                            vec = embed_passage(content)
-                            conn.execute(
-                                "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                                (rowid, serialize_vector(vec))
-                            )
-                            batch_repaired += 1
-                        except Exception as e:
-                            logger.warning(f"Repair embed rowid={rowid}: {e}")
-
-                    if not has_fts:
-                        stripped = strip_fts_punctuation(content)
-                        conn.execute(
-                            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
-                            (rowid, stripped)
-                        )
-                        batch_repaired += 1
-
-                    repaired += 1
-
-                conn.commit()
-                # spec §3.5: exit if no progress (e.g. embed model unavailable)
-                if batch_repaired == 0:
-                    break
-                if len(rows) < 200:
-                    break
-
-        finally:
-            conn.close()
-
-        if repaired > 0:
-            print(f"Repaired {repaired} record(s).", file=sys.stderr)
-        return {'status': 'ok', 'count': repaired}
+    def ep_repair(req: Optional[RepairRequest] = None):
+        max_records = req.max_records if req is not None else None
+        return {'status': 'ok', 'count': _repair_db(max_records)}
 
     @app.get('/list')
-    async def ep_list():
+    def ep_list():
         from .core.database import get_connection, get_all_memories
         conn = get_connection(DB_PATH)
         try:
@@ -1027,15 +1419,6 @@ def _extract_text(prompt) -> str:
     return str(prompt) if prompt else ''
 
 
-def _normalize_timestamp(date_str: str, end_of_day: bool = False) -> str:
-    if not date_str:
-        return date_str
-    if 'T' in date_str or ' ' in date_str:
-        return date_str
-    suffix = 'T23:59:59' if end_of_day else 'T00:00:00'
-    return date_str + suffix
-
-
 def _do_buffer(
     text: str, cfg: dict,
     agent_name: Optional[str] = None,
@@ -1050,8 +1433,10 @@ def _do_buffer(
             # spec §5.4: fatal failure warning (DB write failed)
             print(f"{_FATAL_SAVE_MSG} ({e2})", file=sys.stderr)
 
-    # spec §3: another folder's server owns the port → never write to its DB
-    if _FOREIGN_SERVER_ROOT is not None:
+    # spec §3: another folder's server owns the port → never write to its DB.
+    # No server for this command (still starting / failed to start): save
+    # directly (spec §3 "PID file handling", "Starting the server").
+    if _FOREIGN_SERVER_ROOT is not None or _NO_SERVER_REASON is not None:
         _direct()
         return
 
@@ -1090,6 +1475,10 @@ def _do_search(
             "_(memory search unavailable: another N3MC folder's server is "
             f"using port {cfg.get('server_port')})_"
         ))
+        return
+
+    if _NO_SERVER_REASON is not None:
+        _emit(_status_md(f"_(memory search unavailable: {_NO_SERVER_REASON})_"))
         return
 
     payload: dict = {'query': query}
@@ -1145,8 +1534,11 @@ def cmd_repair(cfg: dict) -> None:
             file=sys.stderr,
         )
         return
+    if _NO_SERVER_REASON is not None:
+        print(f"N3MC: --repair skipped: {_NO_SERVER_REASON}.", file=sys.stderr)
+        return
     try:
-        result = _post(cfg, '/repair', {})
+        result = _post(cfg, '/repair', {})   # no limit: process everything
         count = result.get('count', 0)
         if count > 0:
             print(f"Repaired {count} record(s).", file=sys.stderr)
@@ -1324,8 +1716,17 @@ def _backup(path: str) -> str:
     return dst
 
 
+def _behavior_notice_key(path: str) -> str:
+    """spec §4 (v1.5.0): behavior_md_edited:<first 12 hex of sha256(abs path)>."""
+    h = hashlib.sha256(os.path.abspath(path).encode('utf-8')).hexdigest()[:12]
+    return f'behavior_md_edited:{h}'
+
+
 def _ensure_behavior_md(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    key = _behavior_notice_key(path)
+    # v1.4.0 used one key without the path; v1.5.0 never emits it.
+    _clear_notice('behavior_md_edited')
     if not os.path.exists(path):
         with open(path, 'w', encoding='utf-8') as f:
             f.write(_BEHAVIOR_MD_CONTENT)
@@ -1334,17 +1735,19 @@ def _ensure_behavior_md(path: str) -> None:
         text = f.read()
     first_line = text.lstrip('﻿').splitlines()[0].strip() if text else ''
     if first_line == _BEHAVIOR_MD_MARKER:
+        # The user merged the template (or it is ours): nothing to report.
+        _clear_notice(key)
         return
     if _behavior_md_hash(text) in _KNOWN_BEHAVIOR_MD_HASHES:
         _backup(path)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(_BEHAVIOR_MD_CONTENT)
-        _clear_notice('behavior_md_edited')
+        _clear_notice(key)
         return
     _notify(
-        'behavior_md_edited',
-        "The rules file has been edited by hand, so it was not updated. "
-        "Merge manually if needed.",
+        key,
+        f"The rules file {os.path.abspath(path)} has been edited by hand, so it "
+        "was not updated. Merge the new template manually if needed.",
     )
 
 
@@ -1357,10 +1760,29 @@ _N3MC_COMMENT_PREFIXES = (
 )
 
 
+def _cmp_path(path: str) -> str:
+    """Normalize for comparison: forward and back slashes compare equal."""
+    p = path.replace('\\', '/')
+    return os.path.normcase(os.path.normpath(p))
+
+
+def _is_own_context_import(line: str) -> bool:
+    """spec §4 (v1.5.0): the @ line names this installation's own
+    CONTEXT_FILE by an absolute path."""
+    body = line.rstrip('\r\n')
+    if not _MEMORY_CONTEXT_IMPORT_RE.match(body):
+        return False
+    target = body.strip()[1:].strip()
+    target = os.path.expanduser(target)
+    if not os.path.isabs(target):
+        return False
+    return _cmp_path(target) == _cmp_path(CONTEXT_FILE)
+
+
 def _retire_memory_context(claude_md: str) -> None:
-    """spec §4 (v1.4.0): remove the legacy @…memory_context.md import from
-    <cwd>/.claude/CLAUDE.md (backup first, keep LF/CRLF) and delete the
-    leftover global memory_context.md once."""
+    """spec §4 (v1.5.0): remove the legacy @import of THIS installation's
+    memory_context.md from <cwd>/.claude/CLAUDE.md (backup first, keep
+    LF/CRLF) and delete the leftover global memory_context.md once."""
     if os.path.exists(claude_md):
         try:
             with open(claude_md, 'rb') as f:
@@ -1373,7 +1795,7 @@ def _retire_memory_context(claude_md: str) -> None:
             lines = text.splitlines(keepends=True)
             drop = set()
             for i, line in enumerate(lines):
-                if not _MEMORY_CONTEXT_IMPORT_RE.match(line.rstrip('\r\n')):
+                if not _is_own_context_import(line):
                     continue
                 drop.add(i)
                 # The N3MC comment lines just before it (blank lines between
@@ -1406,17 +1828,147 @@ def _retire_memory_context(claude_md: str) -> None:
             print(f"Warning: could not retire memory_context.md: {e}", file=sys.stderr)
 
 
+# spec §4 --stop housekeeping (v1.5.0)
+_TURN_ID_MAX_AGE_SECONDS = 30 * 86400
+_AUDIT_LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _housekeeping() -> None:
+    """Delete turn_id_*.txt older than 30 days; rotate audit.log > 50 MB."""
+    import glob
+    now = time.time()
+    for path in glob.glob(os.path.join(MEMORY_DIR, 'turn_id_*.txt')):
+        try:
+            if now - os.path.getmtime(path) > _TURN_ID_MAX_AGE_SECONDS:
+                os.remove(path)
+        except OSError as e:
+            print(f"Warning: could not remove {path}: {e}", file=sys.stderr)
+    try:
+        if os.path.getsize(AUDIT_LOG) > _AUDIT_LOG_MAX_BYTES:
+            os.replace(AUDIT_LOG, AUDIT_LOG + '.1')
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"Warning: could not rotate {AUDIT_LOG}: {e}", file=sys.stderr)
+
+
 def cmd_stop(cfg: dict) -> None:
-    """spec §4: behavior rules (versioned) + memory_context retirement.
-    Writes nothing into CLAUDE.md. Does NOT stop the server."""
+    """spec §4: behavior rules (versioned) + memory_context retirement +
+    housekeeping. Writes nothing into CLAUDE.md. Does NOT stop the server.
+    Never prints the physical-save warning (it does not write to the DB);
+    each failing step prints one line to stderr."""
     cp = claude_paths()
-    _ensure_behavior_md(cp['BEHAVIOR_MD'])
-    _retire_memory_context(cp['CLAUDE_MD'])
+    steps = (
+        ('rules file', lambda: _ensure_behavior_md(cp['BEHAVIOR_MD'])),
+        ('memory_context cleanup', lambda: _retire_memory_context(cp['CLAUDE_MD'])),
+        ('housekeeping', _housekeeping),
+    )
+    for name, fn in steps:
+        try:
+            fn()
+        except Exception as e:
+            print(f"Warning: --stop {name} failed: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
+
+_TRANSCRIPT_TAIL_BYTES = 5 * 1024 * 1024
+# spec §4.5 D3 step 2: user-line texts that are not a real prompt.
+_NON_PROMPT_PREFIXES = ('[Request interrupted by user', '<command-', '<local-command-')
+
+
+class TranscriptUnreadable(Exception):
+    pass
+
+
+def _content_texts(content) -> Optional[list]:
+    """Text parts of message.content: [str] for a string, the type=="text"
+    parts for a list, None for anything else."""
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [p.get('text', '') for p in content
+                if isinstance(p, dict) and p.get('type') == 'text'
+                and isinstance(p.get('text', ''), str)]
+    return None
+
+
+def _read_previous_response(transcript_path, current_prompt: str) -> str:
+    """spec §4.5 (decision D3, v1.5.0): the last assistant reply that
+    precedes the current prompt, read from the session's JSONL transcript.
+
+    Raises TranscriptUnreadable on any failure (the caller logs it)."""
+    if not transcript_path or not isinstance(transcript_path, str):
+        raise TranscriptUnreadable('no transcript_path')
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, 'rb') as f:
+            start = max(0, size - _TRANSCRIPT_TAIL_BYTES)
+            f.seek(start)
+            data = f.read()
+    except Exception as e:
+        raise TranscriptUnreadable(f'{type(e).__name__}: {e}') from None
+    text = data.decode('utf-8', errors='replace')
+    lines = text.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]          # first line may be cut by the seek
+
+    current = (current_prompt or '').strip()
+    parsed_any = False
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        parsed_any = True
+        if not isinstance(obj, dict) or obj.get('isSidechain') is True:
+            continue
+        typ = obj.get('type')
+        if typ not in ('user', 'assistant'):
+            continue
+        msg = obj.get('message')
+        content = msg.get('content') if isinstance(msg, dict) else None
+        if typ == 'user':
+            if obj.get('isMeta') is True:
+                continue           # meta line, not a prompt
+            parts = _content_texts(content)
+            is_prompt = isinstance(content, str) or bool(
+                isinstance(content, list) and any(
+                    isinstance(p, dict) and p.get('type') == 'text' for p in content))
+            if not is_prompt:
+                continue           # tool_result-only line: same reply
+            first = (parts[0] if parts else '').lstrip()
+            if first.startswith(_NON_PROMPT_PREFIXES) or \
+                    first.startswith(tuple(_SYSTEM_PROMPT_PREFIXES)):
+                continue           # interruption marker / slash command / system input
+            joined = '\n\n'.join(parts or []).strip()
+            if joined == current or ' '.join(parts or []).strip() == current:
+                continue           # the current prompt itself
+            break                  # the previous real user prompt: no response
+        # assistant: the LAST non-empty text part of the newest assistant line
+        # that has one — the same block Stop receives as last_assistant_message.
+        parts = _content_texts(content) if isinstance(content, list) else None
+        texts = [p for p in (parts or []) if p and p.strip()]
+        if texts:
+            return texts[-1]
+    if not parsed_any and any(l.strip() for l in lines):
+        raise TranscriptUnreadable('no JSON lines')
+    return ''
+
+
+def _save_claude_text(text: str, cfg: dict, session_id: Optional[str],
+                      turn_id: Optional[str]) -> None:
+    """purify the whole text, then chunk and save as [claude] / [claude i/N]."""
+    cleaned = purify_text(text)
+    for chunk in add_chunk_prefixes(chunk_text(cleaned), 'claude'):
+        _do_buffer(chunk, cfg, agent_name='claude-code',
+                   session_id=session_id, turn_id=turn_id)
+
 
 def cmd_hook_submit(cfg: dict) -> None:
     """spec §4.5: UserPromptSubmit hook — repair → buffer(claude) → search → buffer(user)."""
@@ -1425,10 +1977,13 @@ def cmd_hook_submit(cfg: dict) -> None:
         data = json.loads(raw)
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
 
-    user_text     = _extract_text(data.get('message') or data.get('prompt') or '')
-    last_claude   = data.get('last_assistant_message') or ''
-    cc_session_id = data.get('session_id', '')
+    user_text     = _extract_text(data.get('prompt') or data.get('message') or '')
+    cc_session_id = data.get('session_id', '') or ''
+    if not isinstance(cc_session_id, str):
+        cc_session_id = str(cc_session_id)
 
     # spec §4.5: system inputs (e.g. <task-notification>) — no search, no save,
     # no new turn_id; the reply to it belongs to the current exchange.
@@ -1438,36 +1993,45 @@ def cmd_hook_submit(cfg: dict) -> None:
         _emit(_status_md("_No relevant memories found._"))
         return
 
+    # Previous Claude response: a supplied last_assistant_message wins;
+    # otherwise read it from the transcript (decision D3).
+    last_claude = data.get('last_assistant_message')
+    if not isinstance(last_claude, str) or not last_claude.strip():
+        last_claude = ''
+        try:
+            last_claude = _read_previous_response(data.get('transcript_path'), user_text)
+        except TranscriptUnreadable as e:
+            _append_audit({'hook': 'UserPromptSubmit', 'stage': 'transcript_unreadable',
+                           'reason': str(e)[:200]})
+        except Exception as e:     # never let the transcript fail the hook
+            _append_audit({'hook': 'UserPromptSubmit', 'stage': 'transcript_unreadable',
+                           'reason': f'{type(e).__name__}: {e}'[:200]})
+
     server_ok = ensure_server(cfg)
 
-    # Step 1: Repair unindexed records (own server only)
+    # Step 1: Repair unindexed records (own server only; one batch per turn)
     if server_ok:
         try:
-            _post(cfg, '/repair', {})
+            _post(cfg, '/repair', {'max_records': _HOOK_REPAIR_MAX_RECORDS})
         except Exception as e:
             logger.warning(f"Repair failed during hook: {e}")
 
-    # Step 2: Save Claude's previous response
+    # Step 2: Save Claude's previous response under the previous turn_id
     if last_claude.strip():
-        from .core.processor import chunk_text, add_chunk_prefixes, purify_text
-        cleaned  = purify_text(last_claude)
-        chunks   = chunk_text(cleaned)
         prev_tid = _read_turn_id(cc_session_id)
-        for chunk in add_chunk_prefixes(chunks, 'claude'):
-            _do_buffer(chunk, cfg, agent_name='claude-code',
-                       session_id=cc_session_id or None, turn_id=prev_tid)
+        _save_claude_text(last_claude, cfg, cc_session_id or None, prev_tid)
 
     # Step 3: Search memory for current query
     q = user_text[:cfg.get('search_query_max_chars', 2000)]
     _do_search(q, cfg, current_session=cc_session_id or None)
 
-    # Step 4: Save user message (spec §5: no length filter, no skip patterns)
+    # Step 4: a new turn_id for every typed prompt (also image-only, v1.5.0);
+    # save the user message (purified as a whole, then chunked).
+    new_tid = str(uuid.uuid4())
+    _write_turn_id(new_tid, cc_session_id)
     if user_text.strip():
-        from .core.processor import chunk_text, add_chunk_prefixes
-        new_tid = str(uuid.uuid4())
-        _write_turn_id(new_tid, cc_session_id)
-        chunks = chunk_text(user_text)
-        for chunk in add_chunk_prefixes(chunks, 'user'):
+        cleaned = purify_text(user_text)
+        for chunk in add_chunk_prefixes(chunk_text(cleaned), 'user'):
             _do_buffer(chunk, cfg, agent_name='claude-code',
                        session_id=cc_session_id or None, turn_id=new_tid)
 
@@ -1481,25 +2045,21 @@ def cmd_save_claude_turn(cfg: dict) -> None:
         data = json.loads(raw)
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
 
     last_claude   = data.get('last_assistant_message') or ''
-    cc_session_id = data.get('session_id', '')
+    cc_session_id = data.get('session_id', '') or ''
 
-    if not last_claude.strip():
+    if not isinstance(last_claude, str) or not last_claude.strip():
         return
-
-    from .core.processor import chunk_text, add_chunk_prefixes, purify_text
-    cleaned = purify_text(last_claude)
-    chunks  = chunk_text(cleaned)
 
     tid = _read_turn_id(cc_session_id)
     if not tid:
         tid = str(uuid.uuid4())
         _write_turn_id(tid, cc_session_id)
     ensure_server(cfg)
-    for chunk in add_chunk_prefixes(chunks, 'claude'):
-        _do_buffer(chunk, cfg, agent_name='claude-code',
-                   session_id=cc_session_id or None, turn_id=tid)
+    _save_claude_text(last_claude, cfg, cc_session_id or None, tid)
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +2087,70 @@ def run_server(cfg: dict) -> None:
 # n3mc --init  —  register hooks in ~/.claude/settings.json
 # ---------------------------------------------------------------------------
 
+_HOOK_EVENTS = {  # event -> (entry-point name, module name)
+    'UserPromptSubmit': ('n3mc-hook',      'n3memorycore.n3mc_hook'),
+    'Stop':             ('n3mc-stop-hook', 'n3memorycore.n3mc_stop_hook'),
+}
+
+# spec §4 ② (v1.5.0): rules `--init` adds to permissions.allow
+PERMISSION_RULES = (
+    "Bash(python -m n3memorycore.n3memory --search *)",
+    "Bash(python -m n3memorycore.n3memory --buffer *)",
+    "Bash(python -m n3memorycore.n3memory --list*)",
+    "Bash(python -m n3memorycore.n3memory --repair*)",
+    "Bash(python -m n3memorycore.n3memory --stop*)",
+    "Bash(python -m n3memorycore.n3memory --show-turn *)",
+    "Bash(python -m n3memorycore.n3memory --recall-thread *)",
+    "Bash(n3mc --search *)",
+    "Bash(n3mc --buffer *)",
+    "Bash(n3mc --list*)",
+    "Bash(n3mc --repair*)",
+    "Bash(n3mc --stop*)",
+    "Bash(n3mc --show-turn *)",
+    "Bash(n3mc --recall-thread *)",
+)
+
+_OTHER_N3MC_MARKERS = ('n3mc_hook', 'n3mc-hook', 'n3mc_stop_hook', 'n3mc-stop-hook')
+
+
+def _hook_tokens(command: str) -> list:
+    import shlex
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def is_own_hook(command: str, event: str) -> bool:
+    """spec §4 ① Path B (decision D1): True only for a hook command that runs
+    THIS package's hook — (a) the entry point n3mc-hook / n3mc-stop-hook
+    (.exe ignored, any folder), (b) `-m n3memorycore.n3mc_hook`, or (c)
+    n3mc_hook.py / n3mc_stop_hook.py inside this package's folder."""
+    if event not in _HOOK_EVENTS or not isinstance(command, str):
+        return False
+    exe_name, module = _HOOK_EVENTS[event]
+    toks = _hook_tokens(command)
+    if not toks:
+        return False
+    first = toks[0].replace('\\', '/').rsplit('/', 1)[-1].lower()
+    if first.endswith('.exe'):
+        first = first[:-4]
+    if first == exe_name:
+        return True
+    for i, t in enumerate(toks[:-1]):
+        if t == '-m' and toks[i + 1] == module:
+            return True
+    script = module.split('.')[-1] + '.py'
+    pkg_dir = os.path.normcase(os.path.abspath(_PKG_DIR))
+    for t in toks[1:]:
+        tt = os.path.expanduser(t)
+        if os.path.basename(tt.replace('\\', '/')).lower() == script:
+            d = os.path.normcase(os.path.abspath(os.path.dirname(tt)))
+            if d == pkg_dir:
+                return True
+    return False
+
+
 def _resolve_hook_command(script_name: str) -> str:
     """Resolve entry-point script path with forward slashes (bash-safe)."""
     import pathlib
@@ -1541,8 +2165,51 @@ def _resolve_hook_command(script_name: str) -> str:
     return f'"{py}" -m {module}'
 
 
-def cmd_init() -> None:
-    """Set up ~/.n3mc/ and register hooks in ~/.claude/settings.json."""
+def _settings_path() -> str:
+    return os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+
+
+def _merge_settings(settings: dict) -> list:
+    """Merge our hooks and the permission rules into `settings` (in place).
+    Returns the report lines about other N3MC hooks that were left alone."""
+    report = []
+    hooks = settings.setdefault('hooks', {})
+    for event, (exe_name, _module) in _HOOK_EVENTS.items():
+        kept = []
+        entries = hooks.get(event, [])
+        if not isinstance(entries, list):
+            raise ValueError(f'hooks.{event} is not a list')
+        for entry in entries:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            inner_all = entry.get('hooks', [])
+            if not isinstance(inner_all, list):
+                kept.append(entry)
+                continue
+            inner = [h for h in inner_all
+                     if not (isinstance(h, dict) and is_own_hook(h.get('command', ''), event))]
+            for h in inner:
+                c = h.get('command', '') if isinstance(h, dict) else ''
+                if isinstance(c, str) and any(m in c for m in _OTHER_N3MC_MARKERS):
+                    report.append(f"Another N3MC hook is registered for {event} "
+                                  f"and was left in place: {c}")
+            if inner:
+                kept.append({**entry, 'hooks': inner})
+        kept.append({'hooks': [{'type': 'command',
+                                'command': _resolve_hook_command(exe_name)}]})
+        hooks[event] = kept
+
+    allow = settings.setdefault('permissions', {}).setdefault('allow', [])
+    for rule in PERMISSION_RULES:
+        if rule not in allow:
+            allow.append(rule)
+    return report
+
+
+def cmd_init() -> int:
+    """Set up ~/.n3mc/ and register hooks + permission rules in
+    ~/.claude/settings.json (spec §4 ①②, v1.5.0). Returns the exit status."""
     os.makedirs(MEMORY_DIR, exist_ok=True)
     print(f"Data directory: {HOME_DIR}")
 
@@ -1551,48 +2218,59 @@ def cmd_init() -> None:
     print(f"  owner_id = {cfg['owner_id']}")
     print(f"  port     = {cfg['server_port']}")
 
-    settings_path = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
-    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    settings_path = _settings_path()
 
+    # 1. Read. An unreadable file is never touched.
+    raw = None
     if os.path.exists(settings_path):
-        with open(settings_path, 'r', encoding='utf-8') as f:
-            settings = json.load(f)
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                raw = f.read()
+            settings = json.loads(raw)
+        except Exception as e:
+            print(f"{settings_path} is not valid JSON ({e}). Nothing was changed. "
+                  "Fix the file, then run n3mc --init again.", file=sys.stderr)
+            return 1
+        perms = settings.get('permissions', {}) if isinstance(settings, dict) else None
+        if (not isinstance(settings, dict)
+                or not isinstance(settings.get('hooks', {}), dict)
+                or not isinstance(perms, dict)
+                or not isinstance(perms.get('allow', []), list)):
+            print(f"{settings_path} has an unexpected structure. Nothing was changed.",
+                  file=sys.stderr)
+            return 1
+        before = json.loads(raw)
     else:
-        settings = {}
+        settings, before = {}, None
 
-    hooks = settings.setdefault('hooks', {})
-    hook_cmd = _resolve_hook_command('n3mc-hook')
-    stop_cmd = _resolve_hook_command('n3mc-stop-hook')
+    # 2-3. Merge hooks and permission rules.
+    try:
+        report = _merge_settings(settings)
+    except ValueError as e:
+        print(f"{settings_path} has an unexpected structure ({e}). "
+              "Nothing was changed.", file=sys.stderr)
+        return 1
+    for line in report:
+        print(line)
 
-    def _replace_hook(event: str, markers: tuple, command: str) -> None:
-        # spec §4: markers cover both hyphen (exe) and underscore (module) forms
-        existing = hooks.get(event, [])
-        new_entries = []
-        for entry in existing:
-            inner = entry.get('hooks', [])
-            keep = [
-                h for h in inner
-                if not any(m in h.get('command', '') for m in markers)
-            ]
-            if keep:
-                new_entry = dict(entry)
-                new_entry['hooks'] = keep
-                new_entries.append(new_entry)
-        new_entries.append({
-            'hooks': [{'type': 'command', 'command': command}],
-        })
-        hooks[event] = new_entries
-
-    _replace_hook('UserPromptSubmit', ('n3mc-hook', 'n3mc_hook'),           hook_cmd)
-    _replace_hook('Stop',             ('n3mc-stop-hook', 'n3mc_stop_hook'), stop_cmd)
-
-    with open(settings_path, 'w', encoding='utf-8') as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
-
-    print(f"Hooks registered in: {settings_path}")
-    print(f"  UserPromptSubmit -> {hook_cmd}")
-    print(f"  Stop             -> {stop_cmd}")
+    # 4. Write only when something changed: back up, then replace atomically.
+    if settings != before:
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        if raw is not None:
+            stamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            bak = os.path.join(os.path.dirname(settings_path),
+                               f'settings.json.bak-n3mc-{stamp}')
+            shutil.copy2(settings_path, bak)
+            print(f"Backup: {bak}")
+        _atomic_write_text(settings_path,
+                           json.dumps(settings, indent=2, ensure_ascii=False) + '\n')
+        print(f"Hooks and permission rules registered in: {settings_path}")
+    else:
+        print(f"Already registered (no change): {settings_path}")
+    for event, (exe_name, _m) in _HOOK_EVENTS.items():
+        print(f"  {event:<16} -> {_resolve_hook_command(exe_name)}")
     print("Done. Restart Claude Code: saving will start from the next session.")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1617,8 +2295,10 @@ def main() -> None:
     grp.add_argument('--run-server',       action='store_true', dest='run_server')
 
     parser.add_argument('--agent-id', dest='agent_id', default=None)
-    parser.add_argument('--since', default=None, help='Filter from date (YYYY-MM-DD or ISO)')
-    parser.add_argument('--until', default=None, help='Filter until date (YYYY-MM-DD or ISO)')
+    parser.add_argument('--since', default=None,
+                        help='Filter from (2026-11-13 or 2026-11-13T09:00; local time unless an offset is given)')
+    parser.add_argument('--until', default=None,
+                        help='Filter until (a date means the end of that day)')
     parser.add_argument('--before', type=int, default=2, help='Turns before target (default 2)')
     parser.add_argument('--after',  type=int, default=2, help='Turns after target (default 2)')
     parser.add_argument('--format', dest='fmt', default='tsv',
@@ -1627,13 +2307,16 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.init:
-        cmd_init()
-        return
+        sys.exit(cmd_init())
+
+    # spec §3.6 (v1.5.0): unreadable bounds → one stderr line, exit status 2
+    try:
+        since, until = _parse_time_range(args.since, args.until)
+    except TimeBoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
 
     cfg = _load_config()
-
-    since = _normalize_timestamp(args.since) if args.since else None
-    until = _normalize_timestamp(args.until, end_of_day=True) if args.until else None
 
     if args.run_server:
         run_server(cfg)

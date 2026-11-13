@@ -47,23 +47,57 @@ def sanitize_surrogates(text):
 
 DEFAULT_EMBED_MODEL = 'intfloat/multilingual-e5-base'
 
+# spec §3 (v1.5.0): after a failed load, do not try again for this many seconds.
+MODEL_RETRY_SECONDS = 60
+
 _model = None
 _model_name = None
+_configured_model = None       # embed_model from config.json (set by the server)
+_model_failed_at: Optional[float] = None
+_model_failed_error: Optional[str] = None
+
+
+def _load_model(name: str):
+    """Load a sentence-transformers model (separate so tests can replace it)."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(name)
 
 
 def get_model(name: Optional[str] = None):
-    """Lazy-load and cache the sentence-transformers embedding model.
+    """Lazy-load and cache the embedding model.
 
-    Priority: name arg → $N3MC_EMBED_MODEL → DEFAULT_EMBED_MODEL.
+    The model is `embed_model` from config.json (passed by the server at
+    startup); there is no environment-variable override (v1.5.0). After a
+    failed load, raise at once for MODEL_RETRY_SECONDS instead of retrying
+    on every save and search.
     """
-    global _model, _model_name
+    global _model, _model_name, _configured_model, _model_failed_at, _model_failed_error
+    import time
+    if name:
+        _configured_model = name
     if name is None and _model is not None:
         return _model
-    target = name or os.environ.get('N3MC_EMBED_MODEL') or DEFAULT_EMBED_MODEL
-    if _model is None or _model_name != target:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(target)
-        _model_name = target
+    target = name or _configured_model or DEFAULT_EMBED_MODEL
+    if _model is not None and _model_name == target:
+        return _model
+    now = time.time()
+    if _model_failed_at is not None and now - _model_failed_at < MODEL_RETRY_SECONDS:
+        raise RuntimeError(
+            f"embedding model unavailable (last load failed: {_model_failed_error}; "
+            f"retrying after {MODEL_RETRY_SECONDS} s)"
+        )
+    try:
+        model = _load_model(target)
+    except Exception as e:
+        _model_failed_at = now
+        _model_failed_error = str(e)
+        print(f"Warning: embedding model '{target}' could not be loaded: {e}",
+              file=sys.stderr)
+        raise
+    _model = model
+    _model_name = target
+    _model_failed_at = None
+    _model_failed_error = None
     return _model
 
 
@@ -87,6 +121,9 @@ def purify_text(text: str) -> str:
     return _CODE_BLOCK_RE.sub('[code omitted]', cleaned)
 
 
+_SENTENCE_END_RE = re.compile(r'(?<=[.!?])\s+|(?<=[。！？])\s*')
+
+
 def chunk_text(text: str, max_chars: int = 400, overlap: int = 40) -> list:
     if not text or not text.strip():
         return []
@@ -100,8 +137,9 @@ def chunk_text(text: str, max_chars: int = 400, overlap: int = 40) -> list:
         if chunks:
             return chunks
 
-    # Sentence split
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    # Sentence split: . ! ? followed by whitespace, or 。！？ (v1.5.0, no
+    # whitespace needed)
+    sentences = [x for x in _SENTENCE_END_RE.split(text) if x and x.strip()]
     if len(sentences) > 1:
         chunks = _merge_chunks(sentences, max_chars, overlap, sep=' ')
         if chunks:
@@ -267,12 +305,15 @@ def _order_versions_newest_first(conn, scored: list, config: dict) -> list:
         member_set = set(members)
         positions = [i for i, r in enumerate(out) if r.get('turn_id') in member_set]
         slot_scores = [out[i]['score'] for i in positions]
+        # spec §5 (v1.5.0): filter_score moves with the position like score
+        slot_filter = [out[i].get('filter_score', out[i]['score']) for i in positions]
         items = [out[i] for i in positions]
         ordered_turns = sorted(members, key=lambda t: _turn_key(conn, t), reverse=True)
         new_items = [it for t in ordered_turns for it in items if it.get('turn_id') == t]
-        for pos, score, item in zip(positions, slot_scores, new_items):
+        for pos, score, fscore, item in zip(positions, slot_scores, slot_filter, new_items):
             new = dict(item)
             new['score'] = score
+            new['filter_score'] = fscore
             new['_version_group'] = gid
             out[pos] = new
     return out
@@ -386,8 +427,11 @@ def hybrid_search(
             sess = meta.get('session_id')
             # spec §3: b_session = 1.0 on match, 0.6 on mismatch/NULL
             b_session = 1.0 if (current_session_id and sess == current_session_id) else 0.6
-            score = (cs * 0.7 + kr * 0.3) * decay * b_session
-            if score < min_score:
+            # spec §3 (v1.5.0): b_session orders, it does not filter —
+            # min_score and the relative cutoff use filter_score.
+            filter_score = (cs * 0.7 + kr * 0.3) * decay
+            score = filter_score * b_session
+            if filter_score < min_score:
                 continue
             scored.append({
                 'id':                rid,
@@ -397,6 +441,7 @@ def hybrid_search(
                 'turn_id':           meta.get('turn_id'),
                 'agent_name':        meta.get('agent_name'),
                 'score':             score,
+                'filter_score':      filter_score,
                 'cos_sim':           cs,
                 'keyword_relevance': kr,
             })
@@ -410,11 +455,12 @@ def hybrid_search(
             except Exception as e:
                 logger.warning(f"Version ordering skipped: {e}")
 
-        # 5. Relative cut (rows re-ordered as versions are kept)
+        # 5. Relative cut on filter_score (rows re-ordered as versions are kept)
         if scored and rel_ratio:
-            top = scored[0]['score']
+            top = max(r.get('filter_score', r['score']) for r in scored)
             scored = [r for r in scored
-                      if r['score'] >= top * rel_ratio or r.get('_version_group')]
+                      if r.get('filter_score', r['score']) >= top * rel_ratio
+                      or r.get('_version_group')]
 
         # 6. Identical content → one row
         scored = _collapse_identical_content(scored)

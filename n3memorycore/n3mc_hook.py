@@ -18,15 +18,16 @@ from .paths import MEMORY_DIR, AUDIT_LOG
 
 
 def _write_audit(hook: str, raw: str, payload: dict) -> None:
-    from .core.processor import sanitize_surrogates
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    record = json.dumps({
-        'ts':      datetime.now(timezone.utc).isoformat(),
-        'hook':    hook,
-        'raw':     sanitize_surrogates(raw[:4096]),
-        'payload': sanitize_surrogates(payload),
-    }, ensure_ascii=False)
+    # spec §5.4: audit.log write failures go to stderr and never stop a hook
     try:
+        from .core.processor import sanitize_surrogates
+        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        record = json.dumps({
+            'ts':      datetime.now(timezone.utc).isoformat(),
+            'hook':    hook,
+            'raw':     sanitize_surrogates(raw[:4096]),
+            'payload': sanitize_surrogates(payload),
+        }, ensure_ascii=False)
         with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
             f.write(record + '\n')
     except Exception as e:

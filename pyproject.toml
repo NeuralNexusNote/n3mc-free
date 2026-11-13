@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n3memorycore-free"
-version = "1.4.0"
+version = "1.5.0"
 description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,8 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -31,6 +32,7 @@ dependencies = [
     "sentence-transformers>=2.5",
     "sqlite-vec>=0.1.6",
     "uuid7>=0.1.0",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
