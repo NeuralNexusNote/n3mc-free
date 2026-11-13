@@ -20,19 +20,20 @@ def strip_fts_punctuation(text: str) -> str:
 
 
 def _build_fts_query(query: str) -> str:
-    """spec §3 (v1.4.0): build a safe FTS5 MATCH string.
+    """spec §3 (v1.5.0): build a safe FTS5 MATCH string.
 
-    Punctuation strip → control chars to space → char limit → skip if < 3
-    bytes → quote every whitespace-separated term as an FTS5 string so ASCII
-    symbols left after the strip (\\ / # = @ * $ % ...) and bare AND/OR/NOT/NEAR
-    are matched literally instead of raising "fts5: syntax error".
-    Returns "" when the keyword search should be skipped.
+    Control chars and punctuation → spaces (a Japanese sentence splits into
+    terms at its punctuation) → split on whitespace → drop terms under 3
+    characters (trigram can never match them) → at most 30 terms → quote
+    every term as an FTS5 string (symbols and bare AND/OR/NOT/NEAR match
+    literally) → join with OR. Returns "" when the keyword search should
+    be skipped. The INSERT side (strip_fts_punctuation) is unchanged.
     """
-    stripped = strip_fts_punctuation(_FTS_CTRL_RE.sub(' ', query or ''))
-    fts_query = stripped[:_FTS_MAX_TERMS * 20]  # trigram: limit by characters
-    if len(fts_query.encode('utf-8')) < 3:
+    text = _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or ''))
+    terms = [t for t in text.split() if len(t) >= 3][:_FTS_MAX_TERMS]
+    if not terms:
         return ''                                 # → skip keyword search
-    return ' '.join('"' + t.replace('"', '""') + '"' for t in fts_query.split())
+    return ' OR '.join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
 # Public alias (pre-v1.4.0 draft name).
@@ -341,7 +342,7 @@ def search_fts(
     since: Optional[str] = None,
     until: Optional[str] = None,
 ) -> List[sqlite3.Row]:
-    # spec §3 (v1.4.0): strip → ctrl chars → limit → ≥3 bytes → quote terms
+    # spec §3 (v1.5.0): punctuation → spaces, terms ≥ 3 chars, quoted, OR
     fts_query = _build_fts_query(query)
     if not fts_query:
         return []

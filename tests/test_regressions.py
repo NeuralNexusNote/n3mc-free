@@ -1,4 +1,4 @@
-"""Layer 5: regression tests for the v1.4.0 fixes (spec §7).
+"""Layer 5: regression tests for the v1.4.0 / v1.5.0 fixes (spec §7).
 
 No embedding model: vectors are deterministic fakes. Real data and real
 servers are never touched (conftest._isolate_real_data).
@@ -9,9 +9,10 @@ import math
 import os
 import random
 import sqlite3
+import time
 import uuid
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -394,10 +395,13 @@ class TestNoContextFile:
 
     def test_stop_removes_import_keeps_crlf(self, tmp_path, monkeypatch):
         claude_dir = stop_in(tmp_path, monkeypatch)
+        # v1.5.0: only this installation's own CONTEXT_FILE (a path with a space)
+        own = tmp_path / 'my user' / '.n3mc' / '.memory' / 'memory_context.md'
+        monkeypatch.setattr(n3memory, 'CONTEXT_FILE', str(own))
         md = claude_dir / 'CLAUDE.md'
         original = ('# CLAUDE.md\r\n\r\nMy rules\r\n\r\n'
                     '# N3MemoryCore — recalled context for the current turn\r\n'
-                    '@C:/Users/my user/.n3mc/.memory/memory_context.md\r\n')
+                    '@' + own.as_posix() + '\r\n')
         md.write_bytes(original.encode('utf-8'))
         n3memory.cmd_stop({})
         data = md.read_bytes().decode('utf-8')
@@ -499,7 +503,8 @@ class TestBehaviorMd:
         rule.write_text(OLD_TEMPLATE_V1 + '\n## My own section\n', encoding='utf-8')
         n3memory.cmd_stop({})
         assert '## My own section' in rule.read_text(encoding='utf-8')
-        assert 'behavior_md_edited' in notices()
+        keys = [k for k in notices() if k.startswith('behavior_md_edited')]
+        assert keys == [n3memory._behavior_notice_key(str(rule))]
 
 
 # --------------------------------------------------------------------------- config
@@ -689,3 +694,933 @@ class TestForeignServer:
         path, sent = foreign
         n3memory.cmd_repair({'server_port': 1})
         assert sent == []
+
+
+# =========================================================================== v1.5.0
+# References captured at import time (before conftest replaces them per test).
+REAL_SPAWN_SERVER = n3memory._spawn_server
+REAL_CHECK_HOST = n3memory._check_host
+REAL_SETTINGS_PATH = n3memory._settings_path
+REAL_POST = n3memory._post
+REAL_GET = n3memory._get
+
+
+def audit_lines():
+    try:
+        with open(n3memory.AUDIT_LOG, encoding='utf-8') as f:
+            return [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+
+
+# --------------------------------------------------------------------------- FTS (v1.5.0)
+class TestFtsQuoting(TestFtsQuoting):  # v1.5.0 additions
+    def test_terms_joined_with_or(self, tmp_path):
+        path = new_db(tmp_path)
+        add(path, 'the quick brown fox jumps')
+        assert ' OR ' in fts_builder()('what quick fox doing')
+        conn = db.get_connection(path)
+        try:
+            rows = db.search_fts(conn, 'what is the quick fox doing in my DB')
+        finally:
+            conn.close()
+        assert len(rows) == 1
+
+    def test_short_terms_dropped(self):
+        assert fts_builder()('AI 東京') == ''
+        assert fts_builder()('AI 東京 tokyo') == '"tokyo"'
+
+    def test_max_30_terms(self):
+        q = ' '.join(f'term{i:02d}' for i in range(50))
+        assert fts_builder()(q).count(' OR ') == 29
+
+    def test_punctuation_splits_terms(self, tmp_path):
+        path = new_db(tmp_path)
+        add(path, '架空の惑星「アルファ9」の気温設定')
+        built = fts_builder()('「アルファ9」の気温は？')
+        assert built == '"アルファ9" OR "の気温は"'
+        conn = db.get_connection(path)
+        try:
+            rows = db.search_fts(conn, '「アルファ9」の気温は？')
+        finally:
+            conn.close()
+        assert len(rows) == 1
+
+
+# --------------------------------------------------------------------------- filter_score (v1.5.0)
+class TestSearchShaping(TestSearchShaping):  # v1.5.0 additions
+    def test_old_other_session_survives_relative_cut(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        add(path, 'current session record', emb=at_cos(0.86), session_id='cur')
+        add(path, 'old record from another session', emb=at_cos(0.99, axis=2),
+            ts=old, session_id='other')
+        out = proc.hybrid_search(path, 'zzz', cfg(min_score=0.2), current_session_id='cur')
+        contents = [r['content'] for r in out['results']]
+        # the order is still by the final score: the current session first
+        assert contents == ['current session record', 'old record from another session']
+        assert out['results'][0]['score'] > out['results'][1]['score']
+
+    def test_keyword_only_other_session_survives_min_score(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        for i in range(40):
+            add(path, f'filler record number {i}')
+        add(path, 'a note about the zebrafish tank', session_id='other')
+        out = proc.hybrid_search(path, 'zebrafish', cfg(min_score=0.2),
+                                 current_session_id='cur')
+        res = out['results']
+        assert [r['content'] for r in res] == ['a note about the zebrafish tank']
+        assert res[0]['score'] < 0.2 <= res[0]['filter_score']
+
+    def test_filter_score_moves_with_version_position(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        rep = unit(0)
+        add(path, '[user] make it', emb=unit(5), ts='2026-01-01T00:00:00+00:00', turn_id='old')
+        add(path, '[claude 1/2] v1 ' + LONG, emb=rep, ts='2026-01-01T00:00:01+00:00',
+            turn_id='old')
+        add(path, '[user] make it again', emb=unit(6), ts='2026-01-02T00:00:00+00:00',
+            turn_id='new')
+        add(path, '[claude 1/2] v2 ' + LONG, emb=mix(rep, unit(3), 0.99, math.sqrt(1 - 0.99 ** 2)),
+            ts='2026-01-02T00:00:01+00:00', turn_id='new')
+        out = proc.hybrid_search(path, 'zzz', cfg(half_life_days=1e9))
+        res = out['results']
+        assert res[0]['turn_id'] == 'new'
+        assert res[0]['filter_score'] >= res[1]['filter_score']
+
+
+# --------------------------------------------------------------------------- @import retirement (v1.5.0)
+class TestNoContextFile(TestNoContextFile):  # v1.5.0 additions
+    def _run(self, tmp_path, monkeypatch, lines):
+        claude_dir = stop_in(tmp_path, monkeypatch)
+        own = tmp_path / 'home' / '.n3mc' / '.memory' / 'memory_context.md'
+        monkeypatch.setattr(n3memory, 'CONTEXT_FILE', str(own))
+        md = claude_dir / 'CLAUDE.md'
+        md.write_text('\n'.join(lines(own)) + '\n', encoding='utf-8')
+        n3memory.cmd_stop({})
+        return md.read_text(encoding='utf-8'), claude_dir
+
+    def test_foreign_lines_kept(self, tmp_path, monkeypatch):
+        keep = ['@../.memory/memory_context.md',
+                '@C:/other/.memory/memory_context.md',
+                '@docs/notes_about_memory_context.md']
+        text, claude_dir = self._run(tmp_path, monkeypatch, lambda own: ['# Mine'] + keep)
+        for line in keep:
+            assert line in text
+        assert not [p for p in os.listdir(claude_dir) if '.bak-n3mc-' in p]
+
+    def test_backslash_form_of_own_path_removed(self, tmp_path, monkeypatch):
+        text, _ = self._run(
+            tmp_path, monkeypatch,
+            lambda own: ['# Mine', '@' + str(own).replace('/', '\\'),
+                         '@../.memory/memory_context.md'])
+        assert '# Mine' in text
+        assert '@../.memory/memory_context.md' in text
+        assert str(tmp_path).replace('/', '\\') not in text
+
+
+# --------------------------------------------------------------------------- behavior md (v1.5.0)
+class TestBehaviorMd(TestBehaviorMd):  # v1.5.0 additions
+    def test_two_files_two_notices_with_paths(self, tmp_path):
+        paths = []
+        for name in ('a', 'b'):
+            rule = tmp_path / name / '.claude' / 'rules' / 'n3mc-behavior.md'
+            rule.parent.mkdir(parents=True)
+            rule.write_text('# my own rules\n', encoding='utf-8')
+            n3memory._ensure_behavior_md(str(rule))
+            paths.append(rule)
+        ns = notices()
+        for rule in paths:
+            key = n3memory._behavior_notice_key(str(rule))
+            assert key in ns
+            assert len(key) == len('behavior_md_edited:') + 12
+            assert os.path.abspath(str(rule)) in ns[key]['message']
+
+    def test_notice_cleared_when_marker_present(self, tmp_path):
+        rule = tmp_path / '.claude' / 'rules' / 'n3mc-behavior.md'
+        rule.parent.mkdir(parents=True)
+        rule.write_text('# my own rules\n', encoding='utf-8')
+        n3memory._ensure_behavior_md(str(rule))
+        key = n3memory._behavior_notice_key(str(rule))
+        assert key in notices()
+        rule.write_text(n3memory._BEHAVIOR_MD_MARKER + '\n# merged\n', encoding='utf-8')
+        n3memory._ensure_behavior_md(str(rule))
+        assert key not in notices()
+
+
+# --------------------------------------------------------------------------- server start (v1.5.0)
+class FakeProc:
+    def __init__(self, code=None, pid=4321):
+        self.code = code
+        self.pid = pid
+
+    def poll(self):
+        return self.code
+
+
+class TestServerStart:
+    def test_child_exit_stops_wait_and_notifies(self, monkeypatch):
+        monkeypatch.setattr(n3memory, '_get_health', lambda c: None)
+        monkeypatch.setattr(n3memory, '_spawn_server', lambda: FakeProc(code=3))
+        t0 = time.time()
+        assert n3memory.ensure_server({'server_port': 1}) is False
+        assert time.time() - t0 < 5
+        n = notices()['server_start_failed']['message']
+        assert 'exit code 3' in n and n3memory.SERVER_LOG in n
+        assert os.path.exists(n3memory.SERVER_START_FAILED_MARKER)
+        assert not os.path.exists(n3memory.PID_FILE)
+
+    def test_no_retry_within_five_minutes(self, monkeypatch, capsys):
+        monkeypatch.setattr(n3memory, '_get_health', lambda c: None)
+        with open(n3memory.SERVER_START_FAILED_MARKER, 'w') as f:
+            f.write(str(time.time() - 60))
+
+        def no_spawn():
+            raise AssertionError('must not start within 5 minutes of a failure')
+        monkeypatch.setattr(n3memory, '_spawn_server', no_spawn)
+        assert n3memory.ensure_server({'server_port': 1}) is False
+        n3memory._do_search('hello', {'server_port': 1})
+        assert 'memory search unavailable' in capsys.readouterr().out
+
+    def test_retry_after_five_minutes_and_success_clears(self, monkeypatch):
+        with open(n3memory.SERVER_START_FAILED_MARKER, 'w') as f:
+            f.write(str(time.time() - 301))
+        n3memory._notify('server_start_failed', 'old failure')
+        state = {'spawned': False}
+
+        def health(c):
+            if not state['spawned']:
+                return None
+            return {'status': 'ok', 'root': me(), 'code_version': n3memory._code_version()}
+
+        def spawn():
+            state['spawned'] = True
+            return FakeProc(code=None)
+        monkeypatch.setattr(n3memory, '_get_health', health)
+        monkeypatch.setattr(n3memory, '_spawn_server', spawn)
+        assert n3memory.ensure_server({'server_port': 1}) is True
+        assert 'server_start_failed' not in notices()
+        assert not os.path.exists(n3memory.SERVER_START_FAILED_MARKER)
+
+    def test_still_starting_after_60s_not_replaced(self, monkeypatch, capsys):
+        monkeypatch.setattr(n3memory, '_get_health', lambda c: None)
+        with open(n3memory.PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        monkeypatch.setattr(n3memory, '_process_alive', lambda pid: True)
+        monkeypatch.setattr(n3memory, '_is_own_server_process', lambda pid: True)
+        monkeypatch.setattr(n3memory, '_wait_for_server', lambda *a, **k: False)
+
+        def no_start(c):
+            raise AssertionError('must not start a second server')
+        monkeypatch.setattr(n3memory, '_start_server', no_start)
+        assert n3memory.ensure_server({'server_port': 1}) is False
+        assert os.path.exists(n3memory.PID_FILE)
+        n3memory._do_search('hello', {'server_port': 1})
+        assert 'the memory server is still starting' in capsys.readouterr().out
+
+    def test_still_starting_saves_directly(self, monkeypatch):
+        monkeypatch.setattr(n3memory, '_NO_SERVER_REASON', n3memory._STILL_STARTING)
+
+        def no_post(*a, **k):
+            raise AssertionError('must not post while the server is starting')
+        monkeypatch.setattr(n3memory, '_post', no_post)
+        n3memory._do_buffer('note', {'server_port': 1, 'owner_id': 'o'})
+        assert count(n3memory.DB_PATH) == 1
+
+    def test_without_psutil_young_pid_file_is_starting(self, monkeypatch):
+        monkeypatch.setattr(n3memory, '_psutil_available', lambda: False)
+        with open(n3memory.PID_FILE, 'w') as f:
+            f.write('999999')
+        assert n3memory._pid_file_process_starting(999999) is True
+        old = time.time() - 120
+        os.utime(n3memory.PID_FILE, (old, old))
+        assert n3memory._pid_file_process_starting(999999) is False
+
+    def test_popen_detached_and_stderr_to_server_log(self, monkeypatch):
+        monkeypatch.setattr(n3memory, '_spawn_server', REAL_SPAWN_SERVER)
+        with open(n3memory.SERVER_LOG, 'wb') as f:
+            f.write(b'x' * (n3memory._SERVER_LOG_MAX_BYTES + 10))
+        calls = []
+
+        def fake_popen(args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeProc()
+        monkeypatch.setattr(n3memory.subprocess, 'Popen', fake_popen)
+        n3memory._spawn_server()
+        args, kw = calls[0]
+        assert args[1:] == ['-m', 'n3memorycore.n3memory', '--run-server']
+        assert os.path.normcase(kw['stderr'].name) == os.path.normcase(n3memory.SERVER_LOG)
+        assert kw['stdout'] == n3memory.subprocess.DEVNULL
+        assert kw['stdin'] == n3memory.subprocess.DEVNULL
+        if os.name == 'nt':
+            flags = kw['creationflags']
+            assert flags & n3memory.subprocess.CREATE_NEW_PROCESS_GROUP
+            assert flags & n3memory.subprocess.CREATE_NO_WINDOW
+        else:
+            assert kw['start_new_session'] is True
+        assert os.path.getsize(n3memory.SERVER_LOG) == 0   # truncated (> 1 MB)
+
+
+# --------------------------------------------------------------------------- server API (v1.5.0)
+class TestServerApi:
+    PORT = 18999
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        path = new_db(tmp_path, 'api.db')
+        monkeypatch.setattr(n3memory, 'DB_PATH', path)
+        monkeypatch.setattr(n3memory, '_srv_cfg', {'owner_id': 'o', 'local_id': 'l',
+                                                   'server_port': self.PORT})
+        monkeypatch.setattr(n3memory, '_host_ok', REAL_CHECK_HOST)
+        monkeypatch.setattr(proc, 'embed_passage', fake_embed)
+        return TestClient(n3memory.app), path
+
+    ENDPOINTS = [('get', '/health', None), ('post', '/buffer', {'content': 'x'}),
+                 ('post', '/search', {'query': 'x'}), ('post', '/repair', {}),
+                 ('get', '/list', None), ('post', '/shutdown', {'root': '/x'}),
+                 ('delete', '/delete/abc', None), ('post', '/gc', {}),
+                 ('post', '/import', {})]
+
+    @pytest.mark.parametrize('method,url,body', ENDPOINTS)
+    def test_foreign_host_rejected(self, client, method, url, body):
+        c, _ = client
+        kw = {'headers': {'Host': 'evil.example'}}
+        if body is not None:
+            kw['json'] = body
+        assert getattr(c, method)(url, **kw).status_code == 403
+
+    @pytest.mark.parametrize('host', ['127.0.0.1:%d' % PORT, 'localhost:%d' % PORT])
+    def test_local_hosts_pass(self, client, host):
+        c, _ = client
+        assert c.get('/health', headers={'Host': host}).status_code == 200
+        assert c.get('/list', headers={'Host': host}).status_code == 200
+
+    def test_wrong_port_rejected(self, client):
+        c, _ = client
+        assert c.get('/health', headers={'Host': '127.0.0.1:1'}).status_code == 403
+
+    def test_db_endpoints_are_plain_def(self):
+        import inspect
+        eps = {r.path: r.endpoint for r in n3memory.app.routes if hasattr(r, 'endpoint')}
+        for p in ('/buffer', '/search', '/repair', '/list'):
+            assert not inspect.iscoroutinefunction(eps[p]), p
+
+    def test_repair_max_records(self, client):
+        c, path = client
+        for i in range(250):
+            add(path, f'unindexed record {i}')       # no vector
+        h = {'Host': f'127.0.0.1:{self.PORT}'}
+        r = c.post('/repair', json={'max_records': 200}, headers=h)
+        assert r.json()['count'] == 200
+        conn = db.get_connection(path)
+        try:
+            assert len(db.find_unindexed_memories(conn, limit=1000)) == 50
+        finally:
+            conn.close()
+        assert c.post('/repair', json={}, headers=h).json()['count'] == 50
+
+    def test_search_unreadable_since_is_400(self, client):
+        c, _ = client
+        r = c.post('/search', json={'query': 'x', 'since': 'yesterday'},
+                   headers={'Host': f'127.0.0.1:{self.PORT}'})
+        assert r.status_code == 400
+
+    def test_hook_submit_sends_repair_limit(self, monkeypatch):
+        sent = []
+
+        def fake_post(c, p, payload, *a, **k):
+            sent.append((p, payload))
+            return {'results': [], 'pairs': {}, 'pairs_omitted': {}} if p == '/search' else {}
+        monkeypatch.setattr(n3memory, 'ensure_server', lambda c: True)
+        monkeypatch.setattr(n3memory, '_post', fake_post)
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps({'prompt': 'hello there'})))
+        n3memory.cmd_hook_submit({'server_port': 1, 'search_query_max_chars': 2000})
+        assert ('/repair', {'max_records': 200}) in sent
+
+    def test_cli_sends_local_host_header(self, monkeypatch):
+        import urllib.request
+        seen = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{}'
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.get_header('Host'))
+            return Resp()
+        monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+        REAL_POST({'server_port': 18777}, '/x', {})
+        REAL_GET({'server_port': 18777}, '/x')
+        assert seen == ['127.0.0.1:18777', '127.0.0.1:18777']
+
+
+# --------------------------------------------------------------------------- config (v1.5.0)
+class TestConfig(TestConfig):  # v1.5.0 additions
+    @pytest.mark.parametrize('key,value', [
+        ('search_query_max_chars', '2000.0'), ('half_life_days', '0'),
+        ('server_port', '70000'), ('server_port', '-1'), ('min_score', '1.5'),
+    ])
+    def test_out_of_range_ignored(self, key, value):
+        write_cfg('{' + IDS + f', "{key}": {value}' + '}')
+        c = n3memory._load_config()
+        assert c[key] == n3memory._DEFAULT_CONFIG[key]
+        assert key in notices()['config_type']['message']
+
+    def test_valid_values_accepted(self):
+        assert n3memory._config_value_ok('half_life_days', 0.5)
+        assert n3memory._config_value_ok('server_port', 18600)
+        assert n3memory._config_value_ok('min_score', 0)
+        assert not n3memory._config_value_ok('pair_top_n', 3.0)
+
+    def test_exclusive_creation_reads_concurrent_file(self, monkeypatch):
+        other = ('{"owner_id": "33333333-3333-4333-8333-333333333333", '
+                 '"local_id": "44444444-4444-4444-8444-444444444444"}')
+        real_fill = n3memory._fill_ids
+
+        def racing_fill(c):
+            real_fill(c)
+            if not os.path.exists(n3memory.CONFIG_FILE):
+                write_cfg(other)          # another hook wins the race
+        monkeypatch.setattr(n3memory, '_fill_ids', racing_fill)
+        c = n3memory._load_config()
+        assert c['owner_id'] == '33333333-3333-4333-8333-333333333333'
+        assert json.loads(read_cfg())['owner_id'] == '33333333-3333-4333-8333-333333333333'
+
+    def test_missing_file_created_exclusively(self, monkeypatch):
+        import builtins
+        modes = []
+        real_open = builtins.open
+
+        def spy(file, mode='r', *a, **k):
+            if os.path.normcase(str(file)) == os.path.normcase(n3memory.CONFIG_FILE):
+                modes.append(mode)
+            return real_open(file, mode, *a, **k)
+        monkeypatch.setattr(builtins, 'open', spy)
+        n3memory._load_config()
+        assert modes and modes[0] == 'x'
+
+    def test_update_uses_replace(self, monkeypatch):
+        write_cfg('{' + IDS + '}')
+        replaced = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            replaced.append((src, dst))
+            return real_replace(src, dst)
+        monkeypatch.setattr(os, 'replace', spy)
+        n3memory._load_config()
+        assert any(os.path.normcase(d) == os.path.normcase(n3memory.CONFIG_FILE)
+                   and os.path.dirname(s) == os.path.dirname(d) for s, d in replaced)
+        assert 'server_port' in json.loads(read_cfg())
+
+    def test_notices_written_atomically(self, monkeypatch):
+        replaced = []
+        real_replace = os.replace
+        monkeypatch.setattr(os, 'replace', lambda s, d: replaced.append(d) or real_replace(s, d))
+        n3memory._notify('stale_server', 'msg')
+        assert n3memory.NOTICES_FILE in replaced
+
+
+# --------------------------------------------------------------------------- transcript (v1.5.0)
+def tline(typ, content, sidechain=False):
+    return json.dumps({'type': typ, 'isSidechain': sidechain,
+                       'message': {'role': typ, 'content': content}})
+
+
+def write_transcript(tmp_path, with_current=True):
+    lines = [
+        tline('user', 'first question'),
+        tline('assistant', [{'type': 'thinking', 'thinking': 'hidden thoughts'}]),
+        tline('assistant', [{'type': 'text', 'text': 'Let me check.'},
+                            {'type': 'tool_use', 'id': 't1', 'name': 'Read', 'input': {}}]),
+        tline('user', [{'type': 'tool_result', 'tool_use_id': 't1', 'content': 'file body'}]),
+        tline('assistant', [{'type': 'text', 'text': 'SIDECHAIN TEXT'}], sidechain=True),
+        'not json at all',
+        json.dumps({'type': 'system', 'content': 'meta'}),
+        tline('assistant', [{'type': 'text', 'text': 'Final answer here.'}]),
+    ]
+    if with_current:
+        lines.append(tline('user', [{'type': 'text', 'text': 'second question'}]))
+    p = tmp_path / 'session.jsonl'
+    p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return str(p)
+
+
+# Only the LAST text block — the same text Stop receives as last_assistant_message.
+EXPECTED_PREV = 'Final answer here.'
+
+
+class TestHookSubmit(TestHookSubmit):  # v1.5.0 additions
+    @pytest.mark.parametrize('with_current', [True, False])
+    def test_reads_previous_response(self, tmp_path, with_current):
+        p = write_transcript(tmp_path, with_current)
+        assert n3memory._read_previous_response(p, 'second question') == EXPECTED_PREV
+
+    def test_interrupted_reply_is_found(self, tmp_path):
+        """An interruption marker, meta lines and slash-command lines between
+        the partial reply and the new prompt are not prompts (spec §4.5 D3)."""
+        lines = [
+            tline('user', 'first question'),
+            tline('assistant', [{'type': 'text', 'text': 'Partial reply before the interrupt.'}]),
+            tline('user', [{'type': 'text', 'text': '[Request interrupted by user]'}]),
+            json.dumps({'type': 'user', 'isMeta': True, 'isSidechain': False,
+                        'message': {'role': 'user', 'content': 'caveat text'}}),
+            tline('user', '<command-name>/model</command-name>'),
+            tline('user', '<local-command-stdout>Set model</local-command-stdout>'),
+            tline('user', 'second question'),
+        ]
+        p = tmp_path / 'interrupted.jsonl'
+        p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        assert n3memory._read_previous_response(str(p), 'second question') == \
+            'Partial reply before the interrupt.'
+
+    def test_no_previous_reply_returns_empty(self, tmp_path):
+        p = tmp_path / 'fresh.jsonl'
+        p.write_text(tline('user', 'only question') + '\n', encoding='utf-8')
+        assert n3memory._read_previous_response(str(p), 'only question') == ''
+
+    def test_last_text_part_of_the_line(self, tmp_path):
+        p = tmp_path / 'multi.jsonl'
+        p.write_text('\n'.join([
+            tline('user', 'q1'),
+            tline('assistant', [{'type': 'text', 'text': 'part one'},
+                                {'type': 'text', 'text': 'part two'}]),
+            tline('user', 'q2'),
+        ]) + '\n', encoding='utf-8')
+        assert n3memory._read_previous_response(str(p), 'q2') == 'part two'
+
+    def run_hook(self, monkeypatch, payload, saved=None):
+        monkeypatch.setattr(n3memory, 'ensure_server', lambda c: True)
+
+        def fake_post(c, p, *a, **k):
+            return {'results': [], 'pairs': {}, 'pairs_omitted': {}} if p == '/search' else {}
+        monkeypatch.setattr(n3memory, '_post', fake_post)
+        if saved is not None:
+            monkeypatch.setattr(n3memory, '_do_buffer',
+                                lambda text, c, **k: saved.append((text, k.get('turn_id'))))
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(payload)))
+        n3memory.cmd_hook_submit({'server_port': 1, 'search_query_max_chars': 2000,
+                                  'owner_id': 'o'})
+
+    def test_saved_under_previous_turn_id(self, tmp_path, monkeypatch, capsys):
+        n3memory._write_turn_id('t-prev', 'sess')
+        saved = []
+        self.run_hook(monkeypatch, {'session_id': 'sess', 'prompt': 'second question',
+                                    'transcript_path': write_transcript(tmp_path)}, saved)
+        assert saved[0] == ('[claude] ' + EXPECTED_PREV, 't-prev')
+        assert saved[1][0] == '[user] second question'
+        assert saved[1][1] not in (None, 't-prev')
+        assert n3memory._read_turn_id('sess') == saved[1][1]
+        assert '# Recalled Memory Context' in capsys.readouterr().out
+
+    def test_supplied_last_assistant_message_wins(self, tmp_path, monkeypatch):
+        n3memory._write_turn_id('t-prev', 'sess')
+        saved = []
+        self.run_hook(monkeypatch, {'session_id': 'sess', 'prompt': 'q2',
+                                    'last_assistant_message': 'given reply',
+                                    'transcript_path': write_transcript(tmp_path)}, saved)
+        assert saved[0] == ('[claude] given reply', 't-prev')
+
+    def test_no_duplicate_when_stop_saved_it(self, tmp_path, monkeypatch):
+        n3memory._write_turn_id('t-prev', 'sess')
+        c = {'server_port': 1, 'owner_id': 'o'}
+        monkeypatch.setattr(n3memory, 'ensure_server', lambda c: False)
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(
+            {'session_id': 'sess', 'last_assistant_message': EXPECTED_PREV})))
+        n3memory.cmd_save_claude_turn(c)
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(
+            {'session_id': 'sess', 'prompt': 'second question',
+             'transcript_path': write_transcript(tmp_path)})))
+        n3memory.cmd_hook_submit(dict(c, search_query_max_chars=2000))
+        conn = db.get_connection(n3memory.DB_PATH)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM memories WHERE content LIKE '[claude%'"
+                             ).fetchone()[0]
+        finally:
+            conn.close()
+        assert n == 1
+
+    @pytest.mark.parametrize('kind', ['missing', 'broken'])
+    def test_unreadable_transcript_logged(self, tmp_path, monkeypatch, capsys, kind):
+        if kind == 'missing':
+            tp = str(tmp_path / 'nope.jsonl')
+        else:
+            bad = tmp_path / 'bad.jsonl'
+            bad.write_bytes(b'\x00\x01 garbage {{{\n')
+            tp = str(bad)
+        saved = []
+        self.run_hook(monkeypatch, {'session_id': 's', 'prompt': 'hello world',
+                                    'transcript_path': tp}, saved)
+        assert any(l.get('stage') == 'transcript_unreadable' for l in audit_lines())
+        assert saved and saved[-1][0] == '[user] hello world'
+        assert '# Recalled Memory Context' in capsys.readouterr().out
+
+    def test_image_only_prompt_new_turn_id(self, monkeypatch):
+        n3memory._write_turn_id('keep', 'sess')
+        saved = []
+        self.run_hook(monkeypatch, {'session_id': 'sess',
+                                    'prompt': [{'type': 'image', 'source': {}}]}, saved)
+        assert n3memory._read_turn_id('sess') not in (None, 'keep')
+        assert not any(t.startswith('[user') for t, _ in saved)
+
+
+# --------------------------------------------------------------------------- purify before chunk (v1.5.0)
+class TestPurifyBeforeChunk:
+    def hook_saved(self, monkeypatch, text):
+        saved = []
+        monkeypatch.setattr(n3memory, 'ensure_server', lambda c: True)
+        monkeypatch.setattr(n3memory, '_post', lambda c, p, *a, **k: (
+            {'results': [], 'pairs': {}, 'pairs_omitted': {}} if p == '/search' else {}))
+        monkeypatch.setattr(n3memory, '_do_buffer',
+                            lambda t, c, **k: saved.append(t))
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps({'prompt': text})))
+        n3memory.cmd_hook_submit({'server_port': 1, 'search_query_max_chars': 2000})
+        return '\n'.join(saved)
+
+    def test_prose_between_code_blocks_kept(self, monkeypatch):
+        text = ('Intro prose sentence number one. ' * 5 +
+                '\n```\nCODE_ONE_' + 'a' * 120 + '\n```\n' +
+                'MIDDLE PROSE stays here. ' * 4 +
+                '\n```\nCODE_TWO_' + 'b' * 120 + '\n```\n' +
+                'Closing prose sentence. ' * 3)
+        assert len(text) > 500
+        joined = self.hook_saved(monkeypatch, text)
+        assert 'MIDDLE PROSE stays here.' in joined
+        assert 'CODE_ONE_' not in joined and 'CODE_TWO_' not in joined
+        assert '[code omitted]' in joined
+
+    def test_long_code_block_replaced(self, monkeypatch):
+        text = 'Look at this:\n```\n' + 'LONGCODE line\n' * 60 + '```\nThanks.'
+        joined = self.hook_saved(monkeypatch, text)
+        assert 'LONGCODE' not in joined
+        assert '[code omitted]' in joined and 'Thanks.' in joined
+
+
+# --------------------------------------------------------------------------- sentences (v1.5.0)
+class TestChunkSentences:
+    def test_japanese_split_after_sentence_marks(self):
+        sents = ['これは長い日本語の文章の一部であり、空行なしで続いていきます' + str(i) + m
+                 for i, m in zip(range(18), '。！？' * 6)]
+        text = ''.join(sents)
+        assert len(text) > 400 and '\n' not in text
+        chunks = proc.chunk_text(text)
+        assert len(chunks) > 1
+        for c in chunks:
+            assert c[-1] in '。！？'
+
+
+# --------------------------------------------------------------------------- time bounds (v1.5.0)
+JST = timezone(timedelta(hours=9))
+
+
+class TestTimeBounds:
+    @pytest.fixture(autouse=True)
+    def jst(self, monkeypatch):
+        monkeypatch.setattr(n3memory, '_LOCAL_TZ', JST)
+
+    def test_date_only_is_local_midnight(self):
+        assert n3memory._parse_time_bound('2026-11-13') == '2026-11-12T15:00:00+00:00'
+        assert (n3memory._parse_time_bound('2026-11-13', is_until=True)
+                == '2026-11-13T14:59:59.999999+00:00')
+
+    def test_offset_honoured(self):
+        assert n3memory._parse_time_bound('2026-11-13T09:00+00:00') == '2026-11-13T09:00:00+00:00'
+        assert n3memory._parse_time_bound('2026-11-13T09:00Z') == '2026-11-13T09:00:00+00:00'
+
+    def test_t_and_space_same(self):
+        a = n3memory._parse_time_bound('2026-11-13T09:00:00')
+        b = n3memory._parse_time_bound('2026-11-13 09:00:00')
+        assert a == b == '2026-11-13T00:00:00+00:00'
+
+    def test_morning_record_found_by_local_date(self, tmp_path):
+        path = new_db(tmp_path)
+        add(path, 'saved at 08:00 JST on the 13th', ts='2026-11-12T23:00:00.123456+00:00')
+        since, until = n3memory._parse_time_range('2026-11-13', '2026-11-13')
+        conn = db.get_connection(path)
+        try:
+            rows = db.get_all_memories(conn, since=since, until=until)
+        finally:
+            conn.close()
+        assert len(rows) == 1
+
+    @pytest.mark.parametrize('argv,msg', [
+        (['--search', 'x', '--since', 'yesterday'], "--since: cannot read 'yesterday'"),
+        (['--list', '--until', '2026-13-01'], "--until: cannot read '2026-13-01'"),
+        (['--list', '--since', '2026-11-14', '--until', '2026-11-13'],
+         '--since is later than --until'),
+    ])
+    def test_unreadable_exits_2(self, monkeypatch, capsys, argv, msg):
+        monkeypatch.setattr('sys.argv', ['n3mc'] + argv)
+
+        def no_config():
+            raise AssertionError('must exit before doing anything')
+        monkeypatch.setattr(n3memory, '_load_config', no_config)
+        with pytest.raises(SystemExit) as ei:
+            n3memory.main()
+        assert ei.value.code == 2
+        assert msg in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- DB corruption (v1.5.0)
+class TestDbCorrupt:
+    def _make_files(self):
+        for sfx, data in (('', b'db'), ('-wal', b'wal'), ('-shm', b'shm')):
+            with open(n3memory.DB_PATH + sfx, 'wb') as f:
+                f.write(data)
+
+    def test_two_corruptions_two_backups_with_sidecars(self):
+        import re
+        self._make_files()
+        first = n3memory._handle_corrupt_db()
+        self._make_files()
+        second = n3memory._handle_corrupt_db()
+        assert first != second
+        pat = re.compile(r'^n3memory\.db\.corrupt-\d{14}(-\d+)?\.bak$')
+        for b, in_db in ((first, b'db'), (second, b'db')):
+            assert pat.match(os.path.basename(b))
+            with open(b, 'rb') as f:
+                assert f.read() == in_db
+            with open(b + '-wal', 'rb') as f:
+                assert f.read() == b'wal'
+            assert os.path.exists(b + '-shm')
+        assert not os.path.exists(n3memory.DB_PATH + '-wal')
+        assert 'db_corrupt' in notices()
+        assert second in notices()['db_corrupt']['message']
+
+    def test_quick_check_once_per_process(self, monkeypatch):
+        calls = []
+        real_get = n3memory.get_connection
+
+        class Spy:
+            def __init__(self, c):
+                self._c = c
+
+            def execute(self, sql, *a):
+                if 'quick_check' in sql:
+                    calls.append(1)
+                return self._c.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        monkeypatch.setattr(n3memory, 'get_connection', lambda p: Spy(real_get(p)))
+        c = {'owner_id': 'o'}
+        for i in range(3):
+            n3memory._buffer_direct(f'chunk {i}', c)
+        assert len(calls) == 1
+        assert count(n3memory.DB_PATH) == 3
+
+    def test_quick_check_failure_sets_db_aside(self, monkeypatch):
+        real_get = n3memory.get_connection
+        state = {'n': 0}
+
+        class Cur:
+            def fetchone(self):
+                return ('*** in database main *** page 3 corrupt',)
+
+        class Bad:
+            def __init__(self, c):
+                self._c = c
+
+            def execute(self, sql, *a):
+                if 'quick_check' in sql:
+                    return Cur()
+                return self._c.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        def get(p):
+            state['n'] += 1
+            conn = real_get(p)
+            return Bad(conn) if state['n'] == 1 else conn
+        monkeypatch.setattr(n3memory, 'get_connection', get)
+        n3memory._buffer_direct('after corruption', {'owner_id': 'o'})
+        backups = [p for p in os.listdir(n3memory.MEMORY_DIR) if '.corrupt-' in p]
+        assert any(p.endswith('.bak') for p in backups)
+        assert 'db_corrupt' in notices()
+        assert count(n3memory.DB_PATH) == 1
+
+
+# --------------------------------------------------------------------------- --init (v1.5.0)
+PRO_HOOK = 'python "C:/N3MC-Pro_X/N3MemoryCore/n3mc_hook.py"'
+
+
+class TestInit:
+    @pytest.fixture
+    def settings(self, tmp_path, monkeypatch):
+        home = tmp_path / 'fake_user'
+        (home / '.claude').mkdir(parents=True)
+        monkeypatch.setenv('HOME', str(home))
+        monkeypatch.setenv('USERPROFILE', str(home))
+        monkeypatch.setattr(n3memory, '_settings_path', REAL_SETTINGS_PATH)
+        path = home / '.claude' / 'settings.json'
+        assert os.path.normcase(n3memory._settings_path()) == os.path.normcase(str(path))
+        monkeypatch.setattr(n3memory.shutil, 'which',
+                            lambda n: f'C:\\fake\\Scripts\\{n}.EXE')
+        return path
+
+    def own_cmds(self, data, event):
+        return [h['command'] for e in data['hooks'][event] for h in e['hooks']
+                if n3memory.is_own_hook(h['command'], event)]
+
+    def test_pro_hook_kept_and_reported(self, settings, capsys):
+        settings.write_text(json.dumps({'hooks': {'UserPromptSubmit': [
+            {'hooks': [{'type': 'command', 'command': PRO_HOOK}]}]}}), encoding='utf-8')
+        assert n3memory.cmd_init() == 0
+        data = json.loads(settings.read_text(encoding='utf-8'))
+        cmds = [h['command'] for e in data['hooks']['UserPromptSubmit'] for h in e['hooks']]
+        assert PRO_HOOK in cmds
+        assert self.own_cmds(data, 'UserPromptSubmit') == ['C:/fake/Scripts/n3mc-hook.EXE']
+        assert 'Another N3MC hook is registered for UserPromptSubmit' in capsys.readouterr().out
+
+    def test_own_forms_replaced_not_duplicated(self, settings):
+        pkg_script = os.path.join(n3memory._PKG_DIR, 'n3mc_hook.py').replace('\\', '/')
+        old = ['C:/old/Scripts/n3mc-hook.exe', '/usr/bin/n3mc-hook',
+               '"C:/Python/python.exe" -m n3memorycore.n3mc_hook',
+               f'python "{pkg_script}"']
+        settings.write_text(json.dumps({'hooks': {
+            'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': c}]} for c in old],
+            'Stop': [{'hooks': [{'type': 'command',
+                                 'command': '"C:/P/python.exe" -m n3memorycore.n3mc_stop_hook'}]}],
+        }}), encoding='utf-8')
+        assert n3memory.cmd_init() == 0
+        data = json.loads(settings.read_text(encoding='utf-8'))
+        assert self.own_cmds(data, 'UserPromptSubmit') == ['C:/fake/Scripts/n3mc-hook.EXE']
+        assert self.own_cmds(data, 'Stop') == ['C:/fake/Scripts/n3mc-stop-hook.EXE']
+        assert len(data['hooks']['UserPromptSubmit']) == 1
+
+    def test_rerun_writes_nothing(self, settings, capsys):
+        settings.write_text('{"model": "x"}', encoding='utf-8')
+        assert n3memory.cmd_init() == 0
+        first = settings.read_bytes()
+        backups = sorted(p for p in os.listdir(settings.parent) if '.bak-n3mc-' in p)
+        assert len(backups) == 1
+        with open(settings.parent / backups[0], encoding='utf-8') as f:
+            assert f.read() == '{"model": "x"}'
+        capsys.readouterr()
+        assert n3memory.cmd_init() == 0
+        assert settings.read_bytes() == first
+        assert sorted(p for p in os.listdir(settings.parent) if '.bak-n3mc-' in p) == backups
+        assert 'no change' in capsys.readouterr().out
+
+    def test_invalid_settings_untouched_exit_1(self, settings):
+        settings.write_text('{"hooks": [,]}', encoding='utf-8')
+        assert n3memory.cmd_init() == 1
+        assert settings.read_text(encoding='utf-8') == '{"hooks": [,]}'
+        settings.write_text('{"permissions": {"allow": "Bash(x)"}}', encoding='utf-8')
+        assert n3memory.cmd_init() == 1
+        assert settings.read_text(encoding='utf-8') == '{"permissions": {"allow": "Bash(x)"}}'
+        assert not [p for p in os.listdir(settings.parent) if '.bak-n3mc-' in p]
+
+    def test_main_exit_status_1(self, settings, monkeypatch):
+        settings.write_text('not json', encoding='utf-8')
+        monkeypatch.setattr('sys.argv', ['n3mc', '--init'])
+        with pytest.raises(SystemExit) as ei:
+            n3memory.main()
+        assert ei.value.code == 1
+
+    def test_permission_rules_added_existing_kept(self, settings):
+        settings.write_text(json.dumps({'permissions': {'allow': ['Bash(git status)'],
+                                                        'deny': ['Bash(rm *)']}}),
+                            encoding='utf-8')
+        assert n3memory.cmd_init() == 0
+        perms = json.loads(settings.read_text(encoding='utf-8'))['permissions']
+        assert perms['allow'][0] == 'Bash(git status)'
+        assert perms['deny'] == ['Bash(rm *)']
+        for rule in n3memory.PERMISSION_RULES:
+            assert perms['allow'].count(rule) == 1
+        assert 'Bash(n3mc --show-turn *)' in perms['allow']
+        assert 'Bash(n3mc --recall-thread *)' in perms['allow']
+
+    def test_is_own_hook_unit(self):
+        own = n3memory.is_own_hook
+        assert own('C:/x/Scripts/n3mc-hook.EXE', 'UserPromptSubmit')
+        assert own('n3mc-stop-hook', 'Stop')
+        assert own('"/usr/bin/python3" -m n3memorycore.n3mc_hook', 'UserPromptSubmit')
+        assert not own(PRO_HOOK, 'UserPromptSubmit')
+        assert not own('echo n3mc_hook', 'UserPromptSubmit')
+        assert not own('n3mc-hook', 'Stop')
+
+
+# --------------------------------------------------------------------------- housekeeping (v1.5.0)
+class TestHousekeeping:
+    def test_stop_housekeeping(self, tmp_path, monkeypatch, capsys):
+        stop_in(tmp_path, monkeypatch)
+        old = os.path.join(n3memory.MEMORY_DIR, 'turn_id_old.txt')
+        new = os.path.join(n3memory.MEMORY_DIR, 'turn_id_new.txt')
+        for p in (old, new):
+            with open(p, 'w') as f:
+                f.write('t')
+        t = time.time() - 31 * 86400
+        os.utime(old, (t, t))
+        with open(n3memory.AUDIT_LOG, 'w', encoding='utf-8') as f:
+            f.write('x' * 100)
+        monkeypatch.setattr(n3memory, '_AUDIT_LOG_MAX_BYTES', 50)
+        n3memory.cmd_stop({})
+        assert not os.path.exists(old) and os.path.exists(new)
+        assert os.path.exists(n3memory.AUDIT_LOG + '.1')
+        assert not os.path.exists(n3memory.AUDIT_LOG)
+        assert 'Physical save failed' not in capsys.readouterr().err
+
+    def test_stop_never_prints_physical_save_warning(self, tmp_path, monkeypatch, capsys):
+        stop_in(tmp_path, monkeypatch)
+
+        def boom(path):
+            raise OSError('disk full')
+        monkeypatch.setattr(n3memory, '_ensure_behavior_md', boom)
+        n3memory.cmd_stop({})
+        err = capsys.readouterr().err
+        assert 'disk full' in err
+        assert 'Physical save failed' not in err
+
+
+# --------------------------------------------------------------------------- model retry (v1.5.0)
+class TestModelRetry:
+    @pytest.fixture(autouse=True)
+    def fresh(self, monkeypatch):
+        for attr, val in (('_model', None), ('_model_name', None),
+                          ('_configured_model', None), ('_model_failed_at', None),
+                          ('_model_failed_error', None)):
+            monkeypatch.setattr(proc, attr, val)
+
+    def test_no_retry_for_60_seconds(self, monkeypatch, capsys):
+        calls = []
+
+        def failing(name):
+            calls.append(name)
+            raise OSError('offline')
+        monkeypatch.setattr(proc, '_load_model', failing)
+        with pytest.raises(OSError):
+            proc.get_model('some/model')
+        with pytest.raises(RuntimeError):
+            proc.get_model()
+        assert len(calls) == 1
+        assert 'could not be loaded' in capsys.readouterr().err
+        monkeypatch.setattr(proc, '_model_failed_at', proc._model_failed_at - 61)
+        with pytest.raises(OSError):
+            proc.get_model()
+        assert calls == ['some/model', 'some/model']
+
+    def test_env_var_has_no_effect(self, monkeypatch):
+        names = []
+        monkeypatch.setenv('N3MC_EMBED_MODEL', 'bogus/model')
+        monkeypatch.setattr(proc, '_load_model', lambda name: names.append(name) or object())
+        proc.get_model()
+        assert names == [proc.DEFAULT_EMBED_MODEL]
+
+
+# --------------------------------------------------------------------------- packaging (v1.5.0)
+class TestPackaging:
+    def test_psutil_is_a_dependency(self):
+        tomllib = pytest.importorskip('tomllib')
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, 'pyproject.toml'), 'rb') as f:
+            deps = tomllib.load(f)['project']['dependencies']
+        assert any(d.split('>')[0].split('=')[0].strip().lower() == 'psutil' for d in deps)

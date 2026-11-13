@@ -4,6 +4,78 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-14
+
+Spec files renamed `v1.4.0 → v1.5.0`. Fixes from the review of the v1.4.0
+code generated from the spec (2026-11-13), applied through the
+specification. No schema changes; existing user DBs keep working without
+regeneration. `psutil` is now a required dependency.
+
+### Fixed
+- **`n3mc --init` removed other N3MC editions' hooks**: every hook whose
+  command contained `n3mc_hook` was replaced, so a Pro hook registered on
+  the same PC was silently deleted. Only this package's hooks (entry point,
+  `-m n3memorycore…`, or a script inside the package) are replaced now;
+  others are kept and reported. `settings.json` is backed up before a
+  change and written atomically; an invalid file is left untouched.
+- **Memories from other sessions were cut from search results**: `min_score`
+  and the relative cutoff compared the score after `b_session` (0.6), so a
+  record from another session older than about 21 days was dropped even on
+  an exact match, and keyword-only hits from other sessions never survived.
+  Both floors now use the score without `b_session`; the order is unchanged.
+- **Interrupted turns lost Claude's reply**: the UserPromptSubmit step that
+  should save the previous reply read `last_assistant_message`, which Claude
+  Code only sends to the Stop hook. The reply is now read from the session
+  transcript (`transcript_path`): the last text block before the new prompt,
+  the same text Stop receives, skipping the `[Request interrupted by user]`
+  marker; already-saved chunks are skipped.
+- **`--stop` removed unrelated `@…memory_context.md` lines**: only the line
+  pointing at this installation's own old file is removed now.
+- **Prose between two code blocks in a user message was lost**: the message
+  was chunked before purifying. The whole message is purified first.
+- **Keyword search rarely matched in automatic searches**: terms were ANDed
+  and the whole prompt was the query. Terms are now ORed, split at
+  punctuation, and terms under 3 characters (which trigram can never match)
+  are dropped.
+- **Every hook waited 60 s when the server could not start**: the wait now
+  stops when the server process exits; its stderr goes to
+  `.memory/server.log`, a `server_start_failed` notice names it, and no new
+  start is tried for 5 minutes.
+- **Duplicate servers while the model was loading** (psutil missing):
+  `psutil` is required, and a server still starting is never duplicated.
+- **A long `/repair` made `/health` time out**: the endpoints run in the
+  thread pool; the hook repairs at most 200 records per turn.
+- **A whole-number float in `config.json` broke every hook**
+  (`"search_query_max_chars": 2000.0`): each key now has a type and range;
+  out-of-range values are ignored with a `config_type` notice.
+  `config.json` is created exclusively (one `owner_id` when two hooks start
+  together) and updated atomically.
+- **The reply to an image-only prompt joined the previous exchange**: an
+  image-only prompt now starts a new `turn_id`.
+- **A second DB corruption overwrote the first backup, and the WAL was
+  deleted**: backups are time-stamped, the `-wal` / `-shm` files are moved
+  with them, and a `db_corrupt` notice is shown.
+- **`behavior_md_edited` never cleared and did not say which file**: one
+  notice per file, with its path, cleared when the file is updated.
+- **`--since` / `--until` were compared as UTC strings**: dates without an
+  offset are local time (like `saved=`), and unreadable values are an error.
+- **Smaller fixes**: `$N3MC_EMBED_MODEL` (never effective) removed; a failed
+  model load is retried at most once a minute; Japanese text is split into
+  chunks after `。！？`; `quick_check` runs once per process; requests with a
+  non-local `Host` header get 403; the server is detached from the hook
+  process; old `turn_id_*.txt` files are removed and `audit.log` is rotated
+  at 50 MB.
+
+### Changed
+- **`n3mc --init` also writes the permission rules** for the memory commands
+  to `~/.claude/settings.json`, so the rules file's "auto-allowed" holds in
+  every project.
+- **Spec corrections**: the FTS5 trigram unit is 3 characters (not bytes);
+  the DDL and `migrate_schema` list `session_id` / `turn_id`; the endpoint
+  table lists every body field and the Pro-only 403 endpoints; the test
+  tables match the real test names; team sharing over the network is
+  documented as not supported; macOS is no longer listed as a target.
+
 ## [1.4.0] - 2026-11-14
 
 Spec files renamed `v1.3.2 → v1.4.0`. Fixes found while running the Pro

@@ -286,7 +286,7 @@ class TestVectorSearch:
 
 
 # ---------------------------------------------------------------------------
-class TestGC:
+class TestRetentionAndRange:
     """Free edition has no TTL/auto-expire: records are retained indefinitely.
     Also verifies that --since/--until time-range filters work correctly."""
 

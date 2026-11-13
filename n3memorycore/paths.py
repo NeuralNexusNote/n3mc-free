@@ -30,6 +30,10 @@ CONTEXT_FILE = os.path.join(MEMORY_DIR, 'memory_context.md')
 CONTEXT_RETIRED_MARKER = os.path.join(MEMORY_DIR, '.memory_context_retired')
 NOTICES_FILE = os.path.join(MEMORY_DIR, 'notices.json')
 AUDIT_LOG    = os.path.join(MEMORY_DIR, 'audit.log')
+# v1.5.0: stderr of the background server, and the marker written when the
+# server exits during startup (spec §3 "Starting the server").
+SERVER_LOG   = os.path.join(MEMORY_DIR, 'server.log')
+SERVER_START_FAILED_MARKER = os.path.join(MEMORY_DIR, 'server_start_failed')
 CONFIG_FILE  = os.path.join(HOME_DIR,   'config.json')
 
 
