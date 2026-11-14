@@ -357,6 +357,7 @@ def hybrid_search(
     rel_ratio = config.get('relative_min_score_ratio', 0.6)
     pair_top_n = config.get('pair_top_n', 3)
     pair_max_chars = config.get('pair_max_chars', 3000)
+    min_results = config.get('min_results', 3)
 
     query = (query or '')[:max_query]
     if not query.strip():
@@ -365,7 +366,9 @@ def hybrid_search(
     conn = get_connection(db_path)
     try:
         # 1. Vector search; drop candidates below vector_min_cos
+        #    (kept aside with their actual cos for the weak-match fill, §5 step 7)
         vec_results = {}
+        vec_low = {}
         try:
             q_vec = embed_query(query)
             if since or until:
@@ -375,9 +378,7 @@ def hybrid_search(
                 rows = search_vector(conn, q_vec, k=limit * 3)
             for row in rows:
                 cs = cosine_sim_from_l2(row['distance'])
-                if cs < min_cos:
-                    continue
-                vec_results[row['id']] = {
+                (vec_low if cs < min_cos else vec_results)[row['id']] = {
                     'id':         row['id'],
                     'content':    row['content'],
                     'timestamp':  row['timestamp'],
@@ -414,37 +415,51 @@ def hybrid_search(
         fts_max_abs = max((abs(v['bm25_score']) for v in fts_results.values()),
                           default=0.0)
 
-        # 3. Score + min_score
-        scored = []
-        for rid in set(vec_results) | set(fts_results):
+        def _row(rid: str, use_low_cos: bool) -> dict:
             vec_r = vec_results.get(rid)
+            low_r = vec_low.get(rid) if use_low_cos else None
             fts_r = fts_results.get(rid)
-            meta = vec_r or fts_r
-            cs = vec_r['cos_sim'] if vec_r else 0.0
+            meta = vec_r or low_r or fts_r or vec_low[rid]
+            # spec §5 step 1: below vector_min_cos a record counts as an
+            # FTS-only hit (cos 0.0); a weak candidate keeps its actual cos.
+            if vec_r:
+                cs = vec_r['cos_sim']
+            elif low_r:
+                cs = low_r['cos_sim']
+            else:
+                cs = 0.0
             bm25 = fts_r['bm25_score'] if fts_r else 0.0
             kr = keyword_relevance(bm25, fts_max_abs, bm25_min)
             decay = time_decay(meta['timestamp'], half_life)
             sess = meta.get('session_id')
             # spec §3: b_session = 1.0 on match, 0.6 on mismatch/NULL
             b_session = 1.0 if (current_session_id and sess == current_session_id) else 0.6
-            # spec §3 (v1.5.0): b_session orders, it does not filter —
-            # min_score and the relative cutoff use filter_score.
-            filter_score = (cs * 0.7 + kr * 0.3) * decay
-            score = filter_score * b_session
-            if filter_score < min_score:
-                continue
-            scored.append({
+            # spec §3 (v1.6.0): time_decay and b_session order, they do not
+            # filter — min_score and the relative cutoff use filter_score.
+            filter_score = cs * 0.7 + kr * 0.3
+            return {
                 'id':                rid,
                 'content':           meta['content'],
                 'timestamp':         meta['timestamp'],
                 'session_id':        sess,
                 'turn_id':           meta.get('turn_id'),
                 'agent_name':        meta.get('agent_name'),
-                'score':             score,
+                'score':             filter_score * decay * b_session,
                 'filter_score':      filter_score,
                 'cos_sim':           cs,
                 'keyword_relevance': kr,
-            })
+            }
+
+        # 3. Score + min_score (dropped ids are remembered for step 7)
+        dropped: set = set(rid for rid in vec_low
+                           if rid not in vec_results and rid not in fts_results)
+        scored = []
+        for rid in set(vec_results) | set(fts_results):
+            row = _row(rid, use_low_cos=False)
+            if row['filter_score'] < min_score:
+                dropped.add(rid)
+                continue
+            scored.append(row)
         scored.sort(key=lambda x: (x['score'], x['timestamp'] or '', x['id']),
                     reverse=True)
 
@@ -458,9 +473,14 @@ def hybrid_search(
         # 5. Relative cut on filter_score (rows re-ordered as versions are kept)
         if scored and rel_ratio:
             top = max(r.get('filter_score', r['score']) for r in scored)
-            scored = [r for r in scored
-                      if r.get('filter_score', r['score']) >= top * rel_ratio
-                      or r.get('_version_group')]
+            kept_rows = []
+            for r in scored:
+                if (r.get('filter_score', r['score']) >= top * rel_ratio
+                        or r.get('_version_group')):
+                    kept_rows.append(r)
+                else:
+                    dropped.add(r['id'])
+            scored = kept_rows
 
         # 6. Identical content → one row
         scored = _collapse_identical_content(scored)
@@ -478,14 +498,42 @@ def hybrid_search(
             results.append(r)
             if len(results) >= limit:
                 break
+        for r in results:
+            r['weak'] = False
 
-        # 8. Q-A pairs: first pair_top_n turns, pair_max_chars in total
+        # 7b. Minimum-results fill with weak matches (spec §5 step 7, v1.6.0)
+        target = min(min_results, limit)
+        if len(results) < target and dropped:
+            weak_rows = [_row(rid, use_low_cos=True) for rid in dropped]
+            # filter_score ~0 = no signal (float32 L2→cos leaves ~1e-7)
+            weak_rows = [w for w in weak_rows if w['filter_score'] >= 1e-6]
+            weak_rows.sort(key=lambda x: (x['filter_score'], x['timestamp'] or '',
+                                          x['id']), reverse=True)
+            seen_content = {r.get('content') for r in results}
+            for w in weak_rows:
+                if len(results) >= target:
+                    break
+                if w['content'] in seen_content:
+                    continue
+                tid = w.get('turn_id')
+                if tid is not None:
+                    count = turn_id_counts.get(tid, 0)
+                    if count >= 2:
+                        continue
+                    turn_id_counts[tid] = count + 1
+                seen_content.add(w['content'])
+                w['weak'] = True
+                w['_weak'] = True
+                results.append(w)
+
+        # 8. Q-A pairs: first pair_top_n turns, pair_max_chars in total.
+        #    Weak matches are skipped (spec §5 "Q-A Pairing Contract" 4).
         pairs: dict = {}
         pairs_omitted: dict = {}
         used = 0
         for r in results:
             tid = r.get('turn_id')
-            if not tid or tid in pairs or tid in pairs_omitted:
+            if r.get('weak') or not tid or tid in pairs or tid in pairs_omitted:
                 continue
             if len(pairs) >= pair_top_n:
                 break
@@ -529,18 +577,29 @@ def _fmt_saved(ts: Optional[str]) -> str:
 SHOW_TURN_CMD = 'python -m n3memorycore.n3memory --show-turn'
 VERSION_NOTE = ("_If several versions of the same content appear, the one with "
                 "the newest `saved` time is the current one._")
+WEAK_HEADING = "## Possibly related (weak matches — may be unrelated)"
 
 
 def render_memory_context(search_result: dict, query: str,
                           notices: Optional[list] = None) -> str:
-    """spec §5 v1.4.0 rendering: notices → Top matches → Q-A pairs."""
-    results = search_result.get('results', [])
+    """spec §5 rendering: notices → Top matches → weak matches (v1.6.0)
+    → Q-A pairs."""
+    all_results = search_result.get('results', [])
+    results = [r for r in all_results if not r.get('weak')]
+    weak = [r for r in all_results if r.get('weak')]
     pairs = search_result.get('pairs', {})
     omitted = search_result.get('pairs_omitted', {}) or {}
 
     lines = ["# Recalled Memory Context", f"Search query: {query}", ""]
     for n in notices or []:
         lines.append(f"> ⚠️ N3MC notice: {n}")
+        lines.append("")
+
+    def _entry(i: int, r: dict) -> None:
+        agent = r.get('agent_name') or '-'
+        lines.append(f"## [{i}] score={r['score']:.4f} "
+                     f"saved={_fmt_saved(r.get('timestamp'))} {agent}")
+        lines.append(r['content'])
         lines.append("")
 
     if not results:
@@ -552,11 +611,13 @@ def render_memory_context(search_result: dict, query: str,
         lines.append(VERSION_NOTE)
         lines.append("")
         for i, r in enumerate(results, 1):
-            agent = r.get('agent_name') or '-'
-            lines.append(f"## [{i}] score={r['score']:.4f} "
-                         f"saved={_fmt_saved(r.get('timestamp'))} {agent}")
-            lines.append(r['content'])
-            lines.append("")
+            _entry(i, r)
+
+    if weak:
+        lines.append(WEAK_HEADING)
+        lines.append("")
+        for i, r in enumerate(weak, len(results) + 1):
+            _entry(i, r)
 
     exchanges = list(pairs.items())
     # An exchange cut before its first row appears only in pairs_omitted.

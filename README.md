@@ -85,8 +85,8 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 
 | File | Description |
 |---|---|
-| `N3MemoryCore_v1.5.0_Free_JP.md` | Free edition (Japanese) |
-| `N3MemoryCore_v1.5.0_Free_EN.md` | Free edition (English) |
+| `N3MemoryCore_v1.6.0_Free_JP.md` | Free edition (Japanese) |
+| `N3MemoryCore_v1.6.0_Free_EN.md` | Free edition (English) |
 
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
@@ -216,6 +216,19 @@ restarts automatically). If the file has a typo and cannot be read, it is left
 untouched and N3MC runs with defaults until you fix it; a notice about this
 appears at the top of the recalled context once a day. Write numbers without
 quotes.
+
+### Weak matches (min_results)
+
+When fewer than 3 records pass the relevance floors, N3MC adds the closest
+of the records it dropped, up to 3 in total, under a separate heading
+`## Possibly related (weak matches — may be unrelated)`. Claude is told to use
+them only when they are actually relevant. This keeps a question from getting
+no memory at all, at the cost of up to 3 extra, mostly unrelated chunks per
+turn. Set `"min_results": 0` in `~/.n3mc/config.json` to turn it off, or
+another number to change the count.
+
+Old records are never hidden by their age: age only lowers their rank below
+newer records of the same relevance.
 
 ### Backup and restore
 

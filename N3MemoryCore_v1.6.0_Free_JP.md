@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.5.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.6.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -105,7 +105,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.5.0_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.6.0_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -123,7 +123,7 @@ n3mc-free/                       # リポジトリルート
 │   ├── test_hooks.py
 │   ├── test_hooks_encoding.py
 │   ├── test_processor.py
-│   └── test_regressions.py      # v1.4.0 / v1.5.0 の修正の回帰テスト（モデル不要、§7 Layer 5）
+│   └── test_regressions.py      # v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要、§7 Layer 5）
 └── .claude/                     # プロジェクト固有 Claude Code 設定（git 追跡）
     ├── settings.json            # パーミッション許可リスト（フックはユーザー全体の ~/.claude/settings.json に登録 — §4 参照）
     ├── CLAUDE.md                # プロジェクト用ガイダンス（N3MC は何も書き足さない。旧版の memory_context.md への @import は --stop が取り除く）
@@ -385,6 +385,7 @@ PRAGMA wal_autocheckpoint = 1000;
   "search_query_max_chars": 2000,
   "vector_min_cos":       0.85,
   "relative_min_score_ratio": 0.6,
+  "min_results":          3,
   "pair_top_n":           3,
   "pair_max_chars":       3000,
   "version_order_enabled": true,
@@ -395,10 +396,11 @@ PRAGMA wal_autocheckpoint = 1000;
 
 - `bind_host`: サーバーが待ち受けるアドレス。既定の `127.0.0.1` のまま使う（§3「常駐型 FastAPI サーバー」）。
 - `search_result_limit`: `--search` が返す最大件数。
-- `min_score`: `--search` の結果からこの値未満のスコアを除外する（規定値 `0.2`）。`0.0` で無効化。
+- `min_score`: `--search` の結果から、`filter_score`（`time_decay` と `b_session` を掛けないスコア。§3「ランキング計算式」）がこの値未満のものを除外する（規定値 `0.2`）。`0.0` で無効化。
 - `search_query_max_chars`: 検索クエリから使用する最大文字数（規定値 `2000`）。embedding モデル（512トークン）は約2,000文字以上を意味的に処理できません。増加させるとFTSクエリが遅くなる場合があります。
 - `vector_min_cos`: ベクトル検索の候補にする cos 類似度の下限（規定値 `0.85`）。multilingual-e5 は無関係な記録どうしでも 0.80〜0.85 になるため、これ未満の候補を捨てる。**0.85 は `multilingual-e5-base` で測った値。** ほかの埋め込みモデルでは測り直すこと。目安は 0.80〜0.88（下げると拾いやすくなるが関係の薄い記録も混ざり、上げると差し込みは短くなるが関係のある記録も落ちやすい）。
-- `relative_min_score_ratio`: 1 位のスコアのこの倍率未満の結果を捨てる（規定値 `0.6`、§5「検索結果の絞り込みと並べ替え」）。`0.0` で無効化。
+- `relative_min_score_ratio`: `filter_score` が、最も高い `filter_score` のこの倍率未満の結果を捨てる（規定値 `0.6`、§5「検索結果の絞り込みと並べ替え」）。`0.0` で無効化。
+- `min_results`（v1.6.0）: 下限を通った結果がこの件数に満たないとき、足りない分を**弱い候補**（下限で落ちた候補）で補い、別の見出しの下に出す（規定値 `3`、§5「検索結果の絞り込みと並べ替え」の手順 7）。`0` で補充しない。
 - `pair_top_n` / `pair_max_chars`: Q-A の往復を差し込むのは上位 `pair_top_n` 件の往復だけ、合計 `pair_max_chars` 字まで（§5「Q-A ペアリング契約」）。
 - `version_order_enabled` / `version_sim_threshold` / `version_min_chars`: 同じ内容の新しい版を上に並べる処理（§5）。`0.98` も `multilingual-e5-base` で測った値。
 - v1.3.x の `dedup_threshold` と `context_char_limit` は**廃止**。既存の `config.json` に残っていても読まれない（消さなくてよい）。
@@ -527,7 +529,7 @@ def _build_fts_query(query: str) -> str:
 
 `--repair` 実行時に、既存 FTS レコードのうち句読点付きで登録されたものを検出し、句読点除去済みテキストで再登録せよ。この FTS クリーニングは**一度きりのマイグレーション**として実行し、完了後にマーカーファイル（`.memory/fts_punct_cleaned`）を作成せよ。マーカーが存在する場合はスキップし、毎セッション開始時の全件スキャンを回避すること。
 
-**FTSのみヒットした場合のスコア**: ベクトル検索にはヒットせず FTS のみにヒットしたレコードは、`cos_sim = 0.0` として統合スコアを計算し、結果に含めよ。最終スコアは最大でも `0.3 × time_decay × b_session` だが、ランキング対象から除外してはならない。`min_score`（0.2）と相対足切りは `filter_score`（`b_session` を**掛けない**スコア、下記）で判定するので、別セッションのキーワードのみのヒット（最終スコアは最大 0.3 × 0.6 = 0.18）も、`filter_score`（最大 0.3 × time_decay）が下限に届けば残る。
+**FTSのみヒットした場合のスコア**: ベクトル検索にはヒットせず FTS のみにヒットしたレコードは、`cos_sim = 0.0` として統合スコアを計算し、結果に含めよ。最終スコアは最大でも `0.3 × time_decay × b_session` だが、ランキング対象から除外してはならない。`min_score`（0.2）と相対足切りは `filter_score`（`time_decay` と `b_session` を**掛けない**スコア、下記）で判定するので、キーワードのみのヒット（`filter_score` は最大 0.3）は、`keyword_relevance` が 0.67 以上なら、どれほど古くても、どのセッションの記録でも残る。
 
 **ベクトル検索の owner_id フィルタ**: `search_vector` は単一ユーザー前提のシステムであるため、`owner_id` によるフィルタリングを行わない。KNN 検索は全レコードを対象とする（これは仕様上の設計判断であり、複数ユーザー対応時は要改修）。
 
@@ -550,6 +552,8 @@ $$time\_decay = 2^{-\frac{days\_elapsed}{half\_life\_days}}$$
 
 `days_elapsed` はレコード作成日時からの経過日数（浮動小数点）。`half_life_days` は `config.json` の値を使用する（規定値 90）。
 
+`time_decay` は**並び順にだけ使う**（v1.6.0）。`score` には入るが `filter_score` には入らない。古い記録は、同じ関連度の新しい記録より下に並ぶが、古いことを理由に落ちることはない（下の表）。
+
 **バイアス係数（Free 版）**:
 
 | バイアス | 条件 | 係数（固定値） |
@@ -561,14 +565,16 @@ $$time\_decay = 2^{-\frac{days\_elapsed}{half\_life\_days}}$$
 - バイアス係数は設定ファイルによる変更不可（固定値）。
 - `b_session` は、ベクトルと FTS の候補をまとめるのと同じループの中で Python で計算する（2 つの結果は Python でまとめるので、SQL の式にしても役に立たない）。
 
-**`b_session` は並べるためのもので、絞り込みには使わない（v1.5.0）**: 各候補は 2 つの値を持つ:
+**`time_decay` と `b_session` は並べるためのもので、絞り込みには使わない（`b_session` は v1.5.0、`time_decay` は v1.6.0 から）**: 各候補は 2 つの値を持つ:
 
 | 値 | 式 | 使い道 |
 |---|---|---|
-| `score` | `(cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay × b_session` | 結果の並び順（と表示する `score=`） |
-| `filter_score` | `(cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay` | `min_score` と相対足切り（§5「検索結果の絞り込みと並べ替え」の手順 2 と 4） |
+| `score` | `filter_score × time_decay × b_session` = `(cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay × b_session` | 結果の並び順（と表示する `score=`） |
+| `filter_score` | `cos_sim × 0.7 + keyword_relevance × 0.3`（`time_decay` も `b_session` も掛けない） | `min_score` と相対足切り（§5「検索結果の絞り込みと並べ替え」の手順 2 と 4）、弱い候補の並び順（手順 7） |
 
 > **⚠️ 理由（v1.5.0、Free v1.4.0 のレビューで見つかった）**: v1.4.0 では 2 つの下限とも最終スコアと比べていたため、`b_session`（0.6）と相対足切り（0.6）が掛け合わさっていた。現在のセッションにベクトルのヒットが 1 件（cos ≥ 0.85、score ≥ 0.6）あるだけで、別セッションの記録が残るには `cos × time_decay ≥` 1 位の cos が必要になった。半減期 90 日では、**約 21 日より古い別セッションの記録は、内容が完全に一致していてもすべて落ちた**（再現: 現在のセッションの cos 0.86 の記録は残り、30 日前の別セッションの cos 0.99 の記録は 0.33 になって足切り 0.602 × 0.6 = 0.361 を下回った）。別セッションのキーワードのみのヒット（最大 0.18）は常に `min_score` 0.2 を下回り、手動の `--search` はすべての記録を別セッションとして扱うので、キーワードのみのヒットを一度も出さなかった。現在のセッションの記録はすでに Claude のコンテキストにある。それ以外をすべて切ってしまうと、セッションをまたぐ記憶の意味がなくなる。
+
+> **⚠️ `time_decay` も `filter_score` から外した理由（v1.6.0、v1.5.0 の採点で見つかった）**: v1.5.0 は `filter_score` にまだ `time_decay` を掛けて `min_score`（0.2）と比べていた。半減期 90 日では、**DB にその 1 件しかなくても**、cos 0.86 の記録は約 150 日、cos 0.95 の記録は約 180 日で返らなくなった。記録は DB にも `--list` にも残るが、検索では引けない。実モデルでの測定（記録 50 件、質問 26 問）では、すべての記録を 1 年古くすると recall@3 が 23/26 から **0/26** になった。§1 は「一生の資産」としているので、古さで順位は下げてよいが、隠してはならない。`filter_score` から `time_decay` を外すと、1 年古くしたセットでも 23/26 に戻り、件数もノイズも変わらなかった。
 
 - `b_local`（エージェント／インストール粒度の分離）は Free 版では **適用しない** — 全レコードが一致／不一致に関わらず `b_local = 1.0` として扱われる。エージェント／インストール単位で記憶を分離する `B_local` 乗数は **Pro 機能**であり、Pro 版では一致時 `b_local = 1.0`、不一致時 `b_local = 0.8` を適用する。
 
@@ -654,6 +660,7 @@ db_path = base_dir + "\\data\\memory.db" # NG
 |---|---|---|
 | `server_port` | 整数 | 1〜65535 |
 | `search_result_limit`, `pair_top_n`, `pair_max_chars`, `search_query_max_chars`, `version_min_chars` | 整数 | ≥ 1 |
+| `min_results`（v1.6.0） | 整数 | ≥ 0 |
 | `half_life_days` | 数値（int または float） | > 0 |
 | `bm25_min_threshold` | 数値 | ≥ 0 |
 | `min_score`, `vector_min_cos`, `relative_min_score_ratio`, `version_sim_threshold` | 数値 | 0〜1 |
@@ -982,10 +989,11 @@ v1.3.x までは、`--search` の結果を `~/.n3mc/.memory/memory_context.md` �
 
 ### AI 行動指針ファイルの版（`_ensure_behavior_md`）
 
-`.claude/rules/n3mc-behavior.md` は Claude Code がセッション開始時に自動で読み込む。ひな形（`_BEHAVIOR_MD_CONTENT`）の 1 行目は版の目印 `<!-- n3mc-behavior v2 -->` とし、次の節を含める:
+`.claude/rules/n3mc-behavior.md` は Claude Code がセッション開始時に自動で読み込む。ひな形（`_BEHAVIOR_MD_CONTENT`）の 1 行目は版の目印 `<!-- n3mc-behavior v3 -->`（v1.6.0。v1.4.0〜v1.5.0 は `v2`）とし、次の節を含める:
 
 - **Fully Automatic Saving** — 全会話はフックが保存する。`--buffer` を手で呼ばない。保存成功時は沈黙。
 - **Recalled Memory Context** — 毎ターン、UserPromptSubmit フックの出力として `# Recalled Memory Context` が入る。`## Top matches` を先に読み、`## Previous matching Q-A exchanges` は補助として使う。同じ内容の版が複数あれば `saved` が新しいほうが今の版。`> ⚠️ N3MC notice:` の行があれば、その内容をユーザーに伝える。
+- **Weak Matches**（v1.6.0） — `## Possibly related (weak matches — may be unrelated)` の下の記録は関連度の下限を通っておらず、関係がないことが多い。質問に実際に関係があるときだけ使う。関係がなければ無視し、触れない。
 - **Active RAG** — 足りないときは `python -m n3memorycore.n3memory --search "<keywords>"` を自分で実行する（`n3mc` ではなく `python -m` 形式。理由は §4 ②）。
 - **Cut Exchanges** — Q-A の往復に `_(… omitted …)_` の行があり、省略された部分が答えに要るときは、そこに書かれた `python -m n3memorycore.n3memory --show-turn <turn_id>` を実行して全文を読む。
 - **Recall Acknowledgment** — 検索結果を実際に使ったときだけ、返答の冒頭でユーザーの言語で一言そえる。
@@ -1000,7 +1008,7 @@ v1.3.x までは、`--search` の結果を `~/.n3mc/.memory/memory_context.md` �
 | 中身が**過去に配布したひな形のどれかと同じ** | 控え（`n3mc-behavior.md.bak-n3mc-<日時>`）を取ってから、今のひな形で置き換える |
 | それ以外（ユーザーが手で編集した） | **置き換えない。** 知らせ `behavior_md_edited:<hash>` を出す（"The rules file <absolute path> has been edited by hand, so it was not updated. Merge the new template manually if needed."）。`<hash>` はファイルの絶対パスの SHA-256 の先頭 12 桁（16 進） |
 
-- 「過去のひな形と同じ」の判定は、改行を LF にそろえた中身の SHA-256 の先頭 16 桁を `_KNOWN_BEHAVIOR_MD_HASHES` と比べる。v1.3.x までのひな形は `ade0a59b94f59f9a` と `34ed39efe5a3833d`（git の履歴から）。
+- 「過去のひな形と同じ」の判定は、改行を LF にそろえた中身の SHA-256 の先頭 16 桁を `_KNOWN_BEHAVIOR_MD_HASHES` と比べる。v1.3.x までのひな形は `ade0a59b94f59f9a` と `34ed39efe5a3833d`（git の履歴から）。v1.4.0〜v1.5.0 の `v2` のひな形は `5af3c015c06c62c1`（v1.6.0 で追加。コミット `03e2119` と `4f10dbd` の `_BEHAVIOR_MD_CONTENT` から計算。両者は同じ）。
 - **ひな形を変えたら、目印の版を上げ、変える前のひな形のハッシュを `_KNOWN_BEHAVIOR_MD_HASHES` に足すこと。**
 - **古い知らせのキー**: v1.4.0 のキー `behavior_md_edited`（パスのハッシュなし）は上の決まりでは消えないので、`_ensure_behavior_md` が動くたびに消す。
 - **ファイルごとに 1 つの知らせ（v1.5.0）**: 知らせは PC に 1 つの `notices.json` に入るが、rules ファイルはプロジェクトごとにあるので、キーにパスのハッシュを含め、メッセージにファイル名を出す。v1.4.0 はパスを含まない 1 つのキーを使っていた。メッセージはどのプロジェクトのファイルのことかを示さず、ユーザーがひな形を取り込んだあとも、消すものがなかったので 1 日 1 回出続けていた。
@@ -1086,12 +1094,17 @@ Stop フックと同じ JSON を stdin から読み取り、`last_assistant_mess
 // POST /search 成功時
 {
   "results": [
-    {"id": "...", "content": "...", "score": 0.8523, "timestamp": "...", "turn_id": "..."},
+    {"id": "...", "content": "...", "score": 0.8523, "timestamp": "...", "turn_id": "...", "weak": false},
     ...
+    {"id": "...", "content": "...", "score": 0.4120, "timestamp": "...", "turn_id": "...", "weak": true}
   ],
   "pairs": {"<turn_id>": [{"id": "...", "content": "...", "timestamp": "..."}, ...]},
   "pairs_omitted": {"<turn_id>": <pair_max_chars で省略した分割の数>}
 }
+
+// "weak"（v1.6.0）: 最低件数の補充で足した弱い候補は true（§5「検索結果の絞り込みと
+// 並べ替え」の手順 7）。"weak": false の行がすべて先に並び、弱い候補はその後に来る。
+// この項目を見ないクライアントには、弱い候補はリストの最後の普通の結果に見える。
 
 // GET /list 成功時
 {
@@ -1148,6 +1161,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【AI行動指針】Active RAG**: 知識不足時、自発的に `--search` を実行せよ。`permissions.allow` により自動承認済み — 確認不要。
 - **【AI行動指針】想起時の明示**: `--search` の結果を**実際に応答に活用した**（以前保存された情報を想起して答えた）場合は、返答冒頭にユーザー言語で一言そえよ。例:「前回の回答がメモリに保存されています。」「以前の会話から該当情報を取り出しました。」／英語なら "Pulling this from earlier memory in this session."。**関連メモリが無かった / 取得内容を実際には使わなかった場合は告知しない。** 「検索した」ことではなく「想起した」ことだけを述べよ。これにより、ユーザーは記憶レイヤが生きていることを毎ターン視認できる。
 - **【AI行動指針】記憶コンテキストの読み方**: 毎ターンの記憶は UserPromptSubmit フックの出力（`# Recalled Memory Context`）として入る。`## Top matches` を先に読み、Q-A の往復は補助として使う。同じ内容の版が複数あれば `saved` が新しいほうが今の版。往復が省略されていて全文が要るときは、省略の行にある `--show-turn` を実行する。`> ⚠️ N3MC notice:` があればユーザーに伝える。
+- **【AI行動指針】弱い候補（v1.6.0）**: `## Possibly related (weak matches — may be unrelated)` の下の記録は関連度の下限を通っておらず、検索が空にならないように足しただけのもの。質問に実際に関係があるときだけ使う。関係がなければ無視し、触れない（「関係のない記憶が見つかった」とも言わない）。
 
 ### 5.4 実装仕様の詳細
 
@@ -1158,7 +1172,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   - **空クエリ**（画像のみのプロンプト、または `--search ""`）→ `# Recalled Memory Context\n\n_No relevant memories found._\n`。
   - **サーバ不通 / `/search` が非 2xx エラー** → `# Recalled Memory Context\n\n_(memory search unavailable: <reason>)_\n`。
   - **ポートが別のフォルダのサーバー** → §3 の文面。
-  - **検索成功** → レンダリング済み markdown（Top matches + Q-A exchanges）。
+  - **検索成功** → レンダリング済み markdown（Top matches、弱い候補があればその見出し、Q-A exchanges の順。§5「Q-A ペアリング契約」5）。
   - どの場合も、出す知らせ（§3「知らせ」）があれば、見出し `# Recalled Memory Context` の直後（検索結果では `Search query:` の行の直後）に入れる。
 - **【実装仕様】stdin 入力**: `--buffer` は引数の代わりに `-` を指定すると標準入力からテキストを読み取る（例: `cat file.txt | n3mc --buffer -`）。ただし Stop フック（`n3memorycore/n3mc_stop_hook.py`）内では `--buffer -` を使用してはならない。Stop フック自身が stdin から Claude Code の JSON を受け取るため、二重消費になり壊れる。オプションで `--agent-id NAME` 引数を指定すると、レコードの **`agent_name`**（表示名）を設定できる（例: `n3mc --buffer "テキスト" --agent-id "claude-code"`）。名前に反して `local_id` は設定しない。名前は互換のために残している（§3.7）。
 - **【実装仕様】複数行コードブロックは `[code omitted]` に置換される**: 複数行コードブロック（```...```）は文書設計に従い `[code omitted]` に置換される——N3MemoryCore は会話テキストを記録する製品であり、ソースコードは記録対象外。インラインコード（`...`）はそのまま保持。コード以外の会話テキストは長さフィルタ／スキップパターンフィルタなしで一字一句保存される（上記「完全記録契約」参照）。`purify_text` / `_purify` の `_CODE_BLOCK_RE` は閉じた複数行フェンスのみを置換し、インラインコードと未閉フェンスは触らない。
@@ -1184,12 +1198,12 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 2. **Claude 側のペアリング**: Stop フックが C_k（Claude 応答）を保存する際、`.memory/turn_id_<session>.txt` から T_k を読み取り、すべての [claude i/N] チャンクに付与します。ファイルはクリアしません（次の UserPromptSubmit が上書きします）。
 3. **リカバリ経路**: Stop フックがスキップされた場合、次回 UserPromptSubmit の Step 2 が `transcript_path`（§4.5 `--hook-submit`）から C_k を読み、ファイルの T_k で保存するので、U_k と C_k は同一 turn_id を共有します。（v1.4.0 は C_k が UserPromptSubmit の入力にあるものとしていましたが、Claude Code はそこには決して送らないため、この経路は動いていませんでした。）
 4. **ペア復元**: `/search` は `results`（スコア順ヒット）、`pairs`（同 turn_id の兄弟行を順序付きで取得）、`pairs_omitted` の 3 フィールドを返します。並び順は [user] → [claude]、各ロール内では rowid 順。
-   - **差し込む往復の数と量（v1.4.0）**: `pairs` に入れるのは、`results` の上から順に見て最初の `pair_top_n`（3）個の turn_id だけ。兄弟行を順に足し、全往復の合計が `pair_max_chars`（3,000 字）を超える行からあとは入れない。その往復の残りの行数を `pairs_omitted[turn_id]` に入れ、そのあとの往復は入れない。最初の行だけで上限を超える往復は `pairs` に入れず、`pairs_omitted[turn_id]` にその往復の全行数を入れる（描画では `### turn_id: <turn_id>` と省略の行だけを出す）。v1.3.x は上位すべての往復の全兄弟行を入れていたため、差し込みが 1 ターンで 2 万字を超えることがあった。
+   - **差し込む往復の数と量（v1.4.0）**: `pairs` に入れるのは、`results` の上から順に見て最初の `pair_top_n`（3）個の turn_id だけ。**弱い候補（`weak: true`、v1.6.0）はこの走査で飛ばす**。弱い候補の往復は `pairs` に入らない。兄弟行を順に足し、全往復の合計が `pair_max_chars`（3,000 字）を超える行からあとは入れない。その往復の残りの行数を `pairs_omitted[turn_id]` に入れ、そのあとの往復は入れない。最初の行だけで上限を超える往復は `pairs` に入れず、`pairs_omitted[turn_id]` にその往復の全行数を入れる（描画では `### turn_id: <turn_id>` と省略の行だけを出す）。v1.3.x は上位すべての往復の全兄弟行を入れていたため、差し込みが 1 ターンで 2 万字を超えることがあった。
 
    **実装上の重要規定**: `hybrid_search` は `{"results", "pairs"}` を返すが、**`results` から pair 所属の record を除外してはならない**。`results` は score-ranked の全 hits を含む（pair 所属でも残す）。`pairs` はそれとは独立に、各 turn_id ごとの全 siblings を含む補助情報として返す。重複は許容（renderer 側が Top matches を先頭、pairs を後に配置することで Claude の読み順を制御するため、重複しても害はない）。
 5. **レンダリング（v1.2.0+、v1.4.0 で日時と省略の行を追加）**: 検索結果の markdown（`render_memory_context`）は **`## Top matches (use these to answer the question)` ブロックを先頭** に置く。Top matches はスコア順の高スコア record を含み、**Q-A pair に含まれているレコードも除外せずそのまま含める**（pair 所属で result から消さない）。Q-A pairs は **`## Previous matching Q-A exchanges (supplementary context)`** ブロックとして Top matches **の後** に配置する補助情報。Top matches と Q-A pairs に同じ record が重複出現することを許容する（無害 — Claude は Top matches を先に読んで使うため）。
 
-   出力の形（v1.4.0）:
+   出力の形（v1.4.0。弱い候補は v1.6.0 で追加）:
 
    ```markdown
    # Recalled Memory Context
@@ -1204,6 +1218,11 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
    ## [1] score=0.8123 saved=2026-11-13 10:34 (UTC+0900) claude-code
    <content>
 
+   ## Possibly related (weak matches — may be unrelated)
+
+   ## [2] score=0.4120 saved=2025-08-02 21:15 (UTC+0900) claude-code
+   <content>
+
    ## Previous matching Q-A exchanges (supplementary context)
 
    ### turn_id: <turn_id> saved=2026-11-13 10:34 (UTC+0900)
@@ -1214,6 +1233,8 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
    - `saved=` は DB の UTC の値を**ローカル時刻**に直し、`(UTC±hhmm)` を付ける（`_fmt_saved`）。往復の `saved=` はその往復の最初の行の時刻。
    - Top matches の先頭に「同じ内容の版が複数あれば saved が新しいほうが今の版」という一文を入れる。設定を作り直すと古い版と新しい版の両方が出るため、どちらが今の版か Claude が見分けられるようにする。
    - 省略の行は `pairs_omitted` にある往復の最後に出す。
+   - **弱い候補（v1.6.0）**: `weak: true` の行は、Top matches の後、Q-A の往復の前に、`## Possibly related (weak matches — may be unrelated)` の見出しの下に、同じ `## [n] score=… saved=… <agent_name>` の形で出す。番号は Top matches から続ける（ブロックの中で `[n]` は重ならない）。見出しは弱い候補が 1 件以上あるときだけ出す。
+   - **Top matches が 0 件で弱い候補があるとき（v1.6.0）**: Top matches のブロック（`## Top matches` の見出しと版の一文）の代わりに `_No relevant memories found._` を出し、その後に弱い候補の見出しと行を `[1]` から出す。どちらも 0 件のときは、これまでどおり `_No relevant memories found._` だけ。
 6. **スキーマ**: `memories.turn_id TEXT` 列 + `idx_memories_turn_id` インデックス。`insert_memory(..., turn_id=None)` はキーワード専用引数。取得には `get_memories_by_turn_id(conn, turn_id)` を使用します。
 
 > **補足: レンダリング順序の設計背景**
@@ -1227,12 +1248,12 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 1 つの長い Claude 応答が複数チャンクに分割されると、ハイブリッド検索で同一 `turn_id` の兄弟チャンクが Top-K を埋め尽くす病的ケースが発生する。これを防ぐため、`hybrid_search` の結果整形時に **同一 `turn_id` あたり最大 2 チャンクまで** とし、3 件目以降は Top-K リストから除外する（除外されたチャンクは `pairs`（Q-A 兄弟）セクションには出力される）。`turn_id` が NULL のレコード（手動 `--buffer` 等）はこの cap の対象外。
 
-### 検索結果の絞り込みと並べ替え（v1.4.0。v1.5.0 から下限は `filter_score` で判定）
+### 検索結果の絞り込みと並べ替え（v1.4.0。v1.5.0 から下限は `filter_score` で判定。v1.6.0 から弱い候補で補充）
 
 `hybrid_search` はスコアを計算したあと、次の順で結果を整える。v1.3.x は `min_score`（0.2）だけで、無関係な記録も cos 類似度 0.80〜0.85 で候補に残り、差し込みが長く・関係の薄いものになっていた。
 
 1. **ベクトル候補の下限**: cos_sim が `vector_min_cos`（0.85）未満のベクトル候補は捨てる（FTS にもヒットしていれば、`cos_sim = 0.0` の FTS のみヒットとして残る）。
-2. **スコア計算と `min_score`**: `score` と `filter_score` を計算する（§3「バイアス係数」）。**`filter_score`** が `min_score` 未満の結果を捨てる。
+2. **スコア計算と `min_score`**: `score` と `filter_score` を計算する（§3「バイアス係数」。v1.6.0 から `filter_score` には `time_decay` も `b_session` も掛けない）。**`filter_score`** が `min_score` 未満の結果を捨てる。残りを `score` の順に並べる。
 3. **同じ内容の版の並べ替え（`_order_versions_newest_first`、`version_order_enabled` が true のとき）**: 設定を作り直すと、古い版と新しい版の両方が出て、古い版が上に来ることがある。Q-A の差し込みは上から `pair_max_chars` まで入れるので、古い版しか入らないおそれがある。そこで:
    - 結果の各 turn_id について、その往復の「最初の `[claude` の行で、content が `version_min_chars`（100）字以上のもの」の埋め込み（`memories_vec` に保存済みのもの）を代表とする。代表のない往復・turn_id のない結果は対象外。
    - **別の turn_id どうし**で代表の cos 類似度が `version_sim_threshold`（0.98）以上なら同じ内容の版とみなし、グループにする（推移的に結ぶ）。
@@ -1243,11 +1264,20 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 4. **相対の足切り**: **`filter_score`** が、最も高い `filter_score` の `relative_min_score_ratio`（0.6）倍未満の結果を捨てる。ただし `_version_group` の印の付いた行は落とさない（古い版も残す）。手順 3 は位置の間で行を動かし、各位置は自分の `score` を保つ。`filter_score` も同じように位置とともに動く。
 5. **完全に同じ content の集約（`_collapse_identical_content`）**: content が完全に同じ結果は、いちばん上の位置に 1 件だけ残し、その中身（id・timestamp・turn_id）は**新しい記録**のものにする。
 6. **turn_id ごとの 2 件の上限**（上記「Top-K のチャンク重複対策」）と `search_result_limit`。
-7. **Q-A の往復の選択**（`pair_top_n` / `pair_max_chars`、上記「Q-A ペアリング契約」）。
+7. **弱い候補による最低件数の補充（v1.6.0）**: 手順 6 の後に残った結果が `min(min_results, search_result_limit)` 件に満たないとき、**この検索で取得したが手順 1・2・4 で落ちた候補**から、足りない分を足す。
+   - 弱い候補になるのは、手順 1 の `vector_min_cos` で落ちたベクトル候補（**実際の `cos_sim` で計算する**。FTS のみヒットとしての `0.0` ではない）と、`min_score`（手順 2）・相対の足切り（手順 4）で落ちた結果。手順 1 で落ちて FTS にもヒットした記録は、実際の `cos_sim` と `keyword_relevance` を持つ 1 件の候補とする。`filter_score` が `1e-6` 未満（類似度もキーワードも寄与なし。float32 のベクトルの L2 → cos の変換では、直交するベクトルでも約 `1e-7` が残るので、ちょうど `0` とは比べない）の候補は足さない。`since` / `until` の範囲は普通の結果と同じく効く（弱い候補も同じ絞り込み済みの検索から来る）。
+   - **`filter_score` の高い順**に取る（同じ値なら `(timestamp, id)` の新しいほうが先）。`score` は普通の結果と同じ式で計算して `score=` に表示するが、弱い候補の並び順には使わない。
+   - 手順 5（同じ content の集約）と手順 6（turn_id ごとに 2 件まで）は、足す行にも、**すでに結果にある行と合わせて**当てる。content が結果の行と同じ候補や、その `turn_id` の行がすでに結果に 2 件ある候補は飛ばして次を見る。
+   - 合計が `min(min_results, search_result_limit)` に達するか、候補がなくなったら止める。足した行にはすべて `_weak` の印を付ける（`/search` では `"weak": true`、§4.5）。弱い候補は常に普通の行のすべてより後に来る。
+   - `min_results: 0` ではこの手順を行わない。空のクエリには候補がないので、何も返さない。
+   - 弱い候補は、普通の結果の手順 3〜6 には関わらない（版の並べ替えで動かさず、相対の足切りの 1 位の値にも数えない）。
+8. **Q-A の往復の選択**（`pair_top_n` / `pair_max_chars`、上記「Q-A ペアリング契約」）。`_weak` の付いていない行だけを見る。
+
+> **注: 弱い候補を足す理由（v1.6.0、v1.5.0 の採点で見つかった）**: 下限は差し込む文脈を短く保つように決めてあるので、記憶がまったく入らないターンがあった。実モデルでの測定（記録 50 件、質問 26 問）では、1 問あたり平均 1.0 件で、26 問中 2 問は 0 件だった。弱い候補を 3 件まで補うと、recall@3 は 23/26 から 24/26 になり、1 問あたりおよそ 2 件の弱い候補が加わった。**欠点**: 毎ターン最大 3 件（チャンクは最大 400 字）が増え、その大半は関係の薄い記録で、無関係な質問でも必ず 3 件返る。Claude が読み飛ばせるように見出しを分け、大きな Q-A の往復のブロックが弱い記録で埋まらないように、往復の選択から外している。見出し、`min_results` の名前、指示の文面は N3MC Lite と共通にする。
 
 ---
 
-## 6. 自律評価（[N3MC v1.5.0 Evidence Report]）
+## 6. 自律評価（[N3MC v1.6.0 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **実装完了の定義**: 以下のテスト 1〜7 を自律実施 → `n3mc --init` 実行（「次のセッションから保存できます。」が表示される）→ 満点（⭐⭐⭐⭐⭐）で報告するまでが「実装完了」。テスト 8〜10 はセッション中の実動作（`--search` 実行・フック発火・会話ターン）で自動的に確認される。3ステップすべてが完了して初めて実装完了とみなす。
@@ -1289,7 +1319,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
       ```
       合格基準: `OK` が出力されること（この確認はこのパッケージのエントリポイントかモジュールを探すので、ほかの版の `n3mc_hook.py` では満たされない。また §4 ② のパーミッションのルールも確かめる）。失敗した場合は**実装が完了していない** — `n3mc --init`（経路 A）または §4 ① の冪等インストーラ（経路 B）を再実行してから次のサブテストへ進むこと。このゲートを飛ばすと、プロジェクトディレクトリ内で実行する次の 2 サブテストは（ローカルフックや手動実行のおかげで）通ってしまうが、ユーザーが他のディレクトリで開くセッションでは静かに発火しない — まさにこのゲートが防ぎたい「セッション間 RAG が機能しない」事故が温存される。
    2. **UserPromptSubmit**: **n3mc-free プロジェクトディレクトリの外**（例: `~`）で起動した Claude Code セッションからユーザー発言を送り、`# Recalled Memory Context` がそのターンのコンテキストに入っていること（フックの stdout）。直前の Claude 回答（Stop が保存しなかったときはトランスクリプトから読む。§4.5）とユーザー発言の両方が DB に保存されていること（`n3mc --list` で `[claude]`・`[user]` プレフィックス付きレコードを確認）。「プロジェクト外で実行する」ことが必須 — プロジェクト内で実行するとグローバル登録の欠落を見逃す。
-   3. **Stop**: 同じプロジェクト外セッションを終了した後、Claude の最終回答が DB に保存されていること。プロジェクトの `.claude/rules/n3mc-behavior.md` の 1 行目が `<!-- n3mc-behavior v2 -->` であること。プロジェクトの `.claude/CLAUDE.md` に `memory_context.md` の `@import` 行が**ない**こと。
+   3. **Stop**: 同じプロジェクト外セッションを終了した後、Claude の最終回答が DB に保存されていること。プロジェクトの `.claude/rules/n3mc-behavior.md` の 1 行目が `<!-- n3mc-behavior v3 -->` であること。プロジェクトの `.claude/CLAUDE.md` に `memory_context.md` の `@import` 行が**ない**こと。
 
 8. **stdout 出力テスト（memory_context.md を作らない）**: `--search` を実行し、結果が **stdout に出力される**こと、および `~/.n3mc/.memory/memory_context.md` が**作られない**ことを確認せよ。
 
@@ -1329,7 +1359,7 @@ n3mc-free/
     ├── test_api.py          # Layer 3: FastAPIエンドポイントテスト（TestClient）
     ├── test_hooks.py        # Layer 4: フック統合（完全保存チャンク化、画像除去、監査ログ）
     ├── test_hooks_encoding.py # サロゲート除去・UTF-8 の回帰テスト
-    └── test_regressions.py  # Layer 5: v1.4.0 / v1.5.0 の修正の回帰テスト（モデル不要）
+    └── test_regressions.py  # Layer 5: v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要）
 ```
 
 **本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。
@@ -1400,9 +1430,9 @@ python -m pytest tests/ -v
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |
 
-> 上の件数は v1.4.0 のテスト一式のもの。v1.5.0 はテストを Layer 5 にだけ足すので、これらの表はそのまま有効。再生成したテスト一式と違う場合は、件数ではなく、ここにあるクラス名とテスト名に合わせること。
+> 上の件数は v1.4.0 のテスト一式のもの。v1.5.0 と v1.6.0 はテストを Layer 5 にだけ足すので、これらの表はそのまま有効。再生成したテスト一式と違う場合は、件数ではなく、ここにあるクラス名とテスト名に合わせること。
 
-### Layer 5: `test_regressions.py`（v1.4.0 / v1.5.0）
+### Layer 5: `test_regressions.py`（v1.4.0〜v1.6.0）
 
 埋め込みは `zlib.crc32` から作る決定論的な偽のベクトル（`fake_embed`）に差し替え、モデルなしで数秒で終わること。
 
@@ -1411,15 +1441,15 @@ python -m pytest tests/ -v
 | `TestFtsQuoting` | `\ / # = @ * $ %`・`AND/OR/NOT`・`"`・制御文字を含むクエリで例外にならない、記号を含む語がヒットする、`search_fts` が例外を出しても `hybrid_search` が続く。**v1.5.0**: 語を `OR` でつなぐ（文のようなクエリが、その語の一部だけを含む記録にヒットする）、3 文字未満の語（`AI`、`東京`）は捨て、そういう語だけのクエリは FTS を飛ばす、クエリの句読点で語が分かれる（`「アルファ9」の気温は？` が `架空の惑星「アルファ9」の気温設定` にヒットする） |
 | `TestVectorFilter` | `since` 付きの検索で範囲内の記録が KNN の上位外にあっても返る、`rowid IN` が使えないときに全件計算に切り替わる |
 | `TestNoSimilarityDedup` | 似た分割（cos ≥ 0.95）がすべて保存される、同じ `turn_id` の完全一致は飛ばす、別の `turn_id` の完全一致は保存する、`turn_id` なしは全体で完全一致を飛ばす |
-| `TestSearchShaping` | `vector_min_cos` 未満の候補を捨てる、相対の足切り、`_version_group` は足切りで落ちない、新しい版が上に来る、同じ content の集約、`pair_top_n`・`pair_max_chars` と `pairs_omitted`。**v1.5.0**: 類似度の低い現在のセッションの記録があっても、類似度の高い 30 日前の別セッションの記録が相対の足切りで残る、別セッションのキーワードのみのヒットが `min_score` で残る、並びは今も最終スコア順（現在のセッションが先） |
-| `TestRender` | `saved=` がローカル時刻、版の一文、省略の行に `--show-turn`、知らせが先頭に出る |
+| `TestSearchShaping` | `vector_min_cos` 未満の候補を捨てる、相対の足切り、`_version_group` は足切りで落ちない、新しい版が上に来る、同じ content の集約、`pair_top_n`・`pair_max_chars` と `pairs_omitted`。**v1.5.0**: 類似度の低い現在のセッションの記録があっても、類似度の高い 30 日前の別セッションの記録が相対の足切りで残る、別セッションのキーワードのみのヒットが `min_score` で残る、並びは今も最終スコア順（現在のセッションが先）。**v1.6.0**: 類似度の高い 400 日前の記録が、ほかに候補がなくても返る（`min_score` と相対の足切りは `time_decay` を見ない）、同じ類似度の新しい記録と 400 日前の記録が両方返り、新しいほうが上に来る |
+| `TestRender` | `saved=` がローカル時刻、版の一文、省略の行に `--show-turn`、知らせが先頭に出る。**v1.6.0**: 弱い候補が Top matches の後、Q-A の往復の前に `## Possibly related (weak matches — may be unrelated)` の下に出て、番号は Top matches から続く、Top matches が 0 件なら `_No relevant memories found._` の後に弱い候補の見出しが出る（行は `[1]` から）、弱い候補がなければその見出しは出ない |
 | `TestNoContextFile` | `--search` が `memory_context.md` を作らない、`--stop` が CLAUDE.md からこのインストールの `CONTEXT_FILE` の `@import` を取り除く（控えあり・CRLF のまま・空白を含むパス・スラッシュでもバックスラッシュでも）、該当行がなければ触れない、旧ファイルを消してマーカーを作る。**v1.5.0**: 相対の `@../.memory/memory_context.md`、ほかのフォルダの `memory_context.md` を指す `@` の行、`@docs/notes_about_memory_context.md` は残す |
-| `TestBehaviorMd` | 目印が同じなら触れない、過去のひな形なら控えを取って置き換える、手で編集したものは置き換えず知らせを出す。**v1.5.0**: 知らせのキーにパスのハッシュが入り、メッセージにパスが入る、手で編集したファイルが 2 つあれば知らせも 2 つ、ファイルの 1 行目が今の目印になったら知らせが消える |
+| `TestBehaviorMd` | 目印が同じなら触れない、過去のひな形なら控えを取って置き換える（**v1.6.0**: `v2` のひな形、ハッシュ `5af3c015c06c62c1` も含む。新しいファイルの 1 行目は `<!-- n3mc-behavior v3 -->` で、Weak Matches の節がある）、手で編集したものは置き換えず知らせを出す。**v1.5.0**: 知らせのキーにパスのハッシュが入り、メッセージにパスが入る、手で編集したファイルが 2 つあれば知らせも 2 つ、ファイルの 1 行目が今の目印になったら知らせが消える |
 | `TestServerDecision` | 正常／`code_version` 違い／別のフォルダ／`root` なしで確かめられない、`/shutdown` を先に使う、`root` が違えば 403、死んだ PID ファイルは待たない |
 | `TestServerStart`（v1.5.0） | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え） |
 | `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る |
 | `TestForeignServer` | 別のフォルダのサーバーのとき、保存は自分の DB に直接、検索はしない、`--repair` は何もしない |
-| `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
+| `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
 | `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない。**v1.5.0**: 前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く |
 | `TestPurifyBeforeChunk`（v1.5.0） | 2 つのコードブロックとその間の文章を持つ 500 字を超えるユーザー発言で、文章は残り、どちらのコードブロックも保存されない、400 字より長いコードブロックは保存されず置き換えられる |
 | `TestChunkSentences`（v1.5.0） | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
@@ -1429,6 +1459,7 @@ python -m pytest tests/ -v
 | `TestHousekeeping`（v1.5.0） | `--stop` が 30 日より古い `turn_id_*.txt` を消し、新しいものは残す、50 MB を超えた `audit.log` を `audit.log.1` にローテーションする（テストではサイズのしきい値を差し替える） |
 | `TestModelRetry`（v1.5.0） | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |
 | `TestPackaging`（v1.5.0） | `psutil` が `pyproject.toml` の `dependencies` に入っている |
+| `TestWeakMatches`（v1.6.0） | 下限を通った結果が 1 件で `min_results: 3` なら弱い候補が 2 件足され、`filter_score` の順に並び、`/search` で `"weak": true` が付き、普通の行の後に来る、`vector_min_cos` 未満の候補は実際の cos で足される（`filter_score` もその cos で計算）、`min_results: 0` では何も足さない、十分な件数が通ったときは足さない、`search_result_limit` が `min_results` より小さければ合計はその上限まで、結果の行と同じ content の候補や、すでに 2 件ある `turn_id` の候補は飛ばす、`filter_score` が `1e-6` 未満の候補（直交するベクトル）は足さない、弱い候補は `pairs` に使わない、空のクエリでは弱い候補も返さない |
 
 ### 実行方法
 

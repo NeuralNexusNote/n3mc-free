@@ -1,4 +1,4 @@
-"""Layer 5: regression tests for the v1.4.0 / v1.5.0 fixes (spec §7).
+"""Layer 5: regression tests for the v1.4.0 – v1.6.0 fixes (spec §7).
 
 No embedding model: vectors are deterministic fakes. Real data and real
 servers are never touched (conftest._isolate_real_data).
@@ -83,6 +83,9 @@ BASE_CFG = {
     'relative_min_score_ratio': 0.6, 'pair_top_n': 3, 'pair_max_chars': 3000,
     'version_order_enabled': True, 'version_sim_threshold': 0.98,
     'version_min_chars': 100,
+    # The floor tests check the floors alone; TestWeakMatches turns the
+    # v1.6.0 weak-match fill on.
+    'min_results': 0,
 }
 
 
@@ -1624,3 +1627,194 @@ class TestPackaging:
         with open(os.path.join(root, 'pyproject.toml'), 'rb') as f:
             deps = tomllib.load(f)['project']['dependencies']
         assert any(d.split('>')[0].split('=')[0].strip().lower() == 'psutil' for d in deps)
+
+
+# =========================================================================== v1.6.0
+DAY = timedelta(days=1)
+
+
+def days_ago(n: float) -> str:
+    return (datetime.now(timezone.utc) - n * DAY).isoformat()
+
+
+class TestSearchShaping(TestSearchShaping):  # v1.6.0 additions (A1)
+    def test_old_record_returned_alone(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        add(path, 'ancient fact', emb=at_cos(0.95), ts=days_ago(400))
+        out = proc.hybrid_search(path, 'zzz', cfg(min_score=0.2))
+        assert [r['content'] for r in out['results']] == ['ancient fact']
+        r = out['results'][0]
+        assert r['filter_score'] == pytest.approx(0.95 * 0.7)   # no time_decay
+        assert r['score'] < 0.2 <= r['filter_score']
+
+    def test_new_and_old_both_returned_new_first(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        add(path, 'old version', emb=at_cos(0.92), ts=days_ago(400))
+        add(path, 'new version', emb=at_cos(0.92, axis=2), ts=days_ago(1))
+        out = proc.hybrid_search(path, 'zzz', cfg(min_score=0.2))
+        assert [r['content'] for r in out['results']] == ['new version', 'old version']
+
+
+class TestWeakMatches:  # v1.6.0 (A2)
+    def _db(self, tmp_path):
+        path = new_db(tmp_path)
+        add(path, 'strong', emb=at_cos(0.95))
+        add(path, 'weak a', emb=at_cos(0.80, axis=2))
+        add(path, 'weak b', emb=at_cos(0.70, axis=3))
+        add(path, 'weak c', emb=at_cos(0.60, axis=4))
+        return path
+
+    def test_fill_to_min_results(self, tmp_path, query_vec):
+        out = proc.hybrid_search(self._db(tmp_path), 'zzz', cfg(min_results=3))
+        res = out['results']
+        assert [r['content'] for r in res] == ['strong', 'weak a', 'weak b']
+        assert [r['weak'] for r in res] == [False, True, True]
+        # a candidate below vector_min_cos keeps its actual cos
+        assert res[1]['filter_score'] == pytest.approx(0.80 * 0.7)
+
+    def test_zero_disables(self, tmp_path, query_vec):
+        out = proc.hybrid_search(self._db(tmp_path), 'zzz', cfg(min_results=0))
+        assert [r['content'] for r in out['results']] == ['strong']
+
+    def test_nothing_added_when_enough(self, tmp_path, query_vec):
+        path = self._db(tmp_path)
+        add(path, 'strong 2', emb=at_cos(0.94, axis=5))
+        add(path, 'strong 3', emb=at_cos(0.93, axis=6))
+        out = proc.hybrid_search(path, 'zzz', cfg(min_results=3))
+        assert not any(r['weak'] for r in out['results'])
+        assert len(out['results']) == 3
+
+    def test_result_limit_caps_total(self, tmp_path, query_vec):
+        out = proc.hybrid_search(self._db(tmp_path), 'zzz',
+                                 cfg(min_results=3, search_result_limit=2))
+        assert [r['content'] for r in out['results']] == ['strong', 'weak a']
+
+    def test_min_score_and_relative_cut_rows_are_candidates(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        add(path, 'top', emb=at_cos(0.99))
+        add(path, 'cut by relative', emb=at_cos(0.40, axis=2))
+        out = proc.hybrid_search(path, 'zzz',
+                                 cfg(vector_min_cos=0.0, min_results=2))
+        assert [(r['content'], r['weak']) for r in out['results']] == \
+            [('top', False), ('cut by relative', True)]
+
+    def test_identical_content_and_turn_cap(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        add(path, 'same text', emb=at_cos(0.95))
+        add(path, 'same text', emb=at_cos(0.80, axis=2))          # identical content
+        add(path, 't1 row a', emb=at_cos(0.94, axis=3), turn_id='t1')
+        add(path, 't1 row b', emb=at_cos(0.93, axis=4), turn_id='t1')
+        add(path, 't1 row c', emb=at_cos(0.79, axis=5), turn_id='t1')  # turn already has 2
+        add(path, 'other', emb=at_cos(0.50, axis=6))
+        out = proc.hybrid_search(path, 'zzz',
+                                 cfg(min_results=4, relative_min_score_ratio=0.0))
+        assert [r['content'] for r in out['results']] == \
+            ['same text', 't1 row a', 't1 row b', 'other']
+        assert out['results'][-1]['weak'] is True
+
+    def test_zero_filter_score_never_added(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        add(path, 'strong', emb=at_cos(0.95))
+        add(path, 'orthogonal', emb=unit(7))                       # cos 0
+        out = proc.hybrid_search(path, 'zzz', cfg(min_results=3))
+        assert [r['content'] for r in out['results']] == ['strong']
+
+    def test_weak_not_used_for_pairs(self, tmp_path, query_vec):
+        path = new_db(tmp_path)
+        add(path, '[user] strong q', emb=at_cos(0.95), turn_id='ts')
+        add(path, '[user] weak q', emb=at_cos(0.80, axis=2), turn_id='tw')
+        add(path, '[claude] weak a', emb=unit(9), turn_id='tw')
+        out = proc.hybrid_search(path, 'zzz', cfg(min_results=3))
+        assert any(r['weak'] and r['turn_id'] == 'tw' for r in out['results'])
+        assert 'tw' not in out['pairs'] and 'tw' not in out['pairs_omitted']
+        assert 'ts' in out['pairs']
+
+    def test_empty_query_no_weak(self, tmp_path, query_vec):
+        out = proc.hybrid_search(self._db(tmp_path), '   ', cfg(min_results=3))
+        assert out['results'] == []
+
+    def test_weak_flag_in_api_response(self, tmp_path, query_vec):
+        # /search returns hybrid_search's dict as is: the key survives JSON
+        out = proc.hybrid_search(self._db(tmp_path), 'zzz', cfg(min_results=3))
+        js = json.loads(json.dumps(out))
+        assert [r['weak'] for r in js['results']] == [False, True, True]
+
+    def test_default_config_has_min_results_3(self):
+        assert n3memory._DEFAULT_CONFIG['min_results'] == 3
+
+
+class TestRender(TestRender):  # v1.6.0 additions
+    @staticmethod
+    def _row(content, weak, tid=None):
+        return {'id': content, 'content': content, 'score': 0.5, 'weak': weak,
+                'timestamp': '2026-01-01T00:00:00+00:00', 'agent_name': 'claude-code',
+                'turn_id': tid}
+
+    def test_weak_section_between_top_and_pairs(self):
+        md = proc.render_memory_context(
+            {'results': [self._row('top one', False, 't'), self._row('weak one', True)],
+             'pairs': {'t': [{'id': 'x', 'content': '[user] q', 'timestamp': None}]},
+             'pairs_omitted': {}}, 'q')
+        top = md.index('## Top matches')
+        weak = md.index(proc.WEAK_HEADING)
+        qa = md.index('## Previous matching Q-A exchanges')
+        assert top < weak < qa
+        assert proc.WEAK_HEADING == '## Possibly related (weak matches — may be unrelated)'
+        assert md.index('## [2] score=') > weak
+        assert md.index('weak one') > weak
+
+    def test_no_top_matches_but_weak(self):
+        md = proc.render_memory_context(
+            {'results': [self._row('weak one', True)], 'pairs': {}, 'pairs_omitted': {}}, 'q')
+        assert '## Top matches' not in md and 'newest `saved`' not in md
+        assert md.index('_No relevant memories found._') < md.index(proc.WEAK_HEADING)
+        assert '## [1] score=' in md
+
+    def test_no_weak_heading_without_weak_rows(self):
+        md = proc.render_memory_context(
+            {'results': [self._row('top one', False)], 'pairs': {}, 'pairs_omitted': {}}, 'q')
+        assert proc.WEAK_HEADING not in md
+
+
+def _v2_template() -> str:
+    """The v1.4.0 – v1.5.0 template, rebuilt from the current one."""
+    t = n3memory._BEHAVIOR_MD_CONTENT.replace(
+        '<!-- n3mc-behavior v3 -->', '<!-- n3mc-behavior v2 -->')
+    start = t.index('## Weak Matches')
+    end = t.index('## Active RAG')
+    return t[:start] + t[end:]
+
+
+class TestBehaviorMd(TestBehaviorMd):  # v1.6.0 additions
+    def test_marker_is_v3_with_weak_section(self):
+        assert n3memory._BEHAVIOR_MD_MARKER == '<!-- n3mc-behavior v3 -->'
+        assert '## Weak Matches' in n3memory._BEHAVIOR_MD_CONTENT
+
+    def test_v2_template_hash_known(self):
+        assert n3memory._behavior_md_hash(_v2_template()) == '5af3c015c06c62c1'
+        assert '5af3c015c06c62c1' in n3memory._KNOWN_BEHAVIOR_MD_HASHES
+
+    def test_v2_template_replaced(self, tmp_path, monkeypatch):
+        claude_dir = stop_in(tmp_path, monkeypatch)
+        rule = claude_dir / 'rules' / 'n3mc-behavior.md'
+        rule.write_text(_v2_template(), encoding='utf-8')
+        n3memory.cmd_stop({})
+        text = rule.read_text(encoding='utf-8')
+        assert text.splitlines()[0].strip() == '<!-- n3mc-behavior v3 -->'
+        assert '## Weak Matches' in text
+        assert [p for p in os.listdir(rule.parent) if '.bak-n3mc-' in p]
+
+
+class TestConfig(TestConfig):  # v1.6.0 additions
+    @pytest.mark.parametrize('value', ['-1', '1.5'])
+    def test_min_results_out_of_range_ignored(self, value):
+        write_cfg('{' + IDS + f', "min_results": {value}' + '}')
+        c = n3memory._load_config()
+        assert c['min_results'] == 3
+        assert 'min_results' in notices()['config_type']['message']
+
+    def test_min_results_zero_accepted(self):
+        write_cfg('{' + IDS + ', "min_results": 0}')
+        c = n3memory._load_config()
+        assert c['min_results'] == 0
+        assert 'config_type' not in notices()

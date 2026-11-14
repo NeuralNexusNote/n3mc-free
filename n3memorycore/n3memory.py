@@ -199,6 +199,7 @@ _DEFAULT_CONFIG: dict = {
     "search_query_max_chars":   2000,
     "vector_min_cos":           0.85,   # measured with multilingual-e5-base
     "relative_min_score_ratio": 0.6,
+    "min_results":              3,      # weak-match fill, spec §5 step 7 (v1.6.0)
     "pair_top_n":               3,
     "pair_max_chars":           3000,
     "version_order_enabled":    True,
@@ -216,6 +217,7 @@ _CONFIG_RULES: dict = {
     'pair_max_chars':           ('int', 1, None, False),
     'search_query_max_chars':   ('int', 1, None, False),
     'version_min_chars':        ('int', 1, None, False),
+    'min_results':              ('int', 0, None, False),
     'half_life_days':           ('num', 0, None, True),
     'bm25_min_threshold':       ('num', 0, None, False),
     'min_score':                ('num', 0, 1, False),
@@ -1646,7 +1648,7 @@ def cmd_show_turn(turn_id: str, cfg: dict) -> None:
 # --stop: behavior rules + memory_context retirement (spec §4)
 # ---------------------------------------------------------------------------
 
-_BEHAVIOR_MD_MARKER = '<!-- n3mc-behavior v2 -->'
+_BEHAVIOR_MD_MARKER = '<!-- n3mc-behavior v3 -->'
 
 _BEHAVIOR_MD_CONTENT = _BEHAVIOR_MD_MARKER + """
 # N3MemoryCore Behavioral Guidelines
@@ -1667,6 +1669,12 @@ to your context. Read `## Top matches` first; use
 versions of the same content appear, the one with the newest `saved` time is
 the current one. If the block contains a `> ⚠️ N3MC notice:` line, tell the
 user what it says.
+
+## Weak Matches
+Records under `## Possibly related (weak matches — may be unrelated)` did not
+pass the relevance floors and are often unrelated. Use one only when it is
+actually relevant to the question; if it is not, ignore it and do not mention
+it.
 
 ## Active RAG
 When prior context would help, run a search proactively. **Always invoke via
@@ -1702,6 +1710,7 @@ If a save fails physically, surface the warning prominently:
 _KNOWN_BEHAVIOR_MD_HASHES = frozenset({
     'ade0a59b94f59f9a',  # v1.2.x – v1.3.x
     '34ed39efe5a3833d',  # v1.2.0 scaffolding
+    '5af3c015c06c62c1',  # v2 template, v1.4.0 – v1.5.0
 })
 
 
