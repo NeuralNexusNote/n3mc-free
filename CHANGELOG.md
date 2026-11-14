@@ -4,6 +4,34 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-15
+
+Spec files renamed `v1.5.0 → v1.6.0`. Fixes from scoring the v1.5.0 code
+(2026-11-15), applied through the specification. No schema changes. This
+version adds a `config.json` key (`min_results`) and a new heading in the
+recalled context, so search results change.
+
+### Fixed
+- **Records older than about 5–6 months were never returned**: `min_score`
+  and the relative cutoff still compared a score multiplied by `time_decay`
+  (90-day half-life), so a record stopped being returned at about 150 days
+  (cos 0.86) to 180 days (cos 0.95) even when it was the only record in the
+  DB. Both floors now ignore `time_decay`; it only orders the results. In a
+  measurement with the real model (50 records, 26 questions), making every
+  record one year older no longer changes recall@3 (23/26; v1.5.0: 0/26).
+
+### Added
+- **Weak matches** (`min_results`, default 3): when fewer results pass the
+  floors, the shortfall is filled with the best candidates the floors
+  dropped, shown under `## Possibly related (weak matches — may be
+  unrelated)` and marked `"weak": true` in `/search`. They are not used for
+  the Q-A exchanges. `0` turns the fill off. Measured: recall@3 23/26 →
+  24/26, about 1.9 weak rows per question, and unrelated questions now
+  always get 3 rows.
+- The rules template (`.claude/rules/n3mc-behavior.md`) is now
+  `<!-- n3mc-behavior v3 -->` with a "Weak Matches" section; an unedited v2
+  file is backed up and replaced automatically.
+
 ## [1.5.0] - 2026-11-14
 
 Spec files renamed `v1.4.0 → v1.5.0`. Fixes from the review of the v1.4.0

@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.5.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.6.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -105,7 +105,7 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.5.0_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.6.0_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
@@ -123,7 +123,7 @@ n3mc-free/                       # Repository root
 │   ├── test_hooks.py
 │   ├── test_hooks_encoding.py
 │   ├── test_processor.py
-│   └── test_regressions.py      # regression tests for the v1.4.0 / v1.5.0 fixes (no model needed, §7 Layer 5)
+│   └── test_regressions.py      # regression tests for the v1.4.0 – v1.6.0 fixes (no model needed, §7 Layer 5)
 └── .claude/                     # Project-scoped Claude Code config (tracked)
     ├── settings.json            # Permission allowlist (Hooks live in user-global ~/.claude/settings.json — see §4)
     ├── CLAUDE.md                # Per-project guidance (N3MC adds nothing; --stop removes the memory_context.md @import written by older versions)
@@ -385,6 +385,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
   "search_query_max_chars": 2000,
   "vector_min_cos":       0.85,
   "relative_min_score_ratio": 0.6,
+  "min_results":          3,
   "pair_top_n":           3,
   "pair_max_chars":       3000,
   "version_order_enabled": true,
@@ -395,10 +396,11 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 
 - `bind_host`: Address the server listens on. Keep the default `127.0.0.1` (§3 "Resident FastAPI Server").
 - `search_result_limit`: Maximum number of results returned by `--search`.
-- `min_score`: Excludes results with a score below this value from `--search` output (default `0.2`). Set to `0.0` to disable.
+- `min_score`: Excludes results whose `filter_score` (the score without `time_decay` and `b_session`; §3 "Ranking Formula") is below this value from `--search` output (default `0.2`). Set to `0.0` to disable.
 - `search_query_max_chars`: Maximum characters used from a search query (default `2000`). The embedding model (512 tokens) cannot process more than ~2000 chars meaningfully. Increase at the cost of slower FTS queries.
 - `vector_min_cos`: Minimum cosine similarity for a vector-search candidate (default `0.85`). With multilingual-e5, even unrelated records score 0.80–0.85, so candidates below this are discarded. **0.85 was measured with `multilingual-e5-base`.** Re-measure for other embedding models. A reasonable range is 0.80–0.88 (lower picks up more but mixes in weakly related records; higher shortens the injected context but is more likely to drop relevant records).
-- `relative_min_score_ratio`: Discards results scoring below this fraction of the top score (default `0.6`; §5 "Search Result Filtering and Ordering"). Set to `0.0` to disable.
+- `relative_min_score_ratio`: Discards results whose `filter_score` is below this fraction of the highest `filter_score` (default `0.6`; §5 "Search Result Filtering and Ordering"). Set to `0.0` to disable.
+- `min_results` (v1.6.0): When fewer results than this pass the floors, the shortfall is filled with **weak matches** — candidates the floors dropped, shown under a separate heading (default `3`; §5 "Search Result Filtering and Ordering", step 7). Set to `0` to disable the fill.
 - `pair_top_n` / `pair_max_chars`: Only the exchanges of the top `pair_top_n` results are injected as Q-A exchanges, up to `pair_max_chars` characters in total (§5 "Q-A Pairing Contract").
 - `version_order_enabled` / `version_sim_threshold` / `version_min_chars`: Ordering newer versions of the same content first (§5). `0.98` was also measured with `multilingual-e5-base`.
 - `dedup_threshold` and `context_char_limit` from v1.3.x are **removed**. If they remain in an existing `config.json`, they are ignored (no need to delete them).
@@ -528,7 +530,7 @@ def _build_fts_query(query: str) -> str:
 
 During `--repair`, detect existing FTS records that were indexed with punctuation and re-register them with stripped text. This FTS cleaning runs as a **one-time migration**: after completion, create a marker file (`.memory/fts_punct_cleaned`). If the marker exists, skip the scan to avoid a full-table scan on every session start.
 
-**Score for FTS-only Hits**: Records that appear in FTS results but not in vector search results should be included in results with `cos_sim = 0.0` for integrated score calculation. Their final score is at most `0.3 × time_decay × b_session`, but they must not be excluded from ranking. Because `min_score` (0.2) and the relative cutoff are judged on `filter_score` (the score **without** `b_session`, below), a keyword-only hit from another session (at most 0.3 × 0.6 = 0.18 as a final score) is still kept when its `filter_score` (at most 0.3 × time_decay) reaches the floor.
+**Score for FTS-only Hits**: Records that appear in FTS results but not in vector search results should be included in results with `cos_sim = 0.0` for integrated score calculation. Their final score is at most `0.3 × time_decay × b_session`, but they must not be excluded from ranking. Because `min_score` (0.2) and the relative cutoff are judged on `filter_score` (the score **without** `time_decay` and `b_session`, below), a keyword-only hit (at most 0.3 as a `filter_score`) is kept when its `keyword_relevance` is at least 0.67, however old it is and whichever session wrote it.
 
 **Vector Search owner_id Filter**: Since `search_vector` is a single-user system, no filtering by `owner_id` is performed. KNN search targets all records. (This is a deliberate design decision; multi-user support would require rework.)
 
@@ -551,6 +553,8 @@ $$time\_decay = 2^{-\frac{days\_elapsed}{half\_life\_days}}$$
 
 `days_elapsed` is the elapsed days (floating point) since the record's creation timestamp. Use the `half_life_days` value from `config.json` (default 90).
 
+`time_decay` **only orders** the results (v1.6.0): it is part of `score`, not of `filter_score`, so an old record is ranked below a newer one of the same relevance but is never dropped for its age (see the table below).
+
 **Bias coefficients (Free edition)**:
 
 | Bias | Condition | Coefficient (fixed value) |
@@ -562,14 +566,16 @@ $$time\_decay = 2^{-\frac{days\_elapsed}{half\_life\_days}}$$
 - Bias coefficients are fixed values and cannot be changed via the configuration file.
 - Compute `b_session` in Python, in the same loop that merges the vector and FTS candidates (the two result sets are combined in Python, so a SQL `CASE` would not help).
 
-**`b_session` orders; it does not filter (v1.5.0)**: every candidate carries two values:
+**`time_decay` and `b_session` order; they do not filter (`b_session` since v1.5.0, `time_decay` since v1.6.0)**: every candidate carries two values:
 
 | Value | Formula | Used for |
 |---|---|---|
-| `score` | `(cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay × b_session` | The order of the results (and the `score=` shown) |
-| `filter_score` | `(cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay` | `min_score` and the relative cutoff (§5 "Search Result Filtering and Ordering", steps 2 and 4) |
+| `score` | `filter_score × time_decay × b_session` = `(cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay × b_session` | The order of the results (and the `score=` shown) |
+| `filter_score` | `cos_sim × 0.7 + keyword_relevance × 0.3` (no `time_decay`, no `b_session`) | `min_score` and the relative cutoff (§5 "Search Result Filtering and Ordering", steps 2 and 4), and the order of the weak matches (step 7) |
 
 > **⚠️ Why (v1.5.0, found in the Free v1.4.0 review)**: in v1.4.0 both floors compared the final score, so `b_session` (0.6) and the relative cutoff (0.6) multiplied. As soon as the current session had one vector hit (cos ≥ 0.85, score ≥ 0.6), another session's record needed `cos × time_decay ≥` the top cos to survive: with the 90-day half-life, **every record from another session older than about 21 days was cut even when its content matched exactly** (reproduced: a current-session record at cos 0.86 stayed, a 30-day-old record from another session at cos 0.99 scored 0.33 and fell under the cutoff 0.602 × 0.6 = 0.361). A keyword-only hit from another session (at most 0.18) was always under `min_score` 0.2, and manual `--search` treats every record as another session, so it never showed keyword-only hits. The current session's records are already in Claude's context; cutting everything else defeated the purpose of cross-session memory.
+
+> **⚠️ Why `time_decay` left `filter_score` too (v1.6.0, found when scoring v1.5.0)**: v1.5.0 still multiplied `filter_score` by `time_decay` and compared it with `min_score` (0.2). With the 90-day half-life, a record stopped being returned at about 150 days (cos 0.86) to 180 days (cos 0.95) **even when it was the only record in the DB**; it stayed in the DB and in `--list`, but search could no longer reach it. In a measurement with the real model (50 records, 26 questions), making every record one year older dropped recall@3 from 23/26 to **0/26**. §1 promises a lifelong asset, so age may lower a record's rank but must not hide it. Without `time_decay` in `filter_score`, the one-year-old set returned 23/26 again, with the same number of results and no more noise.
 
 - `b_local` (agent / installation grouping) is **not** applied in Free — every record is treated as `b_local = 1.0` regardless of match. The `B_local` multiplier that separates memories per agent / install is a **Pro feature**; in Pro it applies `b_local = 1.0` on match and `b_local = 0.8` on mismatch.
 
@@ -655,6 +661,7 @@ Users edit `config.json` by hand (e.g. to tune `vector_min_cos`), so assume it m
 |---|---|---|
 | `server_port` | integer | 1–65535 |
 | `search_result_limit`, `pair_top_n`, `pair_max_chars`, `search_query_max_chars`, `version_min_chars` | integer | ≥ 1 |
+| `min_results` (v1.6.0) | integer | ≥ 0 |
 | `half_life_days` | number (int or float) | > 0 |
 | `bm25_min_threshold` | number | ≥ 0 |
 | `min_score`, `vector_min_cos`, `relative_min_score_ratio`, `version_sim_threshold` | number | 0–1 |
@@ -983,10 +990,11 @@ Up to v1.3.x, `--search` results were also written to `~/.n3mc/.memory/memory_co
 
 ### Behavior Guidelines File Versioning (`_ensure_behavior_md`)
 
-Claude Code loads `.claude/rules/n3mc-behavior.md` automatically at session start. The first line of the template (`_BEHAVIOR_MD_CONTENT`) is the version marker `<!-- n3mc-behavior v2 -->`, and the template contains the following sections:
+Claude Code loads `.claude/rules/n3mc-behavior.md` automatically at session start. The first line of the template (`_BEHAVIOR_MD_CONTENT`) is the version marker `<!-- n3mc-behavior v3 -->` (v1.6.0; `v2` in v1.4.0 – v1.5.0), and the template contains the following sections:
 
 - **Fully Automatic Saving** — hooks save every conversation. Do not call `--buffer` manually. Stay silent on successful saves.
 - **Recalled Memory Context** — every turn, `# Recalled Memory Context` arrives as the output of the UserPromptSubmit hook. Read `## Top matches` first and use `## Previous matching Q-A exchanges` as supplementary context. If several versions of the same content appear, the one with the newer `saved` is the current one. If there is a `> ⚠️ N3MC notice:` line, relay its content to the user.
+- **Weak Matches** (v1.6.0) — records under `## Possibly related (weak matches — may be unrelated)` did not pass the relevance floors and are often unrelated. Use one only when it is actually relevant to the question; if it is not, ignore it and do not mention it.
 - **Active RAG** — when context is insufficient, run `python -m n3memorycore.n3memory --search "<keywords>"` yourself (the `python -m` form, not `n3mc`; see §4 ② for why).
 - **Cut Exchanges** — if a Q-A exchange has an `_(… omitted …)_` line and the omitted part is needed for the answer, run the `python -m n3memorycore.n3memory --show-turn <turn_id>` written there to read the full text.
 - **Recall Acknowledgment** — only when search results actually shape the reply, open the reply with a short acknowledgment in the user's language.
@@ -1001,7 +1009,7 @@ File handling:
 | Content is **identical to one of the previously distributed templates** | Back it up (`n3mc-behavior.md.bak-n3mc-<datetime>`), then replace it with the current template |
 | Anything else (edited by the user) | **Do not replace it.** Emit the notice `behavior_md_edited:<hash>` ("The rules file <absolute path> has been edited by hand, so it was not updated. Merge the new template manually if needed."), where `<hash>` is the first 12 hex chars of the SHA-256 of the file's absolute path |
 
-- "Identical to a previous template" is decided by comparing the first 16 hex chars of the SHA-256 of the content (with line endings normalized to LF) against `_KNOWN_BEHAVIOR_MD_HASHES`. The templates up to v1.3.x are `ade0a59b94f59f9a` and `34ed39efe5a3833d` (from the git history).
+- "Identical to a previous template" is decided by comparing the first 16 hex chars of the SHA-256 of the content (with line endings normalized to LF) against `_KNOWN_BEHAVIOR_MD_HASHES`. The templates up to v1.3.x are `ade0a59b94f59f9a` and `34ed39efe5a3833d` (from the git history). The `v2` template of v1.4.0 – v1.5.0 is `5af3c015c06c62c1` (added in v1.6.0; computed from `_BEHAVIOR_MD_CONTENT` at commits `03e2119` and `4f10dbd`, which are identical).
 - **Whenever the template changes, bump the marker version and add the hash of the previous template to `_KNOWN_BEHAVIOR_MD_HASHES`.**
 - **Old notice key**: the v1.4.0 key `behavior_md_edited` (without a path hash) can no longer be cleared by the rule above, so `_ensure_behavior_md` removes it whenever it runs.
 - **One notice per file (v1.5.0)**: notices live in one `notices.json` per PC, but rules files are per project, so the key includes a hash of the path and the message names the file. v1.4.0 used one key without the path: the message did not say which project's file was meant, and it kept appearing once a day after the user had merged the template, because nothing cleared it.
@@ -1086,12 +1094,18 @@ Reads the same Stop-hook JSON from stdin, extracts `last_assistant_message`, app
 // POST /search — on success
 {
   "results": [
-    {"id": "...", "content": "...", "score": 0.8523, "timestamp": "...", "turn_id": "..."},
+    {"id": "...", "content": "...", "score": 0.8523, "timestamp": "...", "turn_id": "...", "weak": false},
     ...
+    {"id": "...", "content": "...", "score": 0.4120, "timestamp": "...", "turn_id": "...", "weak": true}
   ],
   "pairs": {"<turn_id>": [{"id": "...", "content": "...", "timestamp": "..."}, ...]},
   "pairs_omitted": {"<turn_id>": <number of chunks omitted due to pair_max_chars>}
 }
+
+// "weak" (v1.6.0): true for the weak matches added by the minimum-results fill
+// (§5 "Search Result Filtering and Ordering", step 7). They always come after
+// every row with "weak": false. Clients that ignore the key see the weak matches
+// as ordinary results at the end of the list.
 
 // GET /list — on success
 {
@@ -1148,6 +1162,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[AI Behavioral Guidelines] Active RAG**: When knowledge is insufficient, proactively execute `--search` to retrieve relevant memories. The command is auto-approved via `permissions.allow` — no confirmation needed.
 - **[AI Behavioral Guidelines] Recall acknowledgment**: When `--search` results **actually shape your reply** (you are recalling information saved in an earlier turn), open the reply with a short acknowledgment **in the user's language**, e.g. Japanese 「前回の回答がメモリに保存されています。」 or English "Pulling this from earlier memory in this session." **If no relevant memory was found, or if retrieved snippets did not influence your answer, do not announce anything.** Never announce the mere act of searching — only the act of recalling. This lets the user see the memory layer is alive each turn.
 - **[AI Behavioral Guidelines] Reading the memory context**: Per-turn memory arrives as the output of the UserPromptSubmit hook (`# Recalled Memory Context`). Read `## Top matches` first and use the Q-A exchanges as supplementary context. If several versions of the same content appear, the one with the newer `saved` is the current one. When an exchange is cut and the full text is needed, run the `--show-turn` command given in the omission line. If there is a `> ⚠️ N3MC notice:` line, relay it to the user.
+- **[AI Behavioral Guidelines] Weak matches (v1.6.0)**: records under `## Possibly related (weak matches — may be unrelated)` did not pass the relevance floors and are added only so that a search is never empty. Use one only when it is actually relevant to the question; if it is not, ignore it and do not mention it (do not say that unrelated memories were found).
 
 ### 5.4 Implementation Specification Details
 
@@ -1158,7 +1173,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   - **Empty query** (image-only prompt, or `--search ""`) → `# Recalled Memory Context\n\n_No relevant memories found._\n`.
   - **Server unreachable / `/search` non-2xx error** → `# Recalled Memory Context\n\n_(memory search unavailable: <reason>)_\n`.
   - **Port belongs to another folder's server** → the text given in §3.
-  - **Successful results** → the rendered markdown (Top matches + Q-A exchanges).
+  - **Successful results** → the rendered markdown (Top matches, then weak matches if any, then Q-A exchanges; §5 "Q-A Pairing Contract" 5).
   - In every case, any pending notices (§3 "Notices") are inserted right after the `# Recalled Memory Context` heading (right after the `Search query:` line in search results).
 - **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | n3mc --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3memorycore/n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id NAME` argument that sets the record's **`agent_name`** display label (e.g., `n3mc --buffer "text" --agent-id "claude-code"`). Despite its name it does not set `local_id`; the name is kept for compatibility (§3.7).
 - **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
@@ -1184,12 +1199,12 @@ Every [user] and [claude i/N] row recorded for the same conversational turn shar
 2. **Claude-side pairing**: When the Stop hook saves Claude's response C_k, it reads T_k from `.memory/turn_id_<session>.txt` and attaches it to every [claude i/N] chunk. The file is not cleared (the next UserPromptSubmit overwrites it).
 3. **Recovery path**: If the Stop hook is skipped, the next UserPromptSubmit's Step 2 reads C_k from `transcript_path` (§4.5 `--hook-submit`) and saves it with T_k from the file, so U_k and C_k still share the same turn_id. (v1.4.0 expected C_k in the UserPromptSubmit input, where Claude Code never sends it, so this path did not work.)
 4. **Pair reconstruction**: `/search` returns three fields — `results` (score-ranked hits), `pairs` (ordered sibling rows sharing a turn_id), and `pairs_omitted`. Ordering is: [user] rows first, then [claude] rows, by rowid within each role.
-   - **Number and size of injected exchanges (v1.4.0)**: `pairs` contains only the first `pair_top_n` (3) turn_ids encountered while scanning `results` from the top. Sibling rows are added in order; from the row at which the running total across all exchanges would exceed `pair_max_chars` (3,000 characters), no further rows are added. The number of remaining rows of that exchange goes into `pairs_omitted[turn_id]`, and later exchanges are not included. An exchange whose first row alone exceeds the limit is not put in `pairs`; `pairs_omitted[turn_id]` gets all of its rows (the renderer prints only `### turn_id: <turn_id>` and the omission line for it). v1.3.x included all sibling rows of every top exchange, so the injected context could exceed 20,000 characters in a single turn.
+   - **Number and size of injected exchanges (v1.4.0)**: `pairs` contains only the first `pair_top_n` (3) turn_ids encountered while scanning `results` from the top. **Weak matches (`weak: true`, v1.6.0) are skipped in this scan**: their exchanges are never put in `pairs`. Sibling rows are added in order; from the row at which the running total across all exchanges would exceed `pair_max_chars` (3,000 characters), no further rows are added. The number of remaining rows of that exchange goes into `pairs_omitted[turn_id]`, and later exchanges are not included. An exchange whose first row alone exceeds the limit is not put in `pairs`; `pairs_omitted[turn_id]` gets all of its rows (the renderer prints only `### turn_id: <turn_id>` and the omission line for it). v1.3.x included all sibling rows of every top exchange, so the injected context could exceed 20,000 characters in a single turn.
 
    **Critical implementation rule**: `hybrid_search` returns `{"results", "pairs"}`, but **`results` MUST NOT exclude records that also belong to a pair**. `results` contains all score-ranked hits in full (pair members are kept). `pairs` is a separate supplementary list of siblings grouped by turn_id. Overlap is allowed because the renderer places `## Top matches` first and `## Previous matching Q-A exchanges` second, so Claude reads the highest-confidence answer first regardless of overlap.
 5. **Rendering (v1.2.0+; timestamps and omission line added in v1.4.0)**: The search-result markdown (`render_memory_context`) puts a **`## Top matches (use these to answer the question)` block FIRST**. Top matches contain all high-scoring records in score order, **including records that also belong to a Q-A pair** (do NOT suppress them from the result list). Q-A pairs follow as a **`## Previous matching Q-A exchanges (supplementary context)`** block placed AFTER Top matches. Overlap between sections is allowed: a record may appear in both Top matches and a Q-A pair — harmless because Claude reads Top matches first.
 
-   Output shape (v1.4.0):
+   Output shape (v1.4.0; weak matches added in v1.6.0):
 
    ```markdown
    # Recalled Memory Context
@@ -1204,6 +1219,11 @@ Every [user] and [claude i/N] row recorded for the same conversational turn shar
    ## [1] score=0.8123 saved=2026-11-13 10:34 (UTC+0900) claude-code
    <content>
 
+   ## Possibly related (weak matches — may be unrelated)
+
+   ## [2] score=0.4120 saved=2025-08-02 21:15 (UTC+0900) claude-code
+   <content>
+
    ## Previous matching Q-A exchanges (supplementary context)
 
    ### turn_id: <turn_id> saved=2026-11-13 10:34 (UTC+0900)
@@ -1214,6 +1234,8 @@ Every [user] and [claude i/N] row recorded for the same conversational turn shar
    - `saved=` converts the UTC value in the DB to **local time** and appends `(UTC±hhmm)` (`_fmt_saved`). For an exchange, `saved=` is the time of its first row.
    - The sentence "if several versions of the same content appear, the one with the newer saved is the current one" is placed at the top of Top matches. Recreating settings makes both the old and new versions appear, so this lets Claude tell which is current.
    - The omission line is printed at the end of each exchange listed in `pairs_omitted`.
+   - **Weak matches (v1.6.0)**: rows with `weak: true` are printed under `## Possibly related (weak matches — may be unrelated)`, after Top matches and before the Q-A exchanges, in the same `## [n] score=… saved=… <agent_name>` form. Numbering continues from Top matches (`[n]` is unique in the block). The heading is printed only when there is at least one weak match.
+   - **No top matches but weak matches (v1.6.0)**: print `_No relevant memories found._` in place of the Top matches block (no `## Top matches` heading and no versions sentence), then the weak-matches heading and rows, numbered from `[1]`. With neither top nor weak matches, the output stays `_No relevant memories found._` as before.
 6. **Schema**: `memories.turn_id TEXT` with index `idx_memories_turn_id`. `insert_memory(..., turn_id=None)` is the keyword-only parameter. `get_memories_by_turn_id(conn, turn_id)` is the helper used by retrieval.
 
 > **Note: Background of the rendering order**
@@ -1227,12 +1249,12 @@ If `embed_query` raises an exception (model not loaded, GPU failure, etc.), the 
 
 When a long Claude turn is split into many chunks, hybrid search can fill the entire Top-K with sibling chunks of one `turn_id`. To prevent this, the result-shaping stage of `hybrid_search` enforces **a per-`turn_id` cap of at most 2 chunks** in the Top-K list; subsequent siblings are dropped from Top-K (they remain available in the `pairs` Q-A section). Records with `turn_id` NULL (manual `--buffer` etc.) are exempt from the cap.
 
-### Search Result Filtering and Ordering (v1.4.0; floors on `filter_score` since v1.5.0)
+### Search Result Filtering and Ordering (v1.4.0; floors on `filter_score` since v1.5.0; weak-match fill since v1.6.0)
 
 After computing scores, `hybrid_search` shapes the results in the following order. v1.3.x relied on `min_score` (0.2) alone, so unrelated records with cos similarity 0.80–0.85 stayed in the candidates and the injected context became long and weakly related.
 
 1. **Vector candidate floor**: discard vector candidates with cos_sim below `vector_min_cos` (0.85) (if the record also hit FTS, it remains as an FTS-only hit with `cos_sim = 0.0`).
-2. **Score calculation and `min_score`**: compute `score` and `filter_score` (§3 "Bias coefficients"). Discard results whose **`filter_score`** is below `min_score`.
+2. **Score calculation and `min_score`**: compute `score` and `filter_score` (§3 "Bias coefficients"; `filter_score` has neither `time_decay` nor `b_session` since v1.6.0). Discard results whose **`filter_score`** is below `min_score`. Order the rest by `score`.
 3. **Ordering versions of the same content (`_order_versions_newest_first`, when `version_order_enabled` is true)**: Recreating settings can surface both the old and new versions, with the old one ranked higher. Since Q-A injection fills from the top up to `pair_max_chars`, only the old version might get in. Therefore:
    - For each turn_id in the results, the representative is the embedding (already stored in `memories_vec`) of the exchange's "first `[claude` row whose content is at least `version_min_chars` (100) characters". Exchanges without a representative and results without a turn_id are excluded.
    - If the representatives of **different turn_ids** have cos similarity ≥ `version_sim_threshold` (0.98), treat them as versions of the same content and group them (linked transitively).
@@ -1243,11 +1265,20 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 4. **Relative cutoff**: discard results whose **`filter_score`** is below `relative_min_score_ratio` (0.6) × the highest `filter_score`. Rows tagged `_version_group` are not dropped (old versions are kept too). Step 3 moves rows between positions while each position keeps its `score`; `filter_score` moves with the position in the same way.
 5. **Collapsing identical content (`_collapse_identical_content`)**: results with exactly the same content are reduced to a single entry at the highest position, whose payload (id, timestamp, turn_id) is taken from the **newest record**.
 6. **Per-turn_id cap of 2** (see "Top-K Chunk-Duplication Cap" above) and `search_result_limit`.
-7. **Selecting Q-A exchanges** (`pair_top_n` / `pair_max_chars`; see "Q-A Pairing Contract" above).
+7. **Minimum-results fill with weak matches (v1.6.0)**: when fewer than `min(min_results, search_result_limit)` results remain after step 6, add the shortfall from the candidates that **this search fetched but steps 1, 2 or 4 dropped**:
+   - Weak candidates are: vector candidates dropped by `vector_min_cos` in step 1, **with their actual `cos_sim`** (not the `0.0` they get as FTS-only hits), and results dropped by `min_score` (step 2) or the relative cutoff (step 4). A record dropped in step 1 that also hit FTS is one candidate with its actual `cos_sim` and its `keyword_relevance`. Candidates whose `filter_score` is below `1e-6` (no similarity and no keyword signal; the L2 → cos conversion of float32 vectors leaves about `1e-7` for orthogonal vectors, so do not compare with exactly `0`) are never added. The `since` / `until` range applies as for normal results (weak candidates come from the same filtered search).
+   - Take them in **descending `filter_score`** (ties: newer `(timestamp, id)` first). `score` is computed with the same formula as for normal results and is the `score=` shown, but it does not decide the order of weak matches.
+   - Apply step 5 (identical content) and step 6 (at most 2 rows per `turn_id`) to the added rows **together with the rows already in the results**: a weak candidate whose content equals a result row, or whose `turn_id` already has 2 rows in the results, is skipped and the next candidate is tried.
+   - Stop when the total reaches `min(min_results, search_result_limit)` or the candidates run out. Mark every added row `_weak` (`"weak": true` in `/search`, §4.5). Weak rows always come after every normal row.
+   - `min_results: 0` disables this step. An empty query has no candidates, so it returns nothing.
+   - Weak rows take no part in steps 3 – 6 of the normal results (they are not moved by version ordering and do not count toward the relative cutoff's top score).
+8. **Selecting Q-A exchanges** (`pair_top_n` / `pair_max_chars`; see "Q-A Pairing Contract" above). Only rows without `_weak` are scanned.
+
+> **Note: Why weak matches (v1.6.0, found when scoring v1.5.0)**: the floors are tuned to keep the injected context short, so a turn could get no memory at all: in a measurement with the real model (50 records, 26 questions) a question got 1.0 result on average and 2 of 26 got none. Adding up to 3 weak matches raised recall@3 from 23/26 to 24/26 and added about 2 weak rows per question. **Cost**: every turn can carry up to 3 more chunks (up to 400 characters each), mostly weakly related, and even an unrelated question always gets 3 rows. They are kept under their own heading so Claude can skip them, and they are excluded from the Q-A exchanges so the large exchange block is never filled with weak material. The heading, the `min_results` key and the guideline wording are shared with N3MC Lite.
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.5.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.6.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
@@ -1291,7 +1322,7 @@ After implementation is complete, autonomously resolve the following tests and r
       ```
       Pass criterion: prints `OK` (the check looks for this package's entry point or module, so another edition's `n3mc_hook.py` does not satisfy it, and for the §4 ② permission rules). If this assertion fails, **the implementation is not complete** — run `n3mc --init` (Path A) or re-run the idempotent installer (Path B) in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
    2. **UserPromptSubmit**: From a Claude Code session running **outside the n3mc-free project directory** (e.g. `~`), send a user message and confirm that `# Recalled Memory Context` is included in that turn's context (the hook's stdout). Confirm that both the preceding Claude response (read from the transcript when Stop did not save it, §4.5) and the user message are saved to the DB (check `n3mc --list` for records with `[claude]` and `[user]` prefixes). The "outside the project directory" stipulation is essential — running the test from inside the project would mask a missing global registration.
-   3. **Stop**: After session termination of that same outside-the-project session, confirm that Claude's final response is saved to the DB. Confirm that the first line of the project's `.claude/rules/n3mc-behavior.md` is `<!-- n3mc-behavior v2 -->`. Confirm that the project's `.claude/CLAUDE.md` contains **no** `@import` line for `memory_context.md`.
+   3. **Stop**: After session termination of that same outside-the-project session, confirm that Claude's final response is saved to the DB. Confirm that the first line of the project's `.claude/rules/n3mc-behavior.md` is `<!-- n3mc-behavior v3 -->`. Confirm that the project's `.claude/CLAUDE.md` contains **no** `@import` line for `memory_context.md`.
 
 8. **stdout output test (no memory_context.md)**: Run `--search` and confirm that results are **printed to stdout** and that `~/.n3mc/.memory/memory_context.md` is **not created**.
 
@@ -1331,7 +1362,7 @@ n3mc-free/
     ├── test_api.py          # Layer 3: FastAPI endpoint tests (TestClient)
     ├── test_hooks.py        # Layer 4: Hook integration (complete-preservation chunking, image strip, audit log)
     ├── test_hooks_encoding.py # Regression tests for surrogate stripping and UTF-8
-    └── test_regressions.py  # Layer 5: Regression tests for the v1.4.0 / v1.5.0 fixes (no model needed)
+    └── test_regressions.py  # Layer 5: Regression tests for the v1.4.0 – v1.6.0 fixes (no model needed)
 ```
 
 **Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
@@ -1402,9 +1433,9 @@ python -m pytest tests/ -v
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |
 
-> The counts above are the v1.4.0 suite. v1.5.0 adds its tests to Layer 5 only, so these tables stay valid; if a regenerated suite differs, the class and test names here are what to match, not the counts.
+> The counts above are the v1.4.0 suite. v1.5.0 and v1.6.0 add their tests to Layer 5 only, so these tables stay valid; if a regenerated suite differs, the class and test names here are what to match, not the counts.
 
-### Layer 5: `test_regressions.py` (v1.4.0 / v1.5.0)
+### Layer 5: `test_regressions.py` (v1.4.0 – v1.6.0)
 
 Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` (`fake_embed`), so the suite runs in seconds without the model.
 
@@ -1413,15 +1444,15 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestFtsQuoting` | Queries containing `\ / # = @ * $ %`, `AND/OR/NOT`, `"`, or control characters do not raise; terms containing symbols are hit; `hybrid_search` continues when `search_fts` raises. **v1.5.0**: terms are joined with `OR` (a sentence-like query hits a record that contains only some of its words); terms under 3 characters (`AI`, `東京`) are dropped and a query of only such terms skips FTS; punctuation in the query splits terms (`「アルファ9」の気温は？` hits `架空の惑星「アルファ9」の気温設定`) |
 | `TestVectorFilter` | A search with `since` returns in-range records even if they are outside the global KNN top; falls back to exact computation when `rowid IN` is unavailable |
 | `TestNoSimilarityDedup` | Similar chunks (cos ≥ 0.95) are all saved; exact matches within the same `turn_id` are skipped; exact matches in a different `turn_id` are saved; without `turn_id`, exact matches are skipped globally |
-| `TestSearchShaping` | Candidates below `vector_min_cos` are discarded; relative cutoff; `_version_group` rows survive the cutoff; the newer version comes first; identical content is collapsed; `pair_top_n`, `pair_max_chars`, and `pairs_omitted`. **v1.5.0**: a 30-day-old record from another session with high similarity survives the relative cutoff while a current-session record with lower similarity is present; a keyword-only hit from another session survives `min_score`; the order is still by the final score (current session first) |
-| `TestRender` | `saved=` is local time; the versions sentence; the omission line contains `--show-turn`; notices appear at the top |
+| `TestSearchShaping` | Candidates below `vector_min_cos` are discarded; relative cutoff; `_version_group` rows survive the cutoff; the newer version comes first; identical content is collapsed; `pair_top_n`, `pair_max_chars`, and `pairs_omitted`. **v1.5.0**: a 30-day-old record from another session with high similarity survives the relative cutoff while a current-session record with lower similarity is present; a keyword-only hit from another session survives `min_score`; the order is still by the final score (current session first). **v1.6.0**: a 400-day-old record with high similarity is returned even when it is the only candidate (`min_score` and the relative cutoff ignore `time_decay`); when a new and a 400-day-old record with the same similarity are both present, both are returned and the new one comes first |
+| `TestRender` | `saved=` is local time; the versions sentence; the omission line contains `--show-turn`; notices appear at the top. **v1.6.0**: weak rows appear under `## Possibly related (weak matches — may be unrelated)` after Top matches and before the Q-A exchanges, numbered on from Top matches; with no top matches, `_No relevant memories found._` is followed by the weak-matches heading (rows from `[1]`); no weak heading when there are no weak rows |
 | `TestNoContextFile` | `--search` does not create `memory_context.md`; `--stop` removes the `@import` of this installation's `CONTEXT_FILE` from CLAUDE.md (with backup, keeping CRLF, paths containing spaces, forward or back slashes); does not touch the file when no line matches; deletes the old file and creates the marker. **v1.5.0**: keeps a relative `@../.memory/memory_context.md`, an `@` line pointing at another folder's `memory_context.md`, and `@docs/notes_about_memory_context.md` |
-| `TestBehaviorMd` | Leaves the file alone when the marker matches; backs up and replaces a previous template; does not replace a hand-edited file and emits a notice. **v1.5.0**: the notice key contains a hash of the path and the message contains the path; two hand-edited files give two notices; the notice is cleared when the file's first line becomes the current marker |
+| `TestBehaviorMd` | Leaves the file alone when the marker matches; backs up and replaces a previous template (**v1.6.0**: including the `v2` template, hash `5af3c015c06c62c1`; the new file starts with `<!-- n3mc-behavior v3 -->` and contains the Weak Matches section); does not replace a hand-edited file and emits a notice. **v1.5.0**: the notice key contains a hash of the path and the message contains the path; two hand-edited files give two notices; the notice is cleared when the file's first line becomes the current marker |
 | `TestServerDecision` | Healthy / different `code_version` / another folder / no `root` and unverifiable; uses `/shutdown` first; 403 when `root` differs; does not wait on a dead PID file |
 | `TestServerStart` (v1.5.0) | A child that exits during the wait stops the wait at once and emits `server_start_failed` naming `server.log`; within 5 minutes of a failure no new start is attempted; a later successful start clears the notice and the marker; a PID-file process still starting after 60 s is neither replaced nor duplicated; `Popen` gets the detach flags for the platform and stderr goes to `server.log` (process creation replaced by a fake) |
 | `TestServerApi` (v1.5.0) | A request with `Host: evil.example` gets 403 on every endpoint, `127.0.0.1:<port>` and `localhost:<port>` pass; `/buffer`, `/search`, `/repair`, `/list` are plain `def` functions; `/repair` with `{"max_records": 200}` processes at most 200 records and `--hook-submit` sends that limit |
 | `TestForeignServer` | With another folder's server on the port: saves go directly to our own DB, no search, `--repair` does nothing |
-| `TestConfig` | Does not overwrite an unreadable `config.json`; ignores only the mistyped key; notices clear once fixed; `code_version` changes only when the contents of `config.json` change. **v1.5.0**: `2000.0` for `search_query_max_chars`, `0` for `half_life_days`, `70000` / `-1` for `server_port`, `1.5` for `min_score` are ignored with `config_type`; a missing file is created with exclusive creation and a concurrent creator's file is read, not overwritten (one `owner_id`); updates go through a temporary file and `os.replace` |
+| `TestConfig` | Does not overwrite an unreadable `config.json`; ignores only the mistyped key; notices clear once fixed; `code_version` changes only when the contents of `config.json` change. **v1.5.0**: `2000.0` for `search_query_max_chars`, `0` for `half_life_days`, `70000` / `-1` for `server_port`, `1.5` for `min_score` are ignored with `config_type` (**v1.6.0**: so are `-1` and `1.5` for `min_results`, while `0` is accepted); a missing file is created with exclusive creation and a concurrent creator's file is read, not overwritten (one `owner_id`); updates go through a temporary file and `os.replace` |
 | `TestHookSubmit` | Input starting with `<task-notification>` is neither saved nor searched and does not change `turn_id`; Stop does not clear `turn_id`. **v1.5.0**: the previous Claude response is read from a sample `transcript_path` JSONL (the last text block only; `tool_result`-only user lines, `isMeta` lines, the `[Request interrupted by user]` marker, slash-command lines, `thinking`, `tool_use` and `isSidechain` lines skipped; the current prompt skipped; an interrupted reply is found) and saved under the previous `turn_id`; when Stop already saved it nothing is duplicated; a missing or broken transcript is logged as `transcript_unreadable` and the hook still searches and saves the prompt; an image-only prompt writes a new `turn_id` |
 | `TestPurifyBeforeChunk` (v1.5.0) | A user message over 500 characters with two code blocks and prose between them keeps the prose and stores neither code block; a code block longer than 400 characters is replaced, not stored |
 | `TestChunkSentences` (v1.5.0) | Japanese text without blank lines is split after `。` / `！` / `？`, not mid-sentence |
@@ -1431,6 +1462,7 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestHousekeeping` (v1.5.0) | `--stop` deletes `turn_id_*.txt` older than 30 days and keeps newer ones; `audit.log` over 50 MB is rotated to `audit.log.1` (size threshold patched for the test) |
 | `TestModelRetry` (v1.5.0) | After a failed model load, `get_model()` does not try again for 60 seconds (load function replaced by a fake); `$N3MC_EMBED_MODEL` has no effect |
 | `TestPackaging` (v1.5.0) | `psutil` is listed in `pyproject.toml` `dependencies` |
+| `TestWeakMatches` (v1.6.0) | With one result passing the floors and `min_results: 3`, two weak rows are added, ordered by `filter_score`, marked `"weak": true` in `/search` and placed after the normal row; a candidate below `vector_min_cos` is added with its actual cos (its `filter_score` uses that cos); `min_results: 0` adds nothing; nothing is added when enough results pass; `search_result_limit` smaller than `min_results` caps the total; a weak candidate identical to a result row, or from a `turn_id` that already has 2 rows, is skipped; a candidate with `filter_score` below `1e-6` (an orthogonal vector) is never added; weak rows are not used for `pairs`; an empty query returns no weak rows |
 
 ### Running
 
