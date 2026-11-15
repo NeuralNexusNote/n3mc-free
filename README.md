@@ -22,6 +22,22 @@ This project prioritizes Instructions over Static Code. Please read our Developm
 N3MemoryCore gives Claude Code long-term memory across sessions.
 **Two install paths supported**: drop the spec into Claude Code and let it build the system, or `pip install` the reference build and run `n3mc --init`. Either way, no manual hook editing. (See [Setup](#setup) below.)
 
+## Free or Lite? Which one to use
+
+There are two free N3MemoryCore builds. **If this is your first time, start with Free (this repository).**
+
+| | **N3MC Free** (this repository) | **[N3MC MCP Lite](https://github.com/NeuralNexusNote/n3mcmcp-lite)** |
+|---|---|---|
+| Works with | Claude Code only | MCP clients: Claude Code, Claude Desktop, Cursor, Windsurf, … |
+| What gets saved | Every message, automatically (hooks) | What the AI decides to save (`save_memory`) |
+| How long it is kept | Until you delete it | 7 days, then deleted automatically |
+| What you need | Python 3.10+ | Python 3.10+, Docker (Redis Stack), and the MCP client settings |
+| Setup | `pip install n3memorycore-free`, then `n3mc --init` | Start Redis Stack, install, then register the server in your MCP client |
+| Good for | Beginners; long-term memory for Claude Code | Users who know MCP and Docker; short-lived working memory for a project |
+
+- **Choose Free** if you use Claude Code and want it to remember your conversations without extra software.
+- **Choose Lite** if you use another MCP client (Claude Desktop, Cursor, …), or you want memory that forgets by itself after a short project, and you are comfortable starting Docker and editing MCP settings.
+
 ---
 
 ## Features
