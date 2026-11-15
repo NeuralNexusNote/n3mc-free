@@ -56,7 +56,7 @@ Then **restart Claude Code**. Memory kicks in from the next session.
 **Path B — AI-Native Setup** (regenerate from this specification)
 
 1. Load this specification into Claude Code and ask: "Please implement N3MemoryCore according to this specification."
-   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. No manual steps required.
+   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below): open Claude Code in an empty folder such as `~/<name>` first.
    - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
 
 > **📖 After implementation (Path B only)**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
@@ -77,7 +77,23 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 
 > **Do NOT output manual command hints** (e.g., `n3mc --buffer "fact to save"`, `n3mc --search "keyword"`, `n3mc --list`) at any point during or after implementation.
 
+> **⚠️ Install folder check (Path B — do this first, before anything else)**: Path B writes the code into the folder Claude Code is open in (the current working directory): `pyproject.toml`, `README.md`, `tests/`, `n3memorycore/` and the other files of §2. That folder stays in use after setup: with `pip install -e .` the hooks run the code from it, so deleting or moving it later stops the memory from working.
+> 1. Show the user the absolute path of the current working directory and this message: "N3MemoryCore will be installed in this folder: <absolute path>. The code will stay here; deleting or moving this folder later stops the memory hooks. Continue? (yes/no)". **Wait for the user's answer.** Continue only on a clear yes. This is the only confirmation of the setup; everything after it runs automatically.
+> 2. Before asking, look at the folder. If it contains anything other than this specification file, `.claude/`, `.git/` and the files of an earlier setup of this product (`n3memorycore/`, `pyproject.toml` whose `name` is this package's), **do not ask: abort** and display: "This folder already contains other files (for example a project of yours). Setting up here could overwrite them. Create an empty folder such as `~/n3mc-free`, open Claude Code there, and run this setup again." Never overwrite or mix into an existing project.
+> 3. Do not install into the home folder itself (`~`) or a system folder.
+
 > **⚠️ Python check**: Before starting implementation, run `python --version` or `python3 --version` to verify Python 3.10+ is available. If not found, display: "Python 3.10 or higher is required. Install from https://www.python.org/" and **abort setup**.
+>
+> **Windows note**: On Windows, `python` / `python3` may exist only as Microsoft Store shortcuts (App Execution Aliases under `%LOCALAPPDATA%\Microsoft\WindowsApps`). They open the Store or print a "Python was not found" message instead of a version. Treat this as "Python not found". Also try `py -3 --version` (the python.org launcher) before concluding. When aborting on Windows, add these steps to the message:
+> 1. Install Python 3.10 or later from https://www.python.org/ and check "Add python.exe to PATH" in the installer, or run `winget install Python.Python.3.12`.
+> 2. If `python` still opens the Microsoft Store, turn off the `python.exe` and `python3.exe` entries in Settings → Apps → Advanced app settings → App execution aliases.
+> 3. **Restart required.** Claude Code keeps the `PATH` it started with, so it cannot see a Python installed afterwards. Closing the Claude Code window is not enough: the app can keep running in the background (for example in the system tray). Sign out of Windows once and sign in again: Start menu → your account icon (bottom left) → **Sign out**. Restarting the PC also works.
+> 4. After signing in, open a new terminal and confirm that `python --version` prints 3.10 or later.
+> 5. Start Claude Code, open the same folder, and ask it to run this setup again.
+>
+> Write this message for a beginner: one action per step, plain words, and say clearly that the sign-out (or restart) is required.
+>
+> Do not install Python yourself; installing software is left to the user.
 
 > **📦 Auto-install**: Run the following `pip install` automatically as part of setup. Do not ask the user to run it manually.
 
@@ -769,7 +785,7 @@ After `pip install`, run:
 n3mc --init
 ```
 
-This writes the hook block into `~/.claude/settings.json` with the absolute path resolved by `shutil.which('n3mc-hook')` / `shutil.which('n3mc-stop-hook')`, and adds the permission rules of §4 ② to `permissions.allow`. Re-running is a no-op (idempotent — entries that belong to **this package** are replaced rather than duplicated; hooks of other N3MC editions are left alone, see Path B).
+This writes the hook block into `~/.claude/settings.json` with the absolute path of `n3mc-hook` / `n3mc-stop-hook` (looked up first in the scripts folder of the running Python, then with `shutil.which`; see `resolve_cmd` in Path B), and adds the permission rules of §4 ② to `permissions.allow`. Re-running is a no-op (idempotent — entries that belong to **this package** are replaced rather than duplicated; hooks of other N3MC editions are left alone, see Path B).
 
 The resulting block looks like (paths vary per machine):
 
@@ -808,7 +824,7 @@ When regenerating from this spec, the AI must execute logic equivalent to the fo
 
 ```python
 # n3memorycore/n3memory.py:cmd_init — runnable equivalent of the mandatory step
-import datetime, json, os, pathlib, shlex, shutil, sys, tempfile
+import datetime, json, os, pathlib, shlex, shutil, sys, sysconfig, tempfile
 import n3memorycore
 
 SETTINGS = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
@@ -850,14 +866,35 @@ def is_own_hook(command: str, event: str) -> bool:
                 return True
     return False
 
+def shell_path(p) -> str:
+    # Forward slashes always (bash reads "\" as an escape). Quote ONLY when the
+    # path has a space: a command that starts with a quote fails as a hook on
+    # some Windows setups (observed 2026-11-15), while a bare path works.
+    s = pathlib.Path(p).as_posix()
+    return f'"{s}"' if " " in s else s
+
 def resolve_cmd(script_name: str) -> str:
+    # 1. The scripts folder of the Python running --init (normal, then user
+    #    install). Found even when PATH is stale, e.g. Python was installed
+    #    after Claude Code started and Scripts/ is not on PATH yet.
+    folders = [sysconfig.get_path("scripts")]
+    try:
+        folders.append(sysconfig.get_path("scripts", sysconfig.get_preferred_scheme("user")))
+    except (KeyError, ValueError):
+        pass
+    for folder in folders:
+        for name in (script_name + ".exe", script_name):
+            cand = pathlib.Path(folder) / name
+            if cand.is_file():
+                return shell_path(cand)
+    # 2. PATH.
     exe = shutil.which(script_name)
     if exe:
-        # Claude Code runs hooks through bash: always forward slashes.
-        return pathlib.Path(exe).as_posix()
+        return shell_path(exe)
+    # 3. Last resort: python -m (unquoted unless the path has a space).
     module = {"n3mc-hook": "n3memorycore.n3mc_hook",
               "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
-    return f'"{pathlib.Path(sys.executable).as_posix()}" -m {module}'
+    return f'{shell_path(sys.executable)} -m {module}'
 
 # 1. Read. An unreadable file is never touched (no rewrite, no "repair").
 if SETTINGS.exists():
@@ -914,6 +951,9 @@ if settings != before:
 - **Backup and atomic write (v1.5.0)**: before changing an existing file, copy it to `~/.claude/settings.json.bak-n3mc-<YYYYmmddHHMMSS>`; write through a temporary file in the same folder and `os.replace`. If the file cannot be read as a JSON object (or `hooks` / `permissions` / `permissions.allow` have the wrong type), change nothing, print the reason and exit with status 1.
 - **Do NOT use `git add`-style trust** (`if "hooks" not in settings: settings["hooks"] = {...}`): an empty `hooks: {}` key still passes that check and the user ends up with no hooks. Always inspect the inner arrays.
 - **Cross-platform path**: forward slashes only inside the `command` string, even on Windows. Always normalize `shutil.which()` results via `pathlib.Path(exe).as_posix()`. The bash shell Claude Code spawns interprets backslashes as escape sequences (`\n` → newline, `\t` → tab), so a raw `\Users\...` path silently corrupts during shell parsing.
+- **Command form (v1.6.0)**: `resolve_cmd` looks for the entry point in the scripts folder of the Python running `--init` (`sysconfig.get_path("scripts")`, then the user scheme) **before** `shutil.which`, and puts the path in double quotes **only when it contains a space**. Never wrap a path without spaces in quotes.
+
+> **⚠️ Why (v1.6.0, found on a second Windows PC on 2026-11-15)**: Python had just been installed, so the running Claude Code still had the old `PATH` without `Python3xx/Scripts`. `shutil.which("n3mc-hook")` returned nothing, and `--init` registered the fallback `"C:/.../python.exe" -m n3memorycore.n3mc_hook`. On that PC no hook ever ran (`audit.log` stayed at the manual test entry) until the leading quotes were removed. Looking in the scripts folder of `sys.executable` finds the entry point regardless of `PATH`, and a bare path works there. Which shell Claude Code used for hooks on that PC was not confirmed.
 
 > **⚠️ Why (v1.5.0, found in the Free v1.4.0 review)**: v1.4.0 replaced every hook whose command merely contained `n3mc-hook` or `n3mc_hook`. On a PC that also runs N3MC Pro (registered as `python ".../N3MemoryCore/n3mc_hook.py"`), `n3mc --init` silently deleted the Pro hooks, although §3 explicitly supports running both on one PC with separate `server_port`s. It also wrote `settings.json` in place without a backup, and an invalid file made `--init` end with a traceback.
 
@@ -1458,7 +1498,7 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestChunkSentences` (v1.5.0) | Japanese text without blank lines is split after `。` / `！` / `？`, not mid-sentence |
 | `TestTimeBounds` (v1.5.0) | A date-only `--since` is local midnight converted to UTC (with a fixed non-UTC time zone); an offset value is honoured; `T` and space separators give the same bound; `yesterday` exits with status 2 and an error line; `since > until` is an error |
 | `TestDbCorrupt` (v1.5.0) | Two corruptions give two backups (`n3memory.db.corrupt-<time>.bak`) with their `-wal` / `-shm` moved alongside, not deleted; the `db_corrupt` notice appears; `quick_check` runs once per process |
-| `TestInit` (v1.5.0, temporary `settings.json` only) | A Pro-style hook `python ".../N3MemoryCore/n3mc_hook.py"` outside this package is kept and reported; our entry-point (`.exe` or not) and `-m` entries are replaced, not duplicated; re-running writes nothing; a backup is made before a change; an invalid `settings.json` is left unchanged with exit status 1; the §4 ② rules are added to `permissions.allow` without removing existing rules |
+| `TestInit` (v1.5.0, temporary `settings.json` only) | A Pro-style hook `python ".../N3MemoryCore/n3mc_hook.py"` outside this package is kept and reported; our entry-point (`.exe` or not) and `-m` entries are replaced, not duplicated; re-running writes nothing; a backup is made before a change; an invalid `settings.json` is left unchanged with exit status 1; the §4 ② rules are added to `permissions.allow` without removing existing rules; (v1.6.0) with `PATH` emptied, an entry point in the patched scripts folder is still found and written as a bare path; the `-m` fallback starts without a quote when the Python path has no space, and is quoted when it has one |
 | `TestHousekeeping` (v1.5.0) | `--stop` deletes `turn_id_*.txt` older than 30 days and keeps newer ones; `audit.log` over 50 MB is rotated to `audit.log.1` (size threshold patched for the test) |
 | `TestModelRetry` (v1.5.0) | After a failed model load, `get_model()` does not try again for 60 seconds (load function replaced by a fake); `$N3MC_EMBED_MODEL` has no effect |
 | `TestPackaging` (v1.5.0) | `psutil` is listed in `pyproject.toml` `dependencies` |
@@ -1506,7 +1546,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 |---|---|---|
 | 1. Implementation | Paste the prompt to request implementation | **Sonnet** (fast) |
 | 2. Debugging | Paste 3 prompts **one at a time** for verification | **Sonnet** |
-| 3. Quality review | Paste the prompt for evaluation & improvement | **Opus** (deep reasoning) |
+| 3. Quality review | **Start a new session**, then paste the prompt for evaluation & improvement | **Opus** (deep reasoning) |
 
 ---
 
@@ -1555,7 +1595,12 @@ Once all 3 are done, proceed to Phase 3.
 
 ### Phase 3: Quality Review (Opus)
 
-Switch the model to **Opus** and paste the following:
+> **⚠️ Review in a new session**: Do not review in the session that implemented and debugged the code. Exit Claude Code, start it again in the same install folder, and begin a new session.
+> - The implementing session's context holds its own decisions and explanations, so a review there tends to confirm them instead of checking the code against this specification afresh.
+> - A restarted Claude Code also loads the hooks registered during setup, so the review sees the memory working as a user will.
+> - In the new session the hooks may recall parts of the implementation conversation; that is expected. Base the review on the code, this specification and the results of commands actually run.
+
+In the new session, set the model to **Opus** and paste the following:
 
 ```
 Please review N3MemoryCore.

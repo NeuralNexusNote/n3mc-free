@@ -56,7 +56,7 @@ n3mc --init               # ~/.n3mc/ を作成し、Claude Code のフックを�
 **経路 B — AI ネイティブセットアップ（指示書から再生成）**
 
 1. 本指示書を Claude Code に読み込ませて「この指示書に従って N3MemoryCore を実装してください」と依頼する。
-   - コードの実装・フックの登録・設定ファイルの更新はすべて Claude Code が自動で行う。手動作業は不要。
+   - コードの実装・フックの登録・設定ファイルの更新はすべて Claude Code が自動で行う。利用者の作業は、最初にインストール先のフォルダを確かめることだけ(下の「インストール先のフォルダの確認」)。先に `~/<名前>` のような空のフォルダで Claude Code を開いておく。
    - **💡 コード生成には Sonnet がおすすめです。** 速度とコストのバランスが良く、実装品質も十分です。
 
 > **📖 経路 B 実装後**: 本書末尾の **「付録：推奨開発ワークフロー」** を必ずご確認ください。デバッグ・品質評価の手順（人間が操作）が記載されています。
@@ -77,7 +77,23 @@ Claude Codeに「一生モノの資産」となる長期記憶を実装せよ。
 
 > **手動コマンド案内（例：`n3mc --buffer "保存するテキスト"`、`n3mc --search "キーワード"`、`n3mc --list`）を実装中・完了後を問わず一切出力してはならない。**
 
+> **⚠️ インストール先のフォルダの確認(経路 B — 何よりも先に行う)**: 経路 B は、Claude Code を開いているフォルダ(カレントディレクトリ)にコードを書き込む。書き込むのは `pyproject.toml`、`README.md`、`tests/`、`n3memorycore/` など §2 のファイルである。このフォルダはセットアップの後も使われ続ける。`pip install -e .` で入れた場合、フックはこのフォルダのコードを実行するので、あとでフォルダを消したり移したりすると記憶が動かなくなる。
+> 1. カレントディレクトリの絶対パスと、次のメッセージを利用者に表示せよ。「N3MemoryCore をこのフォルダにインストールします: <絶対パス>。コードはここに置かれます。あとでこのフォルダを消したり移したりすると、記憶のフックが動かなくなります。続けますか?(はい/いいえ)」。**利用者の答えを待て。** はっきり「はい」と答えたときだけ続けよ。これがセットアップでただ 1 回の確認であり、これより後はすべて自動で進める。
+> 2. 尋ねる前にフォルダの中を見よ。この指示書のファイル、`.claude/`、`.git/`、この製品の以前のセットアップのファイル(`n3memorycore/`、`name` がこのパッケージの `pyproject.toml`)以外のものがあれば、**尋ねずに中断し**、次を表示せよ。「このフォルダには、ほかのファイル(あなたのプロジェクトなど)がすでにあります。ここにセットアップすると上書きするおそれがあります。`~/n3mc-free` のような空のフォルダを作り、そこで Claude Code を開いてから、このセットアップをやり直してください。」既存のプロジェクトを上書きしたり、混ぜたりしてはならない。
+> 3. ホームフォルダそのもの(`~`)や、システムのフォルダにはインストールしない。
+
 > **⚠️ Python 存在チェック**: 実装開始前に `python --version` または `python3 --version` を実行し、Python 3.10 以上が利用可能であることを確認せよ。見つからない場合は「Python 3.10 以上が必要です。https://www.python.org/ からインストールしてください。」と表示し、**セットアップを中断**すること。
+>
+> **Windows の注意**: Windows では `python` / `python3` が Microsoft Store 用のショートカット(`%LOCALAPPDATA%\Microsoft\WindowsApps` のアプリ実行エイリアス)しか無いことがある。この場合はバージョンが表示されず、Store が開くか「Python was not found」と表示される。これは「Python が見つからない」として扱え。判断する前に `py -3 --version`(python.org 版のランチャー)も試せ。Windows で中断するときは、次の手順をメッセージに添えよ。
+> 1. https://www.python.org/ から Python 3.10 以上をインストールする。インストーラーの「Add python.exe to PATH」にチェックを入れる。または `winget install Python.Python.3.12` を実行する。
+> 2. それでも `python` で Microsoft Store が開く場合は、設定 → アプリ → アプリの詳細設定 → アプリ実行エイリアス で `python.exe` と `python3.exe` をオフにする。
+> 3. **再起動が必要です。** Claude Code は起動したときの `PATH` を使い続けるので、あとから入れた Python が見えない。Claude Code のウィンドウを閉じるだけでは足りない(アプリがバックグラウンドやタスクトレイで動き続けることがある)。Windows から一度サインアウトして、サインインし直す。スタートメニュー → 左下の自分のアカウントのアイコン → **サインアウト**。PC の再起動でもよい。
+> 4. サインインし直したら、新しいターミナルを開き、`python --version` が 3.10 以上を表示することを確かめる。
+> 5. Claude Code を起動し、同じフォルダを開いて、このセットアップをもう一度依頼する。
+>
+> このメッセージは初心者向けに書け。1 つの手順に 1 つの操作、やさしい言葉で書き、サインアウト(または再起動)が必要なことをはっきり伝えよ。
+>
+> Python を自分でインストールしてはならない。ソフトウェアのインストールは利用者に任せる。
 
 > **📦 自動インストール**: 以下の `pip install` はセットアップの一部として自動実行せよ。ユーザーに手動実行を求めてはならない。
 
@@ -768,7 +784,7 @@ python -m n3memorycore.n3memory --recall-thread <turn_id> [--before N] [--after 
 n3mc --init
 ```
 
-これにより `shutil.which('n3mc-hook')` / `shutil.which('n3mc-stop-hook')` が解決した絶対パスで hook ブロックが `~/.claude/settings.json` に書き込まれ、§4 ② のパーミッションのルールが `permissions.allow` に足される。再実行は no-op（冪等 — **このパッケージの**エントリは重複追加せず置換する。ほかの N3MC の版のフックには触れない。経路 B 参照）。
+これにより `n3mc-hook` / `n3mc-stop-hook` の絶対パス(実行中の Python の scripts フォルダを先に探し、次に `shutil.which` で探す。経路 B の `resolve_cmd` 参照)で hook ブロックが `~/.claude/settings.json` に書き込まれ、§4 ② のパーミッションのルールが `permissions.allow` に足される。再実行は no-op（冪等 — **このパッケージの**エントリは重複追加せず置換する。ほかの N3MC の版のフックには触れない。経路 B 参照）。
 
 書き込まれる JSON はこんな形（パスはマシンによって異なる）:
 
@@ -807,7 +823,7 @@ n3mc --init
 
 ```python
 # n3memorycore/n3memory.py:cmd_init — 必須ステップの実行可能版
-import datetime, json, os, pathlib, shlex, shutil, sys, tempfile
+import datetime, json, os, pathlib, shlex, shutil, sys, sysconfig, tempfile
 import n3memorycore
 
 SETTINGS = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
@@ -849,14 +865,35 @@ def is_own_hook(command: str, event: str) -> bool:
                 return True
     return False
 
+def shell_path(p) -> str:
+    # 常にフォワードスラッシュ(bash は "\" をエスケープとして読む)。引用符は
+    # パスに空白があるときだけ付ける。引用符で始まるコマンドは、Windows の
+    # 環境によってはフックとして動かない(2026-11-15 に確認)。素のパスなら動く。
+    s = pathlib.Path(p).as_posix()
+    return f'"{s}"' if " " in s else s
+
 def resolve_cmd(script_name: str) -> str:
+    # 1. --init を実行している Python の scripts フォルダ(通常、次にユーザー
+    #    インストール)。PATH が古くても見つかる。たとえば Claude Code の起動後に
+    #    Python を入れて、Scripts/ がまだ PATH に無い場合。
+    folders = [sysconfig.get_path("scripts")]
+    try:
+        folders.append(sysconfig.get_path("scripts", sysconfig.get_preferred_scheme("user")))
+    except (KeyError, ValueError):
+        pass
+    for folder in folders:
+        for name in (script_name + ".exe", script_name):
+            cand = pathlib.Path(folder) / name
+            if cand.is_file():
+                return shell_path(cand)
+    # 2. PATH。
     exe = shutil.which(script_name)
     if exe:
-        # Claude Code はフックを bash で実行する: 常にフォワードスラッシュ。
-        return pathlib.Path(exe).as_posix()
+        return shell_path(exe)
+    # 3. 最後の手段: python -m(パスに空白が無ければ引用符を付けない)。
     module = {"n3mc-hook": "n3memorycore.n3mc_hook",
               "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
-    return f'"{pathlib.Path(sys.executable).as_posix()}" -m {module}'
+    return f'{shell_path(sys.executable)} -m {module}'
 
 # 1. 読む。読めないファイルには触れない（書き直しも「修復」もしない）。
 if SETTINGS.exists():
@@ -913,6 +950,9 @@ if settings != before:
 - **控えとアトミックな書き込み（v1.5.0）**: 既存のファイルを変える前に `~/.claude/settings.json.bak-n3mc-<YYYYmmddHHMMSS>` にコピーする。同じフォルダの一時ファイルに書いて `os.replace` で置き換える。ファイルを JSON オブジェクトとして読めない場合（または `hooks` / `permissions` / `permissions.allow` の型が違う場合）は、何も変えず、理由を出して終了ステータス 1 で終わる。
 - **「`hooks` キーが無ければ `{...}` を入れる」だけの判定はダメ**: 空の `hooks: {}` が既に存在するケースで素通りし、結果フックが入らないままになる。必ず内側の配列まで点検すること。
 - **クロスプラットフォームのパス**: Windows でも `command` 文字列の中はフォワードスラッシュ厳守。`shutil.which()` の戻り値は `pathlib.Path(exe).as_posix()` で必ず正規化すること。Claude Code が起動する bash シェルはバックスラッシュをエスケープシーケンス（`\n` → 改行、`\t` → タブ）として解釈するため、`\Users\...` をそのまま書くとパスが破壊される。
+- **コマンドの形(v1.6.0)**: `resolve_cmd` は、`shutil.which` より**先に**、`--init` を実行している Python の scripts フォルダ(`sysconfig.get_path("scripts")`、次にユーザーのスキーム)でエントリポイントを探す。パスを二重引用符で囲むのは、**パスに空白があるときだけ**。空白の無いパスを引用符で囲んではならない。
+
+> **⚠️ 理由(v1.6.0、2026-11-15 に 2 台目の Windows PC で発見)**: Python を入れた直後だったため、動いていた Claude Code の `PATH` は古く、`Python3xx/Scripts` が入っていなかった。`shutil.which("n3mc-hook")` は何も返さず、`--init` は最後の手段の `"C:/.../python.exe" -m n3memorycore.n3mc_hook` を登録した。その PC では、先頭の引用符を外すまでフックが一度も動かなかった(`audit.log` は手動テストの 1 件のまま)。`sys.executable` の scripts フォルダを探せば `PATH` に関係なくエントリポイントが見つかり、素のパスならその PC でも動く。その PC で Claude Code がフックをどのシェルで実行していたかは確かめていない。
 
 > **⚠️ 理由（v1.5.0、Free v1.4.0 のレビューで見つかった）**: v1.4.0 は、コマンドに `n3mc-hook` か `n3mc_hook` を含むだけのフックをすべて置き換えていた。N3MC Pro（`python ".../N3MemoryCore/n3mc_hook.py"` として登録される）も動かしている PC では、`n3mc --init` が Pro のフックを黙って消していた。§3 は `server_port` を分ければ 1 台の PC で両方を動かせると明記しているのに、である。また `settings.json` を控えなしにその場で書き換え、不正なファイルでは `--init` がトレースバックで終わっていた。
 
@@ -1455,7 +1495,7 @@ python -m pytest tests/ -v
 | `TestChunkSentences`（v1.5.0） | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
 | `TestTimeBounds`（v1.5.0） | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（UTC 以外の固定のタイムゾーンで）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー |
 | `TestDbCorrupt`（v1.5.0） | 2 回の破損で 2 つのバックアップ（`n3memory.db.corrupt-<time>.bak`）ができ、`-wal` / `-shm` は削除されずに隣へ移される、知らせ `db_corrupt` が出る、`quick_check` は 1 プロセスに 1 回 |
-| `TestInit`（v1.5.0、一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す |
+| `TestInit`（v1.5.0、一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、(v1.6.0)`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる |
 | `TestHousekeeping`（v1.5.0） | `--stop` が 30 日より古い `turn_id_*.txt` を消し、新しいものは残す、50 MB を超えた `audit.log` を `audit.log.1` にローテーションする（テストではサイズのしきい値を差し替える） |
 | `TestModelRetry`（v1.5.0） | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |
 | `TestPackaging`（v1.5.0） | `psutil` が `pyproject.toml` の `dependencies` に入っている |
@@ -1503,7 +1543,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 |---|---|---|
 | 1. 実装 | プロンプトを貼って実装を依頼 | **Sonnet**（高速） |
 | 2. デバッグ | 3 つのプロンプトを**順番に**貼って検証 | **Sonnet** |
-| 3. 品質レビュー | プロンプトを貼って評価・改善を依頼 | **Opus**（深い推論） |
+| 3. 品質レビュー | **新しいセッションを始めてから**、プロンプトを貼って評価・改善を依頼 | **Opus**（深い推論） |
 
 ---
 
@@ -1552,7 +1592,12 @@ N3MemoryCore について：
 
 ### フェーズ 3：品質レビュー（Opus）
 
-モデルを **Opus** に切り替え、以下を貼り付けてください。
+> **⚠️ レビューは新しいセッションで行う**: 実装とデバッグを行ったセッションでレビューしないでください。Claude Code を終了し、同じインストール先のフォルダで起動し直して、新しいセッションを始めてください。
+> - 実装したセッションのコンテキストには、そのセッション自身の判断や説明が残っています。そこでレビューすると、コードと指示書を改めて突き合わせるより、それまでの判断を追認しがちになります。
+> - Claude Code を起動し直すと、セットアップで登録したフックも読み込まれます。そのため、利用者が使うときと同じ状態で記憶の動きをレビューできます。
+> - 新しいセッションでは、フックが実装時の会話の一部を思い出すことがあります。これは想定どおりです。レビューは、コード、この指示書、実際に実行したコマンドの結果にもとづいて行ってください。
+
+新しいセッションで、モデルを **Opus** に切り替え、以下を貼り付けてください。
 
 ```
 N3MemoryCore をレビューしてください。

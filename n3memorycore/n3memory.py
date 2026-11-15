@@ -17,6 +17,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sysconfig
 import tempfile
 import threading
 import time
@@ -2160,18 +2161,45 @@ def is_own_hook(command: str, event: str) -> bool:
     return False
 
 
-def _resolve_hook_command(script_name: str) -> str:
-    """Resolve entry-point script path with forward slashes (bash-safe)."""
+def _shell_path(p) -> str:
+    """Forward slashes always (bash reads a backslash as an escape). Quote only
+    when the path has a space: a hook command that starts with a quote did not
+    run on a Windows PC (2026-11-15), while a bare path did."""
     import pathlib
+    s = pathlib.Path(p).as_posix()
+    return f'"{s}"' if ' ' in s else s
+
+
+def _resolve_hook_command(script_name: str) -> str:
+    """Resolve the hook command (spec section 4, resolve_cmd).
+
+    1. The scripts folder of the running Python (normal, then user scheme):
+       found even when PATH is stale, e.g. Python was installed after
+       Claude Code started.
+    2. PATH (shutil.which).
+    3. python -m (unquoted unless the path has a space).
+    """
+    import pathlib
+    folders = [sysconfig.get_path('scripts')]
+    try:
+        folders.append(sysconfig.get_path('scripts', sysconfig.get_preferred_scheme('user')))
+    except (KeyError, ValueError):
+        pass
+    for folder in folders:
+        if not folder:
+            continue
+        for name in (script_name + '.exe', script_name):
+            cand = pathlib.Path(folder) / name
+            if cand.is_file():
+                return _shell_path(cand)
     exe = shutil.which(script_name)
     if exe:
-        return pathlib.Path(exe).as_posix()
+        return _shell_path(exe)
     module = {
         'n3mc-hook':      'n3memorycore.n3mc_hook',
         'n3mc-stop-hook': 'n3memorycore.n3mc_stop_hook',
     }[script_name]
-    py = pathlib.Path(sys.executable).as_posix()
-    return f'"{py}" -m {module}'
+    return f'{_shell_path(sys.executable)} -m {module}'
 
 
 def _settings_path() -> str:

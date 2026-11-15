@@ -1467,6 +1467,9 @@ class TestInit:
         assert os.path.normcase(n3memory._settings_path()) == os.path.normcase(str(path))
         monkeypatch.setattr(n3memory.shutil, 'which',
                             lambda n: f'C:\\fake\\Scripts\\{n}.EXE')
+        # Keep the real scripts folder out of the test (spec resolve_cmd step 1).
+        monkeypatch.setattr(n3memory.sysconfig, 'get_path',
+                            lambda *a, **k: str(tmp_path / 'no_scripts'))
         return path
 
     def own_cmds(self, data, event):
@@ -1541,6 +1544,34 @@ class TestInit:
             assert perms['allow'].count(rule) == 1
         assert 'Bash(n3mc --show-turn *)' in perms['allow']
         assert 'Bash(n3mc --recall-thread *)' in perms['allow']
+
+    def test_resolve_finds_scripts_folder_with_empty_path(self, tmp_path, monkeypatch):
+        scripts = tmp_path / 'Py312' / 'Scripts'
+        scripts.mkdir(parents=True)
+        (scripts / 'n3mc-hook.exe').write_text('')
+        monkeypatch.setattr(n3memory.sysconfig, 'get_path', lambda *a, **k: str(scripts))
+        monkeypatch.setattr(n3memory.shutil, 'which', lambda n: None)
+        monkeypatch.setenv('PATH', '')
+        cmd = n3memory._resolve_hook_command('n3mc-hook')
+        assert cmd == (scripts / 'n3mc-hook.exe').as_posix()
+        assert not cmd.startswith('"')
+        assert n3memory.is_own_hook(cmd, 'UserPromptSubmit')
+
+    def test_resolve_m_form_unquoted_without_space(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(n3memory.sysconfig, 'get_path', lambda *a, **k: str(tmp_path / 'none'))
+        monkeypatch.setattr(n3memory.shutil, 'which', lambda n: None)
+        monkeypatch.setattr(n3memory.sys, 'executable', r'C:\Py312\python.exe')
+        cmd = n3memory._resolve_hook_command('n3mc-hook')
+        assert cmd == 'C:/Py312/python.exe -m n3memorycore.n3mc_hook'
+        assert n3memory.is_own_hook(cmd, 'UserPromptSubmit')
+
+    def test_resolve_m_form_quoted_with_space(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(n3memory.sysconfig, 'get_path', lambda *a, **k: str(tmp_path / 'none'))
+        monkeypatch.setattr(n3memory.shutil, 'which', lambda n: None)
+        monkeypatch.setattr(n3memory.sys, 'executable', r'C:\Program Files\Py312\python.exe')
+        cmd = n3memory._resolve_hook_command('n3mc-hook')
+        assert cmd == '"C:/Program Files/Py312/python.exe" -m n3memorycore.n3mc_hook'
+        assert n3memory.is_own_hook(cmd, 'UserPromptSubmit')
 
     def test_is_own_hook_unit(self):
         own = n3memory.is_own_hook
