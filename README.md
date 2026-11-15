@@ -26,7 +26,7 @@ N3MemoryCore gives Claude Code long-term memory across sessions.
 
 ## Features
 
-- 💾 **Fully local** — Your conversations stay on your machine. Nothing sent to the cloud.
+- 💾 **Stored locally** — Your memories are kept in a file on your own PC, not in any cloud service. Only the memories recalled for a turn are sent to Claude, together with your message ([details](#your-memory-stays-on-your-pc)).
 - 🔍 **Semantic search** — Finds relevant past conversations even when the exact words differ. Multilingual by default (`intfloat/multilingual-e5-base`) — works for Japanese, English, Chinese, Korean, and ~100 other languages out of the box. Swap to a language-specialised model via `config.json` if you need higher single-language precision.
 - 🔄 **Persistent across sessions** — Pick up tomorrow where you left off today.
 - ⚡ **Works automatically** — Saving and searching happen automatically. No manual steps needed.
@@ -67,6 +67,20 @@ Claude Code has a built-in auto-memory system (`~/.claude/projects/.../memory/`)
 **Recommended usage:**
 - **Fixed information needed every session** (folder paths, user preferences) → save to auto-memory
 - **Conversation context and history** (discussion threads, past decisions) → N3MemoryCore accumulates automatically
+
+## Your Memory Stays on Your PC
+
+An AI that remembers you is convenient, but it is natural to ask where those memories are kept. N3MemoryCore keeps them in one place you control: a file on your own PC.
+
+- **One local file** — Every memory is stored in a single SQLite file, `~/.n3mc/.memory/n3memory.db`. There is no N3MC account and no N3MC cloud service. To move it, set `N3MC_HOME` (see [Optional: change where data lives](#optional-change-where-data-lives)).
+- **Search runs on your PC** — The embedding model and the search run locally. N3MC's server listens only on `127.0.0.1` and rejects requests for any other host name, so other machines on your network cannot reach it.
+- **No telemetry** — N3MC sends no usage data anywhere. The code is open, so you can check this yourself.
+- **You can see and remove everything** — `n3mc --list` shows what is stored. Deleting `~/.n3mc/` removes all of it (see [Uninstall](#uninstall)). Backing up is copying two files (see [Backup and restore](#backup-and-restore)).
+
+What does go over the network:
+
+- **The embedding model download** — On the first search, `intfloat/multilingual-e5-base` (~470 MB) is downloaded from Hugging Face. After that, the Hugging Face library may still check for model updates when the model loads; set `HF_HUB_OFFLINE=1` to stop this once the model is downloaded.
+- **What Claude reads** — The memories recalled for a turn are added to that turn's prompt, so they are sent to Anthropic together with your message, as everything you type into Claude Code is. N3MC does not upload your memory database anywhere, but the parts Claude uses in a turn are part of that conversation.
 
 ## Free vs Pro
 
