@@ -4,7 +4,7 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.0] - 2026-11-15
+## [1.6.0] - 2026-11-16
 
 Spec files renamed `v1.5.0 → v1.6.0`. Fixes from scoring the v1.5.0 code
 (2026-11-15), applied through the specification. No schema changes. This
@@ -19,6 +19,24 @@ recalled context, so search results change.
   DB. Both floors now ignore `time_decay`; it only orders the results. In a
   measurement with the real model (50 records, 26 questions), making every
   record one year older no longer changes recall@3 (23/26; v1.5.0: 0/26).
+- **No hook ran on a Windows PC where Python had just been installed**
+  (found 2026-11-15): Claude Code still had the old `PATH`, so `--init`
+  could not find `n3mc-hook` and registered
+  `"C:/.../python.exe" -m n3memorycore.n3mc_hook`; a hook command that
+  starts with a quote did not run there. `--init` now looks for the entry
+  point in the scripts folder of the running Python (normal, then user
+  install) before `PATH`, and quotes a path only when it contains a space.
+
+### Changed
+- Spec, setup (Path B): Claude Code first shows the install folder and
+  waits for a yes; it stops when the folder already holds other files, and
+  never installs into the home folder or a system folder.
+- Spec, Windows: Microsoft Store `python` shortcuts count as "Python not
+  found"; `py -3` is also tried. The abort message lists beginner steps,
+  including signing out of Windows once after installing Python so Claude
+  Code gets the new `PATH`.
+- Spec, Phase 3: the quality review runs in a new session, not in the
+  session that implemented the code.
 
 ### Added
 - **Weak matches** (`min_results`, default 3): when fewer results pass the
