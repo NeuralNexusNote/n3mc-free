@@ -1542,7 +1542,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 |---|---|---|
 | 1. Implementation | Paste the prompt to request implementation | **Sonnet** (fast) |
 | 2. Debugging | Paste 3 prompts **one at a time** for verification | **Sonnet** |
-| 3. Quality review | Paste the prompt for evaluation & improvement | **Opus** (deep reasoning) |
+| 3. Quality review | **Start a new session**, then paste the prompt for evaluation & improvement | **Opus** (deep reasoning) |
 
 ---
 
@@ -1591,7 +1591,12 @@ Once all 3 are done, proceed to Phase 3.
 
 ### Phase 3: Quality Review (Opus)
 
-Switch the model to **Opus** and paste the following:
+> **⚠️ Review in a new session**: Do not review in the session that implemented and debugged the code. Exit Claude Code, start it again in the same install folder, and begin a new session.
+> - The implementing session's context holds its own decisions and explanations, so a review there tends to confirm them instead of checking the code against this specification afresh.
+> - A restarted Claude Code also loads the hooks registered during setup, so the review sees the memory working as a user will.
+> - In the new session the hooks may recall parts of the implementation conversation; that is expected. Base the review on the code, this specification and the results of commands actually run.
+
+In the new session, set the model to **Opus** and paste the following:
 
 ```
 Please review N3MemoryCore.
