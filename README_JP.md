@@ -22,6 +22,22 @@
 N3MemoryCoreは、Claude Codeに長期記憶を与える仕組みです。
 **2 つの導入経路をサポート**: 仕様書を Claude Code に渡して実装させるか、`pip install` でリファレンス実装をそのまま使い `n3mc --init` を実行するか。どちらの経路でもフック設定は手動編集不要です。（詳細は[セットアップ](#セットアップ)参照）
 
+## Free と Lite、どちらを使うか
+
+無償の N3MemoryCore は 2 つあります。**初めての方は、Free(このリポジトリ)から始めてください。**
+
+| | **N3MC Free**(このリポジトリ) | **[N3MC MCP Lite](https://github.com/NeuralNexusNote/n3mcmcp-lite)** |
+|---|---|---|
+| 使えるアプリ | Claude Code だけ | MCP 対応のアプリ: Claude Code、Claude Desktop、Cursor、Windsurf など |
+| 保存されるもの | すべての発言を自動で(フック) | AI が保存すると判断したもの(`save_memory`) |
+| 残る期間 | 自分で消すまで | 7 日。過ぎると自動で消える |
+| 必要なもの | Python 3.10 以上 | Python 3.10 以上、Docker(Redis Stack)、MCP クライアントの設定 |
+| 導入 | `pip install n3memorycore-free` の後に `n3mc --init` | Redis Stack を起動し、インストールして、MCP クライアントにサーバーを登録する |
+| 向いている人 | 初めての方。Claude Code の長期記憶に | MCP と Docker に慣れた方。プロジェクトの間だけの作業メモリに |
+
+- **Free を選ぶ:** Claude Code を使っていて、ほかのソフトを入れずに会話を覚えさせたい場合。
+- **Lite を選ぶ:** ほかの MCP クライアント(Claude Desktop、Cursor など)を使う場合や、短いプロジェクトが終われば自然に消える記憶がほしい場合。Docker の起動と MCP の設定ができることが前提です。
+
 ---
 
 ## 特徴
