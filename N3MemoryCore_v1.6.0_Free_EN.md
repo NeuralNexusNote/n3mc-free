@@ -56,7 +56,7 @@ Then **restart Claude Code**. Memory kicks in from the next session.
 **Path B — AI-Native Setup** (regenerate from this specification)
 
 1. Load this specification into Claude Code and ask: "Please implement N3MemoryCore according to this specification."
-   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. No manual steps required.
+   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below): open Claude Code in an empty folder such as `~/<name>` first.
    - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
 
 > **📖 After implementation (Path B only)**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
@@ -76,6 +76,11 @@ Implement long-term memory for Claude Code as a "lifelong asset."
 Exclude source code and accumulate high-density "intent, conclusions, and evaluations" of information. Build a RAG foundation with hybrid search (vector + FTS5) and mathematical correctness, treating data Durability as the top priority. All conversations are automatically saved by hooks. Claude does not need to judge what to save. (The hooks record every non-empty message in full — no length or skip-pattern filter; see §5.1.)
 
 > **Do NOT output manual command hints** (e.g., `n3mc --buffer "fact to save"`, `n3mc --search "keyword"`, `n3mc --list`) at any point during or after implementation.
+
+> **⚠️ Install folder check (Path B — do this first, before anything else)**: Path B writes the code into the folder Claude Code is open in (the current working directory): `pyproject.toml`, `README.md`, `tests/`, `n3memorycore/` and the other files of §2. That folder stays in use after setup: with `pip install -e .` the hooks run the code from it, so deleting or moving it later stops the memory from working.
+> 1. Show the user the absolute path of the current working directory and this message: "N3MemoryCore will be installed in this folder: <absolute path>. The code will stay here; deleting or moving this folder later stops the memory hooks. Continue? (yes/no)". **Wait for the user's answer.** Continue only on a clear yes. This is the only confirmation of the setup; everything after it runs automatically.
+> 2. Before asking, look at the folder. If it contains anything other than this specification file, `.claude/`, `.git/` and the files of an earlier setup of this product (`n3memorycore/`, `pyproject.toml` whose `name` is this package's), **do not ask: abort** and display: "This folder already contains other files (for example a project of yours). Setting up here could overwrite them. Create an empty folder such as `~/n3mc-free`, open Claude Code there, and run this setup again." Never overwrite or mix into an existing project.
+> 3. Do not install into the home folder itself (`~`) or a system folder.
 
 > **⚠️ Python check**: Before starting implementation, run `python --version` or `python3 --version` to verify Python 3.10+ is available. If not found, display: "Python 3.10 or higher is required. Install from https://www.python.org/" and **abort setup**.
 >
