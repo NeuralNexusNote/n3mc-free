@@ -87,7 +87,11 @@ Claude Codeに「一生モノの資産」となる長期記憶を実装せよ。
 > **Windows の注意**: Windows では `python` / `python3` が Microsoft Store 用のショートカット(`%LOCALAPPDATA%\Microsoft\WindowsApps` のアプリ実行エイリアス)しか無いことがある。この場合はバージョンが表示されず、Store が開くか「Python was not found」と表示される。これは「Python が見つからない」として扱え。判断する前に `py -3 --version`(python.org 版のランチャー)も試せ。Windows で中断するときは、次の手順をメッセージに添えよ。
 > 1. https://www.python.org/ から Python 3.10 以上をインストールする。インストーラーの「Add python.exe to PATH」にチェックを入れる。または `winget install Python.Python.3.12` を実行する。
 > 2. それでも `python` で Microsoft Store が開く場合は、設定 → アプリ → アプリの詳細設定 → アプリ実行エイリアス で `python.exe` と `python3.exe` をオフにする。
-> 3. 新しいターミナルで `python --version` が 3.10 以上を表示することを確かめ、Claude Code を再起動してからセットアップをやり直す。
+> 3. **再起動が必要です。** Claude Code は起動したときの `PATH` を使い続けるので、あとから入れた Python が見えない。Claude Code のウィンドウを閉じるだけでは足りない(アプリがバックグラウンドやタスクトレイで動き続けることがある)。Windows から一度サインアウトして、サインインし直す。スタートメニュー → 左下の自分のアカウントのアイコン → **サインアウト**。PC の再起動でもよい。
+> 4. サインインし直したら、新しいターミナルを開き、`python --version` が 3.10 以上を表示することを確かめる。
+> 5. Claude Code を起動し、同じフォルダを開いて、このセットアップをもう一度依頼する。
+>
+> このメッセージは初心者向けに書け。1 つの手順に 1 つの操作、やさしい言葉で書き、サインアウト(または再起動)が必要なことをはっきり伝えよ。
 >
 > Python を自分でインストールしてはならない。ソフトウェアのインストールは利用者に任せる。
 

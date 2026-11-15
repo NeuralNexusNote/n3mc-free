@@ -87,7 +87,11 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 > **Windows note**: On Windows, `python` / `python3` may exist only as Microsoft Store shortcuts (App Execution Aliases under `%LOCALAPPDATA%\Microsoft\WindowsApps`). They open the Store or print a "Python was not found" message instead of a version. Treat this as "Python not found". Also try `py -3 --version` (the python.org launcher) before concluding. When aborting on Windows, add these steps to the message:
 > 1. Install Python 3.10 or later from https://www.python.org/ and check "Add python.exe to PATH" in the installer, or run `winget install Python.Python.3.12`.
 > 2. If `python` still opens the Microsoft Store, turn off the `python.exe` and `python3.exe` entries in Settings → Apps → Advanced app settings → App execution aliases.
-> 3. Open a new terminal, confirm `python --version` prints 3.10 or later, then restart Claude Code and run this setup again.
+> 3. **Restart required.** Claude Code keeps the `PATH` it started with, so it cannot see a Python installed afterwards. Closing the Claude Code window is not enough: the app can keep running in the background (for example in the system tray). Sign out of Windows once and sign in again: Start menu → your account icon (bottom left) → **Sign out**. Restarting the PC also works.
+> 4. After signing in, open a new terminal and confirm that `python --version` prints 3.10 or later.
+> 5. Start Claude Code, open the same folder, and ask it to run this setup again.
+>
+> Write this message for a beginner: one action per step, plain words, and say clearly that the sign-out (or restart) is required.
 >
 > Do not install Python yourself; installing software is left to the user.
 
