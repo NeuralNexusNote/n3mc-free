@@ -55,7 +55,11 @@ _FOREIGN_SERVER_ROOT: Optional[str] = None
 
 # spec §4.5: inputs that are not typed by the user — no search, no save,
 # no new turn_id.
-_SYSTEM_PROMPT_PREFIXES = ('<task-notification>',)
+_SYSTEM_PROMPT_PREFIXES = (
+    '<task-notification>',
+    '<agent-message from=',     # a subagent's report (2026-11-17)
+    '<system-reminder>',        # an app notice (2026-11-17)
+)
 
 _HEADING = "# Recalled Memory Context"
 
@@ -206,6 +210,10 @@ _DEFAULT_CONFIG: dict = {
     "version_order_enabled":    True,
     "version_sim_threshold":    0.98,   # measured with multilingual-e5-base
     "version_min_chars":        100,
+    "reply_sim_rerank_enabled": False,  # spec §5 step 1b (2026-11-17)
+    "reply_sim_alpha":          0.3,
+    "reply_sim_floor":          0.80,   # measured with multilingual-e5-base
+    "reply_sim_span":           0.15,   # measured with multilingual-e5-base
 }
 
 
@@ -225,6 +233,9 @@ _CONFIG_RULES: dict = {
     'vector_min_cos':           ('num', 0, 1, False),
     'relative_min_score_ratio': ('num', 0, 1, False),
     'version_sim_threshold':    ('num', 0, 1, False),
+    'reply_sim_alpha':          ('num', 0, 1, False),
+    'reply_sim_floor':          ('num', 0, 1, False),
+    'reply_sim_span':           ('num', 0, None, True),
 }
 
 
@@ -1054,7 +1065,7 @@ def _repair_db(max_records: Optional[int] = None) -> int:
     (FTS punctuation cleaning and index repair); None = everything."""
     from .core.database import (
         get_connection, find_unindexed_memories, serialize_vector,
-        strip_fts_punctuation,
+        strip_fts_punctuation, bigram_text, fill_bigram_index,
     )
     from .core.processor import embed_passage
 
@@ -1112,6 +1123,18 @@ def _repair_db(max_records: Optional[int] = None) -> int:
             if cleaned_count > 0:
                 print(f"FTS punctuation cleaned: {cleaned_count} record(s).", file=sys.stderr)
 
+        # spec §3 (2026-11-17): one-time CJK bigram index of the records
+        # saved before memories_fts_bi existed. New records are indexed by
+        # insert_memory, so later calls skip this. Not limited by
+        # max_records: it embeds nothing (about 5 s for 18,000 records).
+        bi_marker = os.path.join(MEMORY_DIR, 'fts_bigram_v1')
+        if not os.path.exists(bi_marker):
+            n_bi = fill_bigram_index(conn)
+            with open(bi_marker, 'w', encoding='utf-8') as f:
+                f.write('done')
+            if n_bi > 0:
+                print(f"FTS bigram index: {n_bi} record(s).", file=sys.stderr)
+
         # spec §5: vec_model.txt marker — warn if embed model changed
         current_model = (_srv_cfg or {}).get('embed_model', 'intfloat/multilingual-e5-base')
         vec_marker = os.path.join(MEMORY_DIR, 'vec_model.txt')
@@ -1166,6 +1189,13 @@ def _repair_db(max_records: Optional[int] = None) -> int:
                         "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
                         (rowid, stripped)
                     )
+                    if not conn.execute(
+                        "SELECT 1 FROM memories_fts_bi WHERE rowid = ?", (rowid,)
+                    ).fetchone():
+                        conn.execute(
+                            "INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
+                            (rowid, bigram_text(content))
+                        )
                     batch_repaired += 1
                     changed = True
 

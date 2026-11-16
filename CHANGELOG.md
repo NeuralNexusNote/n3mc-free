@@ -6,10 +6,38 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Search changes ported from N3MC-Pro (2026-11-17)
+
+Applied through the specification (EN and JP). Adds one FTS5 table
+(`memories_fts_bi`) and four config keys (`reply_sim_*`).
+
+#### Fixed
+- **A Japanese prompt rarely got a keyword hit**: the FTS query kept a
+  space-less sentence as one term, which matched only a record containing
+  that exact sentence. A CJK word of 4+ characters is now split into its
+  3-character grams (hiragana-only grams dropped), OR-ed and ranked by
+  bm25. At most 40 terms (was 30).
+- **Subagent reports and app notices were saved as `[user]`**: prompts
+  starting with `<agent-message from=` or `<system-reminder>` are now
+  neither saved nor searched and keep the current `turn_id`, like
+  `<task-notification>`.
+
+#### Added
+- **CJK bigram FTS index** (`memories_fts_bi`, `unicode61`): 2-character
+  words such as `記憶` or `PR`, which the trigram index cannot match, now
+  get keyword hits. Searched with the trigram index on every search, bm25
+  normalized per index. Deleted together with the other tables. Existing
+  records are indexed once by `--repair` (marker `fts_bigram_v1`).
+- **Re-rank by similarity to the reply** (`reply_sim_rerank_enabled`,
+  default `false`; `reply_sim_alpha` 0.3, `reply_sim_floor` 0.80,
+  `reply_sim_span` 0.15, measured with `multilingual-e5-base`).
+
+### Review of the v1.6.0 code (2026-11-16)
+
 Fixes from the review of the v1.6.0 code (2026-11-16), applied through the
 specification (EN and JP). No schema or config changes.
 
-### Fixed
+#### Fixed
 - **A prompt that was only a JSON array was not saved and not searched**:
   `_extract_text()` read every string that parsed as a JSON array as a
   multimodal array, so `[1, 2, 3]` or `["apple", "banana"]` typed as the
@@ -21,7 +49,7 @@ specification (EN and JP). No schema or config changes.
   embedding model was unavailable each call reported N and repaired none.
   It now counts only records that were changed.
 
-### Changed
+#### Changed
 - `.claude/rules/n3mc-behavior.md` in this repository is the current
   template (`<!-- n3mc-behavior v3 -->`, with the "Weak Matches" section);
   it was still the v2 text.

@@ -12,6 +12,7 @@ from .database import (
     search_vector,
     search_vector_with_filter,
     search_fts,
+    search_fts_bigram,
     get_all_memories,
     delete_memory,
     count_memories,
@@ -340,6 +341,69 @@ def _collapse_identical_content(results: list) -> list:
     return out
 
 
+def _rerank_by_reply_similarity(
+    conn, results: list, q_vec: list, alpha: float, floor: float, span: float
+) -> list:
+    """spec §5 (2026-11-17): re-rank exchanges by how close the query is to
+    their REPLY.
+
+    The best-scoring chunk of an exchange is often its request ("[user] ..."),
+    and a similarly worded request says little about whether the reply holds
+    what the query needs. For each row with a turn_id, the stored embeddings
+    of the exchange's "[claude ...]" chunks are averaged and compared with
+    the query:
+
+        score = (1 - alpha) * score / best_score
+                + alpha * max(0, (cos - floor) / span)
+
+    Stored vectors only (no model call), one SQL query for all exchanges.
+    Rows without a turn_id or without reply chunks get no similarity part.
+    floor 0.80 / span 0.15 were measured with multilingual-e5-base. On any
+    error the input is returned unchanged.
+    """
+    if not results or alpha <= 0 or span <= 0:
+        return results
+    tids = sorted({r['turn_id'] for r in results if r.get('turn_id')})
+    sims: dict = {}
+    if tids:
+        try:
+            import numpy as np
+
+            q = np.asarray(q_vec, dtype=np.float32)
+            sums: dict = {}
+            marks = ','.join('?' * len(tids))
+            for tid, blob in conn.execute(
+                "SELECT m.turn_id, v.embedding FROM memories m "
+                "JOIN memories_vec v ON v.rowid = m.rowid "
+                f"WHERE m.turn_id IN ({marks}) AND m.content LIKE '[claude%'",
+                tids,
+            ):
+                if not blob:
+                    continue
+                v = np.frombuffer(blob, dtype=np.float32)
+                n = float(np.linalg.norm(v))
+                if n == 0.0 or v.shape != q.shape:
+                    continue
+                sums[tid] = sums.get(tid, 0.0) + v / n
+            qn = float(np.linalg.norm(q)) or 1.0
+            for tid, s in sums.items():
+                n = float(np.linalg.norm(s))
+                if n > 0.0:
+                    sims[tid] = float(s @ q) / (n * qn)
+        except Exception as e:
+            logger.warning(f"Reply-similarity rerank skipped: {e}")
+            return results
+    best = max(r.get('score', 0.0) for r in results) or 1.0
+    for r in results:
+        cos = sims.get(r.get('turn_id'))
+        part = 0.0 if cos is None else max(0.0, (cos - floor) / span)
+        r['score'] = round((1.0 - alpha) * (r.get('score', 0.0) / best)
+                           + alpha * part, 6)
+    results.sort(key=lambda x: (x['score'], x['timestamp'] or '', x['id']),
+                 reverse=True)
+    return results
+
+
 def hybrid_search(
     db_path: str,
     query: str,
@@ -369,6 +433,7 @@ def hybrid_search(
         #    (kept aside with their actual cos for the weak-match fill, §5 step 7)
         vec_results = {}
         vec_low = {}
+        q_vec = None
         try:
             q_vec = embed_query(query)
             if since or until:
@@ -412,8 +477,37 @@ def hybrid_search(
         except Exception as e:
             logger.warning(f"FTS search error (continuing with vectors): {e}")
 
+        # keyword_relevance per index (bm25 is normalized by each index's own
+        # maximum); a record found by both keeps the higher value.
         fts_max_abs = max((abs(v['bm25_score']) for v in fts_results.values()),
                           default=0.0)
+        kw_rel = {rid: keyword_relevance(v['bm25_score'], fts_max_abs, bm25_min)
+                  for rid, v in fts_results.items()}
+
+        # 2b. CJK bigram index (spec §3, 2026-11-17) — always searched with
+        #     the trigram index. On failure, keep the trigram results only.
+        try:
+            bi_rows = search_fts_bigram(conn, query, limit=limit * 3,
+                                        since=since, until=until)
+        except Exception as e:
+            logger.warning(f"Bigram FTS search error (continuing): {e}")
+            bi_rows = []
+        bi_max_abs = max((abs(r['bm25_score']) for r in bi_rows), default=0.0)
+        for row in bi_rows:
+            kr = keyword_relevance(row['bm25_score'], bi_max_abs, bm25_min)
+            if row['id'] not in fts_results:
+                fts_results[row['id']] = {
+                    'id':         row['id'],
+                    'content':    row['content'],
+                    'timestamp':  row['timestamp'],
+                    'session_id': row['session_id'],
+                    'turn_id':    row['turn_id'],
+                    'agent_name': row['agent_name'],
+                    'bm25_score': row['bm25_score'],
+                }
+                kw_rel[row['id']] = kr
+            elif kr > kw_rel.get(row['id'], 0.0):
+                kw_rel[row['id']] = kr
 
         def _row(rid: str, use_low_cos: bool) -> dict:
             vec_r = vec_results.get(rid)
@@ -428,8 +522,7 @@ def hybrid_search(
                 cs = low_r['cos_sim']
             else:
                 cs = 0.0
-            bm25 = fts_r['bm25_score'] if fts_r else 0.0
-            kr = keyword_relevance(bm25, fts_max_abs, bm25_min)
+            kr = kw_rel.get(rid, 0.0) if fts_r else 0.0
             decay = time_decay(meta['timestamp'], half_life)
             sess = meta.get('session_id')
             # spec §3: b_session = 1.0 on match, 0.6 on mismatch/NULL
@@ -462,6 +555,16 @@ def hybrid_search(
             scored.append(row)
         scored.sort(key=lambda x: (x['score'], x['timestamp'] or '', x['id']),
                     reverse=True)
+
+        # 3b. Re-rank by similarity to the reply (spec §5, 2026-11-17; off by
+        #     default). Changes `score` and the order, not `filter_score`.
+        if scored and q_vec is not None and config.get('reply_sim_rerank_enabled', False):
+            scored = _rerank_by_reply_similarity(
+                conn, scored, q_vec,
+                config.get('reply_sim_alpha', 0.3),
+                config.get('reply_sim_floor', 0.80),
+                config.get('reply_sim_span', 0.15),
+            )
 
         # 4. Newest version of the same content first
         if scored and config.get('version_order_enabled', True):
