@@ -150,6 +150,31 @@ class TestRepair:
         assert data['status'] == 'ok'
         assert 'count' in data
 
+    def test_count_excludes_unrepaired_records(self, client, monkeypatch):
+        # spec §4 (2026-11-16): a record whose embedding cannot be computed
+        # (and whose FTS row exists) is not counted as repaired.
+        from datetime import datetime, timezone
+        from n3memorycore import n3memory
+        from n3memorycore.core import database, processor
+        client.post('/repair', json={})            # settle earlier records
+        conn = database.get_connection(n3memory.DB_PATH)
+        try:
+            for i in range(3):
+                database.insert_memory(
+                    conn, str(uuid.uuid4()), f'no vector yet {uuid.uuid4()}',
+                    datetime.now(timezone.utc).isoformat(), owner_id='o')
+        finally:
+            conn.close()
+
+        def _fail(text):
+            raise RuntimeError('model unavailable')
+
+        with monkeypatch.context() as m:
+            m.setattr(processor, 'embed_passage', _fail)
+            assert client.post('/repair', json={}).json()['count'] == 0
+            assert client.post('/repair', json={'max_records': 200}).json()['count'] == 0
+        assert client.post('/repair', json={}).json()['count'] == 3
+
 
 # ---------------------------------------------------------------------------
 class TestList:

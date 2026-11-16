@@ -1146,6 +1146,7 @@ def _repair_db(max_records: Optional[int] = None) -> int:
                 content  = row['content']
                 has_vec  = row['vec_rowid'] is not None
                 has_fts  = row['fts_rowid'] is not None
+                changed  = False
 
                 if not has_vec:
                     try:
@@ -1155,6 +1156,7 @@ def _repair_db(max_records: Optional[int] = None) -> int:
                             (rowid, serialize_vector(vec))
                         )
                         batch_repaired += 1
+                        changed = True
                     except Exception as e:
                         logger.warning(f"Repair embed rowid={rowid}: {e}")
 
@@ -1165,8 +1167,11 @@ def _repair_db(max_records: Optional[int] = None) -> int:
                         (rowid, stripped)
                     )
                     batch_repaired += 1
+                    changed = True
 
-                repaired += 1
+                # spec §4 (2026-11-16): count only records this call changed
+                if changed:
+                    repaired += 1
 
             conn.commit()
             # spec §3.5: exit if no progress (e.g. embed model unavailable)
@@ -1402,16 +1407,25 @@ def _write_turn_id(tid: str, cc_session_id: str = '') -> None:
         f.write(tid)
 
 
+def _is_multimodal_parts(parts) -> bool:
+    """spec §4.5: a non-empty JSON array whose elements are all objects with
+    a string `type` key. Typed text that happens to be valid JSON
+    (`[1, 2, 3]`, `["a", "b"]`, `[]`) is not such an array."""
+    return (isinstance(parts, list) and bool(parts)
+            and all(isinstance(p, dict) and isinstance(p.get('type'), str)
+                    for p in parts))
+
+
 def _extract_text(prompt) -> str:
     if isinstance(prompt, str):
         try:
             parts = json.loads(prompt)
         except Exception:
             return prompt
-        if isinstance(parts, list):
+        if _is_multimodal_parts(parts):
             return ' '.join(
                 p.get('text', '') for p in parts
-                if isinstance(p, dict) and p.get('type') == 'text'
+                if p.get('type') == 'text' and isinstance(p.get('text', ''), str)
             )
         return prompt
     if isinstance(prompt, list):

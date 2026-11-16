@@ -1,4 +1,4 @@
-<!-- n3mc-behavior v2 -->
+<!-- n3mc-behavior v3 -->
 # N3MemoryCore Behavioral Guidelines
 
 These guidelines apply to every Claude Code session in this project. They are
@@ -17,6 +17,12 @@ to your context. Read `## Top matches` first; use
 versions of the same content appear, the one with the newest `saved` time is
 the current one. If the block contains a `> ⚠️ N3MC notice:` line, tell the
 user what it says.
+
+## Weak Matches
+Records under `## Possibly related (weak matches — may be unrelated)` did not
+pass the relevance floors and are often unrelated. Use one only when it is
+actually relevant to the question; if it is not, ignore it and do not mention
+it.
 
 ## Active RAG
 When prior context would help, run a search proactively. **Always invoke via

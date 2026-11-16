@@ -1107,6 +1107,7 @@ stdin から UserPromptSubmit の JSON を読み取る。Claude Code は `sessio
 > **⚠️ 理由（v1.5.0、Free v1.4.0 のレビューで見つかった）**: v1.4.0 の手順 2 は UserPromptSubmit の入力から `last_assistant_message` を読んでいたが、Claude Code はそこには決して送らない。そのため Q-A 契約の「回復経路」は一度も動かず、Stop フックが動かなかった返答（中断したターン、クラッシュ）は DB にも `audit.log` にもなかった。
 
 - **画像だけの質問（v1.5.0）**: `_extract_text()` が何も返さない（質問が画像だけ）ときも、**新しい** `turn_id` を作って `turn_id_<session>.txt` に書く。飛ばすのは `[user]` の保存だけ。そうしないと、画像への返答が 1 つ前の質問の `turn_id` で保存され（v1.4.0 から Stop フックはファイルを消さない）、関係のない往復の一部として出てしまう。
+- **JSON として読める入力（2026-11-16 に発見）**: `_extract_text()` が文字列の `prompt` をマルチモーダルの配列として扱うのは、**空でない JSON 配列として読め、すべての要素が文字列の `type` キーを持つオブジェクトであるときだけ**（`[{"type":"text",…},{"type":"image",…}]`）。それ以外はユーザーが入力した文章なので、そのまま返す。JSON として読める文章（`[1, 2, 3]`、`["apple", "banana"]`、`[]`、`[{"id": 1}]`）も同じ。この決まりの前は、JSON 配列として読める文字列をすべてマルチモーダルの配列として扱っていたため、そのような配列だけの質問は空になり、検索もされず、DB にも保存されなかった（`audit.log` にだけ残った）。
 
 - **システムの入力は飛ばす**: ユーザー発言が `_SYSTEM_PROMPT_PREFIXES`（現在は `<task-notification>` だけ）で始まる場合（バックグラウンド処理の完了通知など、ユーザーが打ったものではない入力）は、repair・保存・検索をせず、**新しい `turn_id` も振らない**（その通知への Claude の返答は、今の往復の `turn_id` に入る）。`audit.log` に `{"hook": "UserPromptSubmit", "stage": "skipped", "reason": "system_prompt"}` の行を書き、空の結果（`_No relevant memories found._`）を stdout に出して終わる。ほかのシステムの入力が見つかったら `_SYSTEM_PROMPT_PREFIXES` に足す。
 - ポートが別のフォルダのサーバーのときは §3「ポートが別のフォルダのサーバーのとき」に従う（保存は直接、検索はしない）。
@@ -1126,7 +1127,7 @@ Stop フックと同じ JSON を stdin から読み取り、`last_assistant_mess
 
 ```json
 // POST /buffer・/repair 成功時
-{"status": "ok", "count": <処理件数>}
+{"status": "ok", "count": <保存した件数（/buffer）または実際に変更した件数（/repair）>}
 
 // POST /buffer 保存しなかったとき（空、または完全一致）
 {"status": "skipped", "count": 0, "reason": "empty" | "exact_duplicate"}
@@ -1186,14 +1187,14 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 > 上記「完全記録契約」を実現する具体的な実行モデル。`audit.log` 書き込みは常に Step 0 として最初に走る（契約 4 を担保する最後の砦）。
 
-- **【自動化】修復・検索・会話の自動保存**: `UserPromptSubmit` フック（`n3memorycore/n3mc_hook.py`、エントリポイント名 `n3mc-hook`）は `n3mc --hook-submit` を呼び出し、単一プロセス内で以下を実行する。**Step 0 — 監査ログ（常に最初）**: すべてのフック呼び出しは、他の処理に先立って追記専用 `~/.n3mc/.memory/audit.log` に JSON レコード `{"ts", "hook", "raw", "payload"}` を 1 件追加する。これは他のどの処理よりも前に書かれる「最後の砦」としての権威ある生ログであり、後続が全滅しても原文だけは残る。続けて：`--repair`（未ベクトル化修復。1 ターンに最大 200 件、§3.5）、`--buffer`（Claude の直前の回答を **`transcript_path` から読み**（§4.5 `--hook-submit`）、全文保存する — 全文に `purify_text` をかけてから `chunk_text(max_chars=400, overlap=40)` で分割し `[claude]` / `[claude i/N]` で保存。保存済みのチャンクは完全一致の判定で飛ばされる）、`--search`（記憶取得）、`--buffer`（ユーザー発言を全文保存する — メッセージ全体に `purify_text` をかけてから分割し `[user]` / `[user i/N]` で保存）。**長さフィルタなし、スキップパターンフィルタなし**：空でない入力はすべて一字一句記録される。Claude Code が画像+テキストのプロンプトを渡す場合、`prompt` フィールドが JSON 配列になる場合がある。`_extract_text()` は `type=="text"` の部分のみを抽出する。結果が空（画像のみのプロンプト）の場合でも、repair・Claude 回答保存・search・新しい `turn_id`・監査ログ記録は実行され、Step 4（ユーザー保存）のみ、記録すべき本文がないためスキップする。生のマルチモーダルペイロードは `audit.log` に捕捉される。
+- **【自動化】修復・検索・会話の自動保存**: `UserPromptSubmit` フック（`n3memorycore/n3mc_hook.py`、エントリポイント名 `n3mc-hook`）は `n3mc --hook-submit` を呼び出し、単一プロセス内で以下を実行する。**Step 0 — 監査ログ（常に最初）**: すべてのフック呼び出しは、他の処理に先立って追記専用 `~/.n3mc/.memory/audit.log` に JSON レコード `{"ts", "hook", "raw", "payload"}` を 1 件追加する。これは他のどの処理よりも前に書かれる「最後の砦」としての権威ある生ログであり、後続が全滅しても原文だけは残る。続けて：`--repair`（未ベクトル化修復。1 ターンに最大 200 件、§3.5）、`--buffer`（Claude の直前の回答を **`transcript_path` から読み**（§4.5 `--hook-submit`）、全文保存する — 全文に `purify_text` をかけてから `chunk_text(max_chars=400, overlap=40)` で分割し `[claude]` / `[claude i/N]` で保存。保存済みのチャンクは完全一致の判定で飛ばされる）、`--search`（記憶取得）、`--buffer`（ユーザー発言を全文保存する — メッセージ全体に `purify_text` をかけてから分割し `[user]` / `[user i/N]` で保存）。**長さフィルタなし、スキップパターンフィルタなし**：空でない入力はすべて一字一句記録される。Claude Code が画像+テキストのプロンプトを渡す場合、`prompt` フィールドが JSON 配列になる場合がある。`_extract_text()` は `type=="text"` の部分のみを抽出する（この配列として扱うのは、`type` キーを持つオブジェクトの配列だけ。JSON として読める入力はそのまま残す — §4.5）。結果が空（画像のみのプロンプト）の場合でも、repair・Claude 回答保存・search・新しい `turn_id`・監査ログ記録は実行され、Step 4（ユーザー保存）のみ、記録すべき本文がないためスキップする。生のマルチモーダルペイロードは `audit.log` に捕捉される。
 - **【実装仕様】フック内のサブプロセス実行方式（変更禁止）**: `n3memorycore/n3mc_hook.py` および `n3memorycore/n3mc_stop_hook.py` 内のサブプロセス呼び出しは **`subprocess.run`（同期・ブロッキング）** を使用し、各コマンドの完了を待ってから次を実行せよ。`Popen`（非同期・ファイアアンドフォーゲット）を使用してはならない。**理由**: `--repair` → `--search` には実行順序の依存関係がある（修復が完了しないと検索が不完全になる）。また `--search` の結果が stdout に出し終わる前に Claude へ制御が戻ると、検索結果が読めない。速度向上を目的とした非同期化は、データの整合性と検索精度を破壊する。なお、FastAPI サーバーの起動（§3 Clean CLI）のみ `Popen` を使用する（起動完了を待つ必要がないため）。
 - **【自動化】Claude の回答の自動保存**: `Stop` フック（`n3memorycore/n3mc_stop_hook.py`、エントリポイント名 `n3mc-stop-hook`）はまず Step 0 の監査ログ記録を書き（プロセス内で実行）、続いて以下の 2 つの同期サブプロセスを順番に呼び出す:
   1. `python -m n3memorycore.n3memory --save-claude-turn`（stdin = Stop フックの JSON）— `last_assistant_message` をチャンク化保存する。`[claude]` / `[claude i/N]` プレフィックス、既存の turn_id を引き継いで Q-A pairing を維持する。長さフィルタは適用せず、空でない回答はすべて記録する。**ここで `--buffer -` を使ってはならない**: Stop フックが既に stdin を audit.log 書き込みのために消費している。
   2. `python -m n3memorycore.n3memory --stop` — AI 行動指針の用意と旧 memory_context の片付け（§4「`--stop` フック仕様」参照）。
 
   1ターンあたりの合計サブプロセス数: `UserPromptSubmit` × 1（`--hook-submit`）+ `Stop` × 2（`--save-claude-turn` + `--stop`）= 3 回。
-- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。
+- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。
 ### 5.3 AI 行動指針
 
 - **【AI行動指針】全自動保存**: 全会話はフック（UserPromptSubmit / Stop）により自動保存される。Claude が自分で判断して `--buffer` を手動呼び出しする必要はない。**空でないユーザー発言・Claude 回答はすべて、一字一句、切り捨てなしで記録される。** 長さフィルタ（旧 `len(text) >= 10` / `>= 3`）は**廃止**、スキップパターンフィルタ（旧 `_SKIP_PATTERNS`、「ok / yes / thanks」定型応答フィルタ）も**廃止**。`ok` や `yes` のような短い応答も他と同様に記録される。
@@ -1444,26 +1445,26 @@ python -m pytest tests/ -v
 | `TestRefresh` | `exact_duplicate_not_inserted`, `below_threshold_not_duplicate` | 重複の扱い（完全一致のみ） |
 | `TestBiasScoring` | `session_match`, `session_mismatch_lower`, `full_score_formula` | ランキング式（`b_session` のみ。Free に `b_local` はない） |
 
-### Layer 3: `test_api.py`（21テスト）
+### Layer 3: `test_api.py`（22テスト）
 
 | テストクラス | テスト内容 | カバレッジ |
 |---|---|---|
 | `TestHealth` | `health_ok` | サーバー状態 |
 | `TestBuffer` | `save_content`, `empty_content_skipped`, `agent_name_saved`, `exact_dedup`, `code_block_purified` | 保存API |
 | `TestSearch` | `empty_db_search`, `save_then_search`, `empty_query`, `score_returned` | 検索API |
-| `TestRepair` | `repair_runs` | 修復API |
+| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API。埋め込みを計算できないとき `count` は 0 |
 | `TestList` | `list_returns_records`, `list_after_save` | 一覧API |
 | `TestDelete` | `delete_returns_403`, `delete_nonexistent_also_403`, `delete_detail_is_pro` | Pro 専用エンドポイント → 403 |
 | `TestGC` | `gc_returns_403`, `gc_detail_is_pro` | Pro 専用エンドポイント → 403 |
 | `TestImport` | `import_returns_403`, `import_with_data_returns_403`, `import_detail_is_pro` | Pro 専用エンドポイント → 403 |
 
-### Layer 4: `test_hooks.py`（20テスト）と `test_hooks_encoding.py`（10テスト）
+### Layer 4: `test_hooks.py`（21テスト）と `test_hooks_encoding.py`（10テスト）
 
 | テストクラス | テスト内容 | カバレッジ |
 |---|---|---|
 | `TestChunkText` | `short_text_single_record`, `long_text_multiple_chunks`, `prefixes_numbered`, `single_chunk_no_number`, `paragraph_split`, `hard_window_fallback` | 完全保存チャンク化 |
 | `TestStripImages` | `plain_text_unchanged`, `base64_image_stripped`, `image_only_payload_returns_empty` | 画像ペイロード除去 |
-| `TestExtractText` | `plain_string`, `multimodal_json_list`, `image_only_empty`, `empty_input` | マルチモーダル抽出 |
+| `TestExtractText` | `plain_string`, `multimodal_json_list`, `image_only_empty`, `empty_input`, `json_text_is_kept_as_typed` | マルチモーダル抽出。JSON として読める入力をマルチモーダルの配列として扱わない |
 | `TestCompleteRecording` | `short_claude_response_saved`, `short_user_message_saved`, `skip_pattern_abolished`, `code_block_replaced_in_purify`, `inline_code_preserved_in_purify` | 完全記録契約（フィルタ廃止） |
 | `TestStopIdempotency` | `no_import_added`, `rules_file_created` | --stop冪等性 |
 | `TestSanitizerUnit` | `strips_lone_high_surrogate`, `strips_lone_low_surrogate`, `clean_japanese_unchanged`, `complete_emoji_pair_preserved`, `recursive_dict`, `recursive_list`, `none_passthrough` | サロゲート除去（`test_hooks_encoding.py`） |
