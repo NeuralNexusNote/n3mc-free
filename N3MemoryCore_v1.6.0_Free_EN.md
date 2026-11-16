@@ -162,6 +162,7 @@ n3mc-free/                       # Repository root
     ├── .memory_context_retired     # Marker showing the old memory_context.md has been cleaned up (§4 --stop)
     ├── turn_id_<session>.txt       # Q-A pairing handoff between UserPromptSubmit and Stop hooks (one per Claude Code session_id; turn_id.txt when there is no session_id; files older than 30 days are removed by --stop)
     ├── fts_punct_cleaned           # one-time FTS5 punctuation-clean migration marker (touched by --repair)
+    ├── fts_bigram_v1               # one-time CJK bigram index fill marker (touched by --repair; 2026-11-17)
     └── vec_e5v2_migrated           # one-time vector-reindex migration marker (touched by --repair)
 ```
 
@@ -406,7 +407,11 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
   "pair_max_chars":       3000,
   "version_order_enabled": true,
   "version_sim_threshold": 0.98,
-  "version_min_chars":    100
+  "version_min_chars":    100,
+  "reply_sim_rerank_enabled": false,
+  "reply_sim_alpha":      0.3,
+  "reply_sim_floor":      0.80,
+  "reply_sim_span":       0.15
 }
 ```
 
@@ -419,6 +424,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 - `min_results` (v1.6.0): When fewer results than this pass the floors, the shortfall is filled with **weak matches** — candidates the floors dropped, shown under a separate heading (default `3`; §5 "Search Result Filtering and Ordering", step 7). Set to `0` to disable the fill.
 - `pair_top_n` / `pair_max_chars`: Only the exchanges of the top `pair_top_n` results are injected as Q-A exchanges, up to `pair_max_chars` characters in total (§5 "Q-A Pairing Contract").
 - `version_order_enabled` / `version_sim_threshold` / `version_min_chars`: Ordering newer versions of the same content first (§5). `0.98` was also measured with `multilingual-e5-base`.
+- `reply_sim_rerank_enabled` / `reply_sim_alpha` / `reply_sim_floor` / `reply_sim_span` (2026-11-17): Re-ranking by similarity to the reply (§5 "Search Result Filtering and Ordering", step 2b). Off by default. `0.80` and `0.15` were measured with `multilingual-e5-base`; another embedding model changes the cosine range, so re-measure them.
 - `dedup_threshold` and `context_char_limit` from v1.3.x are **removed**. If they remain in an existing `config.json`, they are ignored (no need to delete them).
 - Write values without quotes (`"vector_min_cos": 0.83`). Values of the wrong type or outside the allowed range are ignored (§3.5 "Allowed values").
 - Editing `config.json` changes `code_version`, so the next command automatically restarts the server and the new values take effect.
@@ -457,6 +463,8 @@ $$keyword\_relevance = \frac{-bm25\_score}{\max(1.0,\ \max_{results}(-bm25\_scor
 
 If the search returns 0 results, set `keyword_relevance = 0.0`.
 
+Since 2026-11-17 the keyword search runs on two FTS5 tables (trigram and CJK bigram, below). Normalize each table's bm25 by **that table's own** maximum; a record found by both keeps the higher `keyword_relevance`.
+
 **FTS5 Table Definition**: Always create the FTS5 virtual table with `tokenize='trigram'`. **Use a standalone (non-`content=`) FTS5 table** — do NOT use the external-content variant (`content='memories', content_rowid='rowid'`). External-content FTS5 does not support the natural `DELETE FROM memories_fts WHERE rowid = ?` pattern required by `delete_memory` and the `--repair` migration loops; it requires a `INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', ?, ?)` ritual instead, and getting that wrong corrupts the FTS index ("database disk image is malformed"). The standalone form keeps a private FTS shadow whose rowid we align with `memories.rowid` ourselves: after `INSERT INTO memories(...)`, retrieve `cursor.lastrowid` and pass it to `INSERT INTO memories_fts(rowid, content) VALUES (?, ?)`.
 
 ```sql
@@ -480,13 +488,19 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
     tokenize='trigram'
 );
 
+-- CJK bigram index (2026-11-17): stores bigram_text(content); same rowid as memories
+CREATE VIRTUAL TABLE memories_fts_bi USING fts5(
+    content,
+    tokenize='unicode61'
+);
+
 -- sqlite-vec KNN vector search (linked to memories table via rowid)
 CREATE VIRTUAL TABLE memories_vec USING vec0(
     embedding float[768]
 );
 -- On INSERT: INSERT INTO memories_vec(rowid, embedding) VALUES (memories.rowid, serialize_vector(vec))
--- On DELETE: DELETE FROM memories_fts WHERE rowid = <rowid>; DELETE FROM memories_vec WHERE rowid = <rowid>;
--- ⚠️ When deleting from memories, always delete from memories_fts and memories_vec in the same transaction.
+-- On DELETE: DELETE FROM memories_fts WHERE rowid = <rowid>; DELETE FROM memories_fts_bi WHERE rowid = <rowid>; DELETE FROM memories_vec WHERE rowid = <rowid>;
+-- ⚠️ When deleting from memories, always delete from memories_fts, memories_fts_bi and memories_vec in the same transaction.
 --    Orphaned records in vec/fts will corrupt search results.
 ```
 
@@ -507,7 +521,7 @@ Additionally, `migrate_schema()` detects if the existing `memories_fts` table wa
 > **Note: Rationale for FTS5 Tokenizer Selection**
 > `trigram` is adopted for substring matching optimized for Japanese text. Japanese has no spaces between words, so a word-boundary tokenizer such as `porter unicode61` treats a whole sentence as one token and effectively disables FTS. `trigram` indexes 3-character substrings, so Japanese keyword search works without morphological analysis. It also works for space-separated languages such as English, and the Free edition is published on PyPI and used in every country, so the default must work in any language (English word-form normalization such as "running" → "run" is not performed; the vector search covers it). Users adapt the final tokenizer to their own language and environment (e.g. `porter unicode61` for English-centric use, or a morphological analyzer); the README says so.
 
-**FTS5 Constraint**: The `trigram` tokenizer indexes **3-character** units (characters, not bytes). A term of fewer than 3 characters — `AI`, `東京`, `龍馬` — can never match (FTS5 returns no rows for it). `_build_fts_query` therefore drops terms shorter than 3 characters; when no term is left, skip keyword search and rank using vector search (cos_sim) only. (v1.4.0 and earlier described the unit as "3 bytes", so 2-character Japanese terms such as `東京` passed the check and always returned 0 rows.)
+**FTS5 Constraint**: The `trigram` tokenizer indexes **3-character** units (characters, not bytes). A term of fewer than 3 characters — `AI`, `東京`, `龍馬` — can never match (FTS5 returns no rows for it). `_build_fts_query` therefore drops terms shorter than 3 characters; when no term is left, skip the trigram search (the bigram index below still runs). (v1.4.0 and earlier described the unit as "3 bytes", so 2-character Japanese terms such as `東京` passed the check and always returned 0 rows.)
 
 **FTS Punctuation Stripping (mandatory on both INSERT and MATCH)**: Punctuation adjacent to words can cause tokenization mismatches. Apply the **same punctuation stripping function** both when **INSERTing into FTS5** and when **building the MATCH query**:
 
@@ -521,24 +535,48 @@ def strip_fts_punctuation(text: str) -> str:
 # On INSERT: store original text in memories table, stripped text in FTS
 INSERT INTO memories_fts(rowid, content) VALUES (?, strip_fts_punctuation(content))
 
-# On MATCH (v1.5.0): control chars and punctuation → spaces (so a Japanese sentence
-# splits into terms at its punctuation) → split on whitespace → drop terms under
-# 3 characters → keep at most 30 terms → wrap each term in "..." (escaping " as "")
-# → join with OR.
-_FTS_MAX_TERMS = 30  # Prevent FTS5 freeze on large text input
+# On MATCH (2026-11-17): control chars and punctuation → spaces → split on
+# whitespace. A word of more than 3 characters that contains CJK is split into
+# its overlapping 3-character grams, and hiragana-only grams are dropped; other
+# words of 3+ characters stay whole; shorter words are dropped. Remove
+# duplicates, keep at most 40 terms, wrap each in "..." (escaping " as ""),
+# join with OR.
+_FTS_MAX_TERMS = 40  # Prevent FTS5 freeze on large text input
 _FTS_CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')
+_CJK_CHAR_RE = re.compile(r'[぀-ヿ㐀-鿿豈-﫿가-힯]')
+_HIRAGANA_ONLY_RE = re.compile(r'^[぀-ゟー]+$')
 
 def _build_fts_query(query: str) -> str:
-    text = _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or ''))
-    terms = [t for t in text.split() if len(t) >= 3][:_FTS_MAX_TERMS]
+    terms, seen = [], set()
+    for word in _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or '')).split():
+        if len(word) > 3 and _CJK_CHAR_RE.search(word):
+            grams = [word[i:i + 3] for i in range(len(word) - 2)]
+            grams = [g for g in grams if not _HIRAGANA_ONLY_RE.match(g)]
+        elif len(word) >= 3:
+            grams = [word]
+        else:
+            grams = []
+        for g in grams:
+            if g not in seen:
+                seen.add(g)
+                terms.append(g)
+    terms = terms[:_FTS_MAX_TERMS]
     if not terms:
-        return ""                                  # → skip keyword search
+        return ""                                  # → skip the trigram search
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 ```
 
-- **INSERT side is unchanged** (`strip_fts_punctuation` removes punctuation and keeps words joined, as before), so no FTS re-registration or new migration marker is needed. Only the query side turns punctuation into spaces. Example: the stored `架空の惑星「アルファ9」の気温設定` is indexed as `架空の惑星アルファ9の気温設定`; the query `「アルファ9」の気温は？` becomes the terms `アルファ9` and `の気温は` (OR), and the first one matches.
+- **INSERT side is unchanged** (`strip_fts_punctuation` removes punctuation and keeps words joined, as before), so no FTS re-registration or new migration marker is needed. Only the query side turns punctuation into spaces. Example: the stored `架空の惑星「アルファ9」の気温設定` is indexed as `架空の惑星アルファ9の気温設定`; the query `「アルファ9」の気温は？` becomes the terms `アルフ`, `ルファ`, `ファ9`, `の気温`, `気温は` (OR).
 - **Why OR (v1.5.0, found in the Free v1.4.0 review)**: v1.4.0 joined the quoted terms with AND (FTS5's implicit operator). The hook uses the whole user message as the query, so a sentence such as `what is the quick fox doing in my DB` returned 0 rows even when a record contained `quick` and `fox`, and a Japanese sentence without spaces was one long term that matched only a record containing that exact sentence. The keyword part (30 %) of the score was therefore almost always 0 in automatic searches. With OR, a record matches when it contains any term, and FTS5's `bm25()` ranks records with more and rarer terms higher. Terms shorter than 3 characters never match under trigram and are dropped.
-- A long Japanese sentence without punctuation is still a single term. That is accepted: the vector search covers it, and splitting it into every trigram would match almost every record.
+- **Why CJK words are split into 3-character grams (2026-11-17)**: until then a Japanese sentence without punctuation was one term and matched only a record containing that exact sentence. On a real N3MC-Pro DB (2026-11-16, 200 recent prompts), only 33% of the prompts got any FTS hit; with the grams OR-ed, 97% did, and `bm25()` ranks records by how many and how rare the shared grams are. Hiragana-only grams (`してく`, `ください`) appear in most records and are dropped. This also turns a space-separated query (English) into OR of its words, as before.
+
+**CJK bigram index (`memories_fts_bi`, 2026-11-17)**: the trigram index cannot match a 2-character word (`記憶`, `設定`, `PR`). A second standalone FTS5 table (`tokenize='unicode61'`) stores `bigram_text(content)`: after `strip_fts_punctuation`, each CJK run becomes its overlapping 2-character grams and other runs stay whole (`N3MCの設定` → `N3MC の設 設定`).
+
+- `insert_memory` writes both tables. **Every delete path** deletes from both (see above).
+- The query side (`build_bigram_query`) OR-s the query's bigram tokens, quoted. Hiragana-only tokens are dropped when anything else is left; a 1-character non-CJK token is dropped.
+- `hybrid_search` always searches both tables (`search_fts` and `search_fts_bigram`) and merges them as described under "keyword_relevance". If the bigram search fails, continue with the trigram results.
+- Records saved before the table existed are indexed once by `--repair` (marker `.memory/fts_bigram_v1`; not limited by `max_records`, since it embeds nothing).
+- Why (measured in N3MC-Pro, 2026-11-16, 138 labeled questions): removing the bigram index lowered MRR by 0.046 (95% interval −0.089 to −0.007).
 
 > **⚠️ Quoting each term is mandatory (v1.4.0)**: Even after punctuation stripping, ASCII symbols such as `\ / # = @ * $ % + ^ ~ |` and bare `AND` / `OR` / `NOT` / `NEAR` remain. Passing them to `MATCH` as-is causes an FTS5 syntax error (`fts5: syntax error near "\"`, etc.), `/search` returns HTTP 500, and memory injection degrades to "memory search unavailable" (observed on about 12% of prompts). Wrapping each term as an FTS5 string `"..."` makes symbols and operators match literally. (Since v1.5.0 the quoted terms are joined with `OR`; the `OR` written between them is outside the quotes and is the operator, while a user's `OR` inside a term stays literal.)
 >
@@ -680,7 +718,8 @@ Users edit `config.json` by hand (e.g. to tune `vector_min_cos`), so assume it m
 | `min_results` (v1.6.0) | integer | ≥ 0 |
 | `half_life_days` | number (int or float) | > 0 |
 | `bm25_min_threshold` | number | ≥ 0 |
-| `min_score`, `vector_min_cos`, `relative_min_score_ratio`, `version_sim_threshold` | number | 0–1 |
+| `min_score`, `vector_min_cos`, `relative_min_score_ratio`, `version_sim_threshold`, `reply_sim_alpha`, `reply_sim_floor` | number | 0–1 |
+| `reply_sim_span` | number | > 0 |
 
 - "Integer" means a JSON integer (`2000`). A float such as `2000.0` is **not** accepted, even when its value is whole: these keys are used as slice bounds and counts (`user_text[:search_query_max_chars]`), and v1.4.0 accepted `2000.0`, after which every `--hook-submit` failed with `TypeError` before searching and the user message never reached the DB (it was only in `audit.log`). A negative `server_port` or `half_life_days: 0` also passed v1.4.0's check.
 - Out-of-range values are treated exactly like wrongly typed ones: that key alone uses its default and the `config_type` notice names it.
@@ -1109,7 +1148,7 @@ Reads the UserPromptSubmit JSON from stdin. Claude Code sends `session_id`, `tra
 
 - **Image-only prompts (v1.5.0)**: when `_extract_text()` returns nothing (the prompt is only images), still generate a **new** `turn_id` and write it to `turn_id_<session>.txt`; only the `[user]` save is skipped. Otherwise the reply to the image would be saved under the previous question's `turn_id` (the Stop hook no longer clears the file since v1.4.0) and appear as part of an unrelated exchange.
 - **Typed text that is valid JSON (found 2026-11-16)**: `_extract_text()` treats a string `prompt` as a multimodal array **only when it parses as a non-empty JSON array whose elements are all objects with a string `type` key** (`[{"type":"text",…},{"type":"image",…}]`). Any other prompt is the user's own text and is returned unchanged, including text that happens to be valid JSON: `[1, 2, 3]`, `["apple", "banana"]`, `[]`, `[{"id": 1}]`. Before this rule, every string that parsed as a JSON array was read as a multimodal array, so a prompt that was only such an array became empty: it was not searched and not saved to the DB (it was only in `audit.log`).
-- **Skip system inputs**: If the user message starts with one of `_SYSTEM_PROMPT_PREFIXES` (currently only `<task-notification>`) — input the user did not type, such as completion notices from background tasks — do not repair, save, or search, and **do not assign a new `turn_id`** (Claude's reply to that notice goes into the current exchange's `turn_id`). Write a line `{"hook": "UserPromptSubmit", "stage": "skipped", "reason": "system_prompt"}` to `audit.log`, print the empty result (`_No relevant memories found._`) to stdout, and exit. Add any other system inputs found later to `_SYSTEM_PROMPT_PREFIXES`.
+- **Skip system inputs**: If the user message starts with one of `_SYSTEM_PROMPT_PREFIXES` (`<task-notification>`, `<agent-message from=` and `<system-reminder>`, the last two since 2026-11-17) — input the user did not type, such as completion notices from background tasks, a subagent's report or an app notice — do not repair, save, or search, and **do not assign a new `turn_id`** (Claude's reply to that notice goes into the current exchange's `turn_id`). Write a line `{"hook": "UserPromptSubmit", "stage": "skipped", "reason": "system_prompt"}` to `audit.log`, print the empty result (`_No relevant memories found._`) to stdout, and exit. Add any other system inputs found later to `_SYSTEM_PROMPT_PREFIXES`.
 - When the port belongs to another folder's server, follow §3 "When the port belongs to another folder's server" (save directly, do not search).
 
 ### `--save-claude-turn` (Stop Hook Helper)
@@ -1296,6 +1335,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 1. **Vector candidate floor**: discard vector candidates with cos_sim below `vector_min_cos` (0.85) (if the record also hit FTS, it remains as an FTS-only hit with `cos_sim = 0.0`).
 2. **Score calculation and `min_score`**: compute `score` and `filter_score` (§3 "Bias coefficients"; `filter_score` has neither `time_decay` nor `b_session` since v1.6.0). Discard results whose **`filter_score`** is below `min_score`. Order the rest by `score`.
+   - **2b. Re-rank by similarity to the reply (2026-11-17; only when `reply_sim_rerank_enabled` is true, default false)**: for each result with a `turn_id`, average the stored embeddings of the exchange's `[claude` rows and take the cosine with the query embedding; then `score = (1 − α) × score ÷ best score + α × max(0, (cos − reply_sim_floor) ÷ reply_sim_span)` (α = `reply_sim_alpha`) and re-order. Stored vectors only (no model call), one SQL query for all exchanges; on any error, or when the query could not be embedded, keep the results unchanged. `filter_score` is not changed. Why: the best chunk of an exchange is often its request, so a similarly worded but unrelated request took first place; in N3MC-Pro (138 labeled questions) α 0.3 raised MRR by 0.029 (95% interval +0.009 to +0.049), mostly at rank 1. Costs: `score` moves to a 0–1 scale, and with short queries (25 characters or less) the order rarely changes.
 3. **Ordering versions of the same content (`_order_versions_newest_first`, when `version_order_enabled` is true)**: Recreating settings can surface both the old and new versions, with the old one ranked higher. Since Q-A injection fills from the top up to `pair_max_chars`, only the old version might get in. Therefore:
    - For each turn_id in the results, the representative is the embedding (already stored in `memories_vec`) of the exchange's "first `[claude` row whose content is at least `version_min_chars` (100) characters". Exchanges without a representative and results without a turn_id are excluded.
    - If the representatives of **different turn_ids** have cos similarity ≥ `version_sim_threshold` (0.98), treat them as versions of the same content and group them (linked transitively).
@@ -1403,7 +1443,8 @@ n3mc-free/
     ├── test_api.py          # Layer 3: FastAPI endpoint tests (TestClient)
     ├── test_hooks.py        # Layer 4: Hook integration (complete-preservation chunking, image strip, audit log)
     ├── test_hooks_encoding.py # Regression tests for surrogate stripping and UTF-8
-    └── test_regressions.py  # Layer 5: Regression tests for the v1.4.0 – v1.6.0 fixes (no model needed)
+    ├── test_regressions.py  # Layer 5: Regression tests for the v1.4.0 – v1.6.0 fixes (no model needed)
+    └── test_search_port_2026_11_17.py # Layer 5: Japanese FTS grams, bigram index, skipped system inputs, reply re-rank
 ```
 
 **Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
@@ -1482,7 +1523,8 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 
 | Test Class | Tests |
 |---|---|
-| `TestFtsQuoting` | Queries containing `\ / # = @ * $ %`, `AND/OR/NOT`, `"`, or control characters do not raise; terms containing symbols are hit; `hybrid_search` continues when `search_fts` raises. **v1.5.0**: terms are joined with `OR` (a sentence-like query hits a record that contains only some of its words); terms under 3 characters (`AI`, `東京`) are dropped and a query of only such terms skips FTS; punctuation in the query splits terms (`「アルファ9」の気温は？` hits `架空の惑星「アルファ9」の気温設定`) |
+| `TestFtsQuoting` | Queries containing `\ / # = @ * $ %`, `AND/OR/NOT`, `"`, or control characters do not raise; terms containing symbols are hit; `hybrid_search` continues when `search_fts` raises. **v1.5.0**: terms are joined with `OR` (a sentence-like query hits a record that contains only some of its words); terms under 3 characters (`AI`, `東京`) are dropped and a query of only such terms skips FTS; punctuation in the query splits terms (`「アルファ9」の気温は？` hits `架空の惑星「アルファ9」の気温設定`). **2026-11-17**: at most 40 terms; CJK words of 4+ characters become 3-character grams |
+| `test_search_port_2026_11_17.py` (2026-11-17) | A Japanese sentence without spaces hits a record containing its words; hiragana-only grams are dropped; symbol-only and 2-character queries do not raise; `bigram_text('N3MCの設定')` is `N3MC の設 設定`; `記憶` and `PR` hit through the bigram index (and through `hybrid_search`); a failing bigram search keeps the trigram results; `delete_memory` leaves no bigram row; `--repair` fills the bigram rows of an old DB once (two runs, one row per record); `<agent-message from=...>` and `<system-reminder>` prompts are neither saved nor searched and keep `turn_id`, while a user question starting with `<agent-message` or `<div>` is not skipped; the reply re-rank is off by default, moves the exchange with the closer reply up when on, and returns its input on a DB error |
 | `TestVectorFilter` | A search with `since` returns in-range records even if they are outside the global KNN top; falls back to exact computation when `rowid IN` is unavailable |
 | `TestNoSimilarityDedup` | Similar chunks (cos ≥ 0.95) are all saved; exact matches within the same `turn_id` are skipped; exact matches in a different `turn_id` are saved; without `turn_id`, exact matches are skipped globally |
 | `TestSearchShaping` | Candidates below `vector_min_cos` are discarded; relative cutoff; `_version_group` rows survive the cutoff; the newer version comes first; identical content is collapsed; `pair_top_n`, `pair_max_chars`, and `pairs_omitted`. **v1.5.0**: a 30-day-old record from another session with high similarity survives the relative cutoff while a current-session record with lower similarity is present; a keyword-only hit from another session survives `min_score`; the order is still by the final score (current session first). **v1.6.0**: a 400-day-old record with high similarity is returned even when it is the only candidate (`min_score` and the relative cutoff ignore `time_decay`); when a new and a 400-day-old record with the same similarity are both present, both are returned and the new one comes first |

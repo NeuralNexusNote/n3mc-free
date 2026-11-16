@@ -162,6 +162,7 @@ n3mc-free/                       # リポジトリルート
     ├── .memory_context_retired     # 旧 memory_context.md を片付け済みであることを示すマーカー（§4 --stop）
     ├── turn_id_<session>.txt       # UserPromptSubmit と Stop フック間で Q-A pairing をハンドオフ（Claude Code の session_id ごと。session_id がないときは turn_id.txt。30 日より古いファイルは --stop が削除する）
     ├── fts_punct_cleaned           # FTS5 句読点クリーニングの一回限りマイグレーションマーカー（--repair が touch）
+    ├── fts_bigram_v1               # CJK バイグラム索引を一度だけ埋めた印（--repair が touch。2026-11-17）
     └── vec_e5v2_migrated           # ベクトル再インデックスの一回限りマイグレーションマーカー（--repair が touch）
 ```
 
@@ -406,7 +407,11 @@ PRAGMA wal_autocheckpoint = 1000;
   "pair_max_chars":       3000,
   "version_order_enabled": true,
   "version_sim_threshold": 0.98,
-  "version_min_chars":    100
+  "version_min_chars":    100,
+  "reply_sim_rerank_enabled": false,
+  "reply_sim_alpha":      0.3,
+  "reply_sim_floor":      0.80,
+  "reply_sim_span":       0.15
 }
 ```
 
@@ -419,6 +424,7 @@ PRAGMA wal_autocheckpoint = 1000;
 - `min_results`（v1.6.0）: 下限を通った結果がこの件数に満たないとき、足りない分を**弱い候補**（下限で落ちた候補）で補い、別の見出しの下に出す（規定値 `3`、§5「検索結果の絞り込みと並べ替え」の手順 7）。`0` で補充しない。
 - `pair_top_n` / `pair_max_chars`: Q-A の往復を差し込むのは上位 `pair_top_n` 件の往復だけ、合計 `pair_max_chars` 字まで（§5「Q-A ペアリング契約」）。
 - `version_order_enabled` / `version_sim_threshold` / `version_min_chars`: 同じ内容の新しい版を上に並べる処理（§5）。`0.98` も `multilingual-e5-base` で測った値。
+- `reply_sim_rerank_enabled` / `reply_sim_alpha` / `reply_sim_floor` / `reply_sim_span`（2026-11-17）: 返答との近さで並べ直す処理（§5「検索結果の絞り込みと並べ方」の 2b）。既定は off。`0.80` と `0.15` は `multilingual-e5-base` で測った値で、埋め込みのモデルを替えるとコサインの分布が変わるので、測り直す。
 - v1.3.x の `dedup_threshold` と `context_char_limit` は**廃止**。既存の `config.json` に残っていても読まれない（消さなくてよい）。
 - 値は引用符を付けずに書く（`"vector_min_cos": 0.83`）。型が違う値や許される範囲外の値は無視される（§3.5「許される値」）。
 - `config.json` を書き換えると `code_version` が変わり、次のコマンドでサーバーが自動で起動し直して新しい値が効く。
@@ -457,6 +463,8 @@ $$keyword\_relevance = \frac{-bm25\_score}{\max(1.0,\ \max_{results}(-bm25\_scor
 
 検索結果が0件の場合は `keyword_relevance = 0.0` とする。
 
+2026-11-17 から、キーワード検索は 2 つの FTS5 の表（trigram と、下の CJK バイグラム）で行う。bm25 は**表ごとに、その表の**最大値で割る。両方で当たった記録は、高いほうの `keyword_relevance` を使う。
+
 **FTS5 テーブル定義**: FTS5 仮想テーブルは必ず `tokenize='trigram'` を指定して作成せよ。**スタンドアロン形式（`content=` 句なし）の FTS5 を使うこと** — external-content 形式（`content='memories', content_rowid='rowid'`）は使ってはならない。external-content FTS5 は `delete_memory` および `--repair` のマイグレーションループで必要となる `DELETE FROM memories_fts WHERE rowid = ?` の自然な構文をサポートせず、代わりに `INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', ?, ?)` という特殊構文が必要。これを誤ると FTS インデックスが破損する（"database disk image is malformed" エラー）。スタンドアロン形式は `memories.rowid` と整合する rowid を持つプライベートな FTS シャドウを保持し、こちらが手動で揃える: `INSERT INTO memories(...)` の後 `cursor.lastrowid` を取得し、`INSERT INTO memories_fts(rowid, content) VALUES (?, ?)` に渡す。
 
 ```sql
@@ -480,13 +488,19 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
     tokenize='trigram'
 );
 
+-- CJK バイグラムの索引（2026-11-17）: bigram_text(content) を入れる。rowid は memories と同じ
+CREATE VIRTUAL TABLE memories_fts_bi USING fts5(
+    content,
+    tokenize='unicode61'
+);
+
 -- sqlite-vec による KNN ベクトル検索（rowid で memories テーブルと紐付け）
 CREATE VIRTUAL TABLE memories_vec USING vec0(
     embedding float[768]
 );
 -- INSERT 時: INSERT INTO memories_vec(rowid, embedding) VALUES (memories.rowid, serialize_vector(vec))
--- DELETE 時: DELETE FROM memories_fts WHERE rowid = <rowid>; DELETE FROM memories_vec WHERE rowid = <rowid>;
--- ⚠️ memories を削除する際は、必ず memories_fts と memories_vec も同一トランザクションで削除すること。
+-- DELETE 時: DELETE FROM memories_fts WHERE rowid = <rowid>; DELETE FROM memories_fts_bi WHERE rowid = <rowid>; DELETE FROM memories_vec WHERE rowid = <rowid>;
+-- ⚠️ memories を削除する際は、必ず memories_fts・memories_fts_bi・memories_vec も同一トランザクションで削除すること。
 --    孤立レコードが残ると検索結果が壊れる。
 ```
 
@@ -507,7 +521,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id);  -- turn_i
 > **補足: FTS5 トークナイザーの選定理由**
 > `trigram` は日本語テキストに最適化された部分文字列マッチングのために採用している。日本語は単語間にスペースを持たないため、`porter unicode61` のような単語境界ベースのトークナイザーでは文全体が1トークンとして扱われ、FTS が実質的に無効化される。`trigram` は3文字単位の部分文字列インデックスを生成するため、形態素解析なしで日本語のキーワード検索が可能になる。英語のように空白で区切る言語でも動く。Free 版は PyPI でどこの国でも使われるため、既定はどの言語でも動くものにする（英語の語形変化 "running" → "run" はまとめないが、ベクトル検索で補える）。最終的なトークナイザーは、利用者が自分の言語・環境に合わせて直す（例: 英語中心なら `porter unicode61`、日本語の精度を上げるなら形態素解析）。README にもそう案内している。
 
-**FTS5 制約**: `trigram` トークナイザーは **3 文字**単位（バイトではなく文字）でインデックスを作る。3 文字未満の語 — `AI`、`東京`、`龍馬` — は決して一致しない（FTS5 はその語に対して 0 行を返す）。そのため `_build_fts_query` は 3 文字未満の語を捨てる。語が 1 つも残らなければキーワード検索をスキップし、ベクトル検索（cos_sim）のみでランキングせよ。（v1.4.0 以前は単位を「3 バイト」と書いていたため、`東京` のような 2 文字の日本語の語が確認を通り、常に 0 行を返していた。）
+**FTS5 制約**: `trigram` トークナイザーは **3 文字**単位（バイトではなく文字）でインデックスを作る。3 文字未満の語 — `AI`、`東京`、`龍馬` — は決して一致しない（FTS5 はその語に対して 0 行を返す）。そのため `_build_fts_query` は 3 文字未満の語を捨てる。語が 1 つも残らなければ trigram の検索を飛ばす（下のバイグラムの索引の検索は行う）。（v1.4.0 以前は単位を「3 バイト」と書いていたため、`東京` のような 2 文字の日本語の語が確認を通り、常に 0 行を返していた。）
 
 **FTS 句読点除去（挿入側・検索側の両方で必須）**: 単語に隣接する句読点がトークナイゼーションの不一致を起こす可能性がある。**FTS5 への INSERT 時**および **FTS MATCH クエリ時**の両方で、同一の句読点除去関数を適用せよ:
 
@@ -521,23 +535,46 @@ def strip_fts_punctuation(text: str) -> str:
 # INSERT 時: memories テーブルには原文、FTS には句読点除去済みテキストを登録
 INSERT INTO memories_fts(rowid, content) VALUES (?, strip_fts_punctuation(content))
 
-# MATCH 時（v1.5.0）: 制御文字と句読点を空白に（日本語の文が句読点で語に
-# 分かれる）→ 空白で分割 → 3 文字未満の語を捨てる → 最大 30 語 → 各語を "..." で
-# 囲む（" は "" にする）→ OR でつなぐ。
-_FTS_MAX_TERMS = 30  # 大量テキスト入力時の FTS5 フリーズを防止
+# MATCH 時（2026-11-17）: 制御文字と句読点を空白に → 空白で分割。CJK を含む
+# 4 文字以上の語は 3 文字ずつ重ねて分け、ひらがなだけの 3 文字は捨てる。ほかの
+# 3 文字以上の語はそのまま。3 文字未満の語は捨てる。重複を除き、最大 40 語、
+# 各語を "..." で囲み（" は "" にする）、OR でつなぐ。
+_FTS_MAX_TERMS = 40  # 大量テキスト入力時の FTS5 フリーズを防止
 _FTS_CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')
+_CJK_CHAR_RE = re.compile(r'[぀-ヿ㐀-鿿豈-﫿가-힯]')
+_HIRAGANA_ONLY_RE = re.compile(r'^[぀-ゟー]+$')
 
 def _build_fts_query(query: str) -> str:
-    text = _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or ''))
-    terms = [t for t in text.split() if len(t) >= 3][:_FTS_MAX_TERMS]
+    terms, seen = [], set()
+    for word in _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or '')).split():
+        if len(word) > 3 and _CJK_CHAR_RE.search(word):
+            grams = [word[i:i + 3] for i in range(len(word) - 2)]
+            grams = [g for g in grams if not _HIRAGANA_ONLY_RE.match(g)]
+        elif len(word) >= 3:
+            grams = [word]
+        else:
+            grams = []
+        for g in grams:
+            if g not in seen:
+                seen.add(g)
+                terms.append(g)
+    terms = terms[:_FTS_MAX_TERMS]
     if not terms:
-        return ""                                  # → キーワード検索をスキップ
+        return ""                                  # → trigram の検索を飛ばす
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 ```
 
-- **INSERT 側は変えない**（`strip_fts_punctuation` は従来どおり句読点を取り除いて語をつなげたままにする）ので、FTS の登録し直しも新しいマイグレーションマーカーも要らない。句読点を空白にするのは検索側だけ。例: 保存された `架空の惑星「アルファ9」の気温設定` は `架空の惑星アルファ9の気温設定` としてインデックスされる。クエリ `「アルファ9」の気温は？` は語 `アルファ9` と `の気温は`（OR）になり、1 つ目が一致する。
+- **INSERT 側は変えない**（`strip_fts_punctuation` は従来どおり句読点を取り除いて語をつなげたままにする）ので、FTS の登録し直しも新しいマイグレーションマーカーも要らない。句読点を空白にするのは検索側だけ。例: 保存された `架空の惑星「アルファ9」の気温設定` は `架空の惑星アルファ9の気温設定` としてインデックスされる。クエリ `「アルファ9」の気温は？` は語 `アルフ`、`ルファ`、`ファ9`、`の気温`、`気温は`（OR）になる。
 - **OR にする理由（v1.5.0、Free v1.4.0 のレビューで見つかった）**: v1.4.0 は引用符で囲んだ語を AND（FTS5 の暗黙の演算子）でつないでいた。フックはユーザーのメッセージ全体をクエリにするので、`what is the quick fox doing in my DB` のような文は、`quick` と `fox` を含む記録があっても 0 行を返し、空白のない日本語の文は 1 つの長い語になって、その文そのものを含む記録にしか一致しなかった。そのため自動検索ではスコアのキーワード部分（30 %）がほとんど常に 0 だった。OR なら、どれか 1 つの語を含む記録が一致し、FTS5 の `bm25()` が、より多く・より珍しい語を含む記録を上位にする。3 文字未満の語は trigram では決して一致しないので捨てる。
-- 句読点のない長い日本語の文は、今も 1 つの語のままになる。これは受け入れる: ベクトル検索が補い、すべての trigram に分けるとほぼすべての記録に一致してしまう。
+- **CJK の語を 3 文字ずつに分ける理由（2026-11-17）**: それまでは、句読点のない日本語の文が 1 つの語になり、その文そのものを含む記録にしか一致しなかった。N3MC-Pro の本物の DB（2026-11-16、最近の質問 200 件）で、FTS が何か 1 件でも当たる質問は 33% だった。3 文字ずつに分けて OR でつなぐと 97% になり、共通する 3 文字が多く・珍しい記録を `bm25()` が上にする。ひらがなだけの 3 文字（`してく`、`ください`）はほとんどの記録に出るので捨てる。空白で区切る言語（英語）の質問は、これまでどおり語の OR になる。
+
+**CJK バイグラムの索引（`memories_fts_bi`、2026-11-17）**: trigram の索引は 2 文字の語（`記憶`、`設定`、`PR`）を探せない。2 つ目のスタンドアロン FTS5 の表（`tokenize='unicode61'`）に `bigram_text(content)` を入れる。`strip_fts_punctuation` のあと、CJK の続きは 2 文字ずつ重ねて分け、それ以外はそのまま（`N3MCの設定` → `N3MC の設 設定`）。
+
+- `insert_memory` が両方の表に書く。**消す道すべて**で、両方の表から消す（上の DELETE）。
+- 質問の側（`build_bigram_query`）は、質問のバイグラムの語を引用符で囲んで OR でつなぐ。ひらがなだけの語は、ほかの語が残るなら捨てる。CJK でない 1 文字の語は捨てる。
+- `hybrid_search` は、いつも両方の表（`search_fts` と `search_fts_bigram`）を探し、「keyword_relevance」に書いたとおりに合わせる。バイグラムの検索が失敗したら、trigram の結果だけで続ける。
+- 表ができる前に保存された記録は、`--repair` が一度だけ索引する（印 `.memory/fts_bigram_v1`。埋め込みを作らないので `max_records` で制限しない）。
+- 理由（N3MC-Pro で測定、2026-11-16、ラベル付きの質問 138 問）: バイグラムの索引を外すと MRR が 0.046 下がった（95% 区間 −0.089〜−0.007）。
 
 > **⚠️ 語の引用符囲みは必須（v1.4.0）**: 句読点除去のあとも `\ / # = @ * $ % + ^ ~ |` などの ASCII 記号や、単独の `AND` / `OR` / `NOT` / `NEAR` が残る。これをそのまま `MATCH` に渡すと FTS5 の文法エラー（`fts5: syntax error near "\"` 等）になり、`/search` が HTTP 500 を返して記憶の差し込みが「memory search unavailable」になる（実測で質問の約 12% で発生）。各語を FTS5 の文字列として `"..."` で囲めば、記号も演算子も文字どおりに照合される。（v1.5.0 からは引用符で囲んだ語を `OR` でつなぐ。語の間に書く `OR` は引用符の外にあるので演算子になり、語の中にあるユーザーの `OR` は文字どおりのまま。）
 >
@@ -679,7 +716,8 @@ db_path = base_dir + "\\data\\memory.db" # NG
 | `min_results`（v1.6.0） | 整数 | ≥ 0 |
 | `half_life_days` | 数値（int または float） | > 0 |
 | `bm25_min_threshold` | 数値 | ≥ 0 |
-| `min_score`, `vector_min_cos`, `relative_min_score_ratio`, `version_sim_threshold` | 数値 | 0〜1 |
+| `min_score`, `vector_min_cos`, `relative_min_score_ratio`, `version_sim_threshold`, `reply_sim_alpha`, `reply_sim_floor` | 数値 | 0〜1 |
+| `reply_sim_span` | 数値 | > 0 |
 
 - 「整数」は JSON の整数（`2000`）のこと。`2000.0` のような float は、値が整数であっても**受け付けない**。これらのキーはスライスの境界や件数として使われる（`user_text[:search_query_max_chars]`）。v1.4.0 は `2000.0` を受け付け、そのあと `--hook-submit` はすべて検索の前に `TypeError` で失敗し、ユーザーのメッセージは DB に届かなかった（`audit.log` にしか残らなかった）。負の `server_port` や `half_life_days: 0` も v1.4.0 の確認を通っていた。
 - 範囲外の値は型の違う値とまったく同じに扱う: そのキーだけ既定値を使い、知らせ `config_type` にそのキーを出す。
@@ -1109,7 +1147,7 @@ stdin から UserPromptSubmit の JSON を読み取る。Claude Code は `sessio
 - **画像だけの質問（v1.5.0）**: `_extract_text()` が何も返さない（質問が画像だけ）ときも、**新しい** `turn_id` を作って `turn_id_<session>.txt` に書く。飛ばすのは `[user]` の保存だけ。そうしないと、画像への返答が 1 つ前の質問の `turn_id` で保存され（v1.4.0 から Stop フックはファイルを消さない）、関係のない往復の一部として出てしまう。
 - **JSON として読める入力（2026-11-16 に発見）**: `_extract_text()` が文字列の `prompt` をマルチモーダルの配列として扱うのは、**空でない JSON 配列として読め、すべての要素が文字列の `type` キーを持つオブジェクトであるときだけ**（`[{"type":"text",…},{"type":"image",…}]`）。それ以外はユーザーが入力した文章なので、そのまま返す。JSON として読める文章（`[1, 2, 3]`、`["apple", "banana"]`、`[]`、`[{"id": 1}]`）も同じ。この決まりの前は、JSON 配列として読める文字列をすべてマルチモーダルの配列として扱っていたため、そのような配列だけの質問は空になり、検索もされず、DB にも保存されなかった（`audit.log` にだけ残った）。
 
-- **システムの入力は飛ばす**: ユーザー発言が `_SYSTEM_PROMPT_PREFIXES`（現在は `<task-notification>` だけ）で始まる場合（バックグラウンド処理の完了通知など、ユーザーが打ったものではない入力）は、repair・保存・検索をせず、**新しい `turn_id` も振らない**（その通知への Claude の返答は、今の往復の `turn_id` に入る）。`audit.log` に `{"hook": "UserPromptSubmit", "stage": "skipped", "reason": "system_prompt"}` の行を書き、空の結果（`_No relevant memories found._`）を stdout に出して終わる。ほかのシステムの入力が見つかったら `_SYSTEM_PROMPT_PREFIXES` に足す。
+- **システムの入力は飛ばす**: ユーザー発言が `_SYSTEM_PROMPT_PREFIXES`（`<task-notification>`、`<agent-message from=`、`<system-reminder>`。あとの 2 つは 2026-11-17 から）で始まる場合（バックグラウンド処理の完了通知、サブエージェントの報告、アプリのお知らせなど、ユーザーが打ったものではない入力）は、repair・保存・検索をせず、**新しい `turn_id` も振らない**（その通知への Claude の返答は、今の往復の `turn_id` に入る）。`audit.log` に `{"hook": "UserPromptSubmit", "stage": "skipped", "reason": "system_prompt"}` の行を書き、空の結果（`_No relevant memories found._`）を stdout に出して終わる。ほかのシステムの入力が見つかったら `_SYSTEM_PROMPT_PREFIXES` に足す。
 - ポートが別のフォルダのサーバーのときは §3「ポートが別のフォルダのサーバーのとき」に従う（保存は直接、検索はしない）。
 
 ### `--save-claude-turn`（Stop フック専用ヘルパー）
@@ -1295,6 +1333,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 1. **ベクトル候補の下限**: cos_sim が `vector_min_cos`（0.85）未満のベクトル候補は捨てる（FTS にもヒットしていれば、`cos_sim = 0.0` の FTS のみヒットとして残る）。
 2. **スコア計算と `min_score`**: `score` と `filter_score` を計算する（§3「バイアス係数」。v1.6.0 から `filter_score` には `time_decay` も `b_session` も掛けない）。**`filter_score`** が `min_score` 未満の結果を捨てる。残りを `score` の順に並べる。
+   - **2b. 返答との近さで並べ直す（2026-11-17。`reply_sim_rerank_enabled` が true のときだけ。既定は false）**: `turn_id` のある結果ごとに、その往復の `[claude` の行の保存済みの埋め込みを平均し、質問の埋め込みとのコサインを取る。`score = (1 − α) × score ÷ 1 位の score + α × max(0, (コサイン − reply_sim_floor) ÷ reply_sim_span)`（α = `reply_sim_alpha`）として並べ直す。保存済みのベクトルだけを使い（モデルは呼ばない）、SQL は全往復で 1 回。エラーのとき、または質問を埋め込めなかったときは、結果を変えない。`filter_score` は変えない。理由: 往復の中でいちばん点の高い分割は質問のことが多く、言い回しが似ているだけの別の質問が 1 位を取っていた。N3MC-Pro（ラベル付きの質問 138 問）で α 0.3 にすると MRR が 0.029 上がった（95% 区間 +0.009〜+0.049）。伸びは主に 1 位。代わりに起きること: `score` が 0〜1 付近の目盛りになる。25 字以下の短い質問では、順位はほとんど動かない。
 3. **同じ内容の版の並べ替え（`_order_versions_newest_first`、`version_order_enabled` が true のとき）**: 設定を作り直すと、古い版と新しい版の両方が出て、古い版が上に来ることがある。Q-A の差し込みは上から `pair_max_chars` まで入れるので、古い版しか入らないおそれがある。そこで:
    - 結果の各 turn_id について、その往復の「最初の `[claude` の行で、content が `version_min_chars`（100）字以上のもの」の埋め込み（`memories_vec` に保存済みのもの）を代表とする。代表のない往復・turn_id のない結果は対象外。
    - **別の turn_id どうし**で代表の cos 類似度が `version_sim_threshold`（0.98）以上なら同じ内容の版とみなし、グループにする（推移的に結ぶ）。
@@ -1400,7 +1439,8 @@ n3mc-free/
     ├── test_api.py          # Layer 3: FastAPIエンドポイントテスト（TestClient）
     ├── test_hooks.py        # Layer 4: フック統合（完全保存チャンク化、画像除去、監査ログ）
     ├── test_hooks_encoding.py # サロゲート除去・UTF-8 の回帰テスト
-    └── test_regressions.py  # Layer 5: v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要）
+    ├── test_regressions.py  # Layer 5: v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要）
+    └── test_search_port_2026_11_17.py # Layer 5: 日本語の FTS、バイグラムの索引、システムの入力を飛ばす、返答との近さの並べ直し
 ```
 
 **本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。
@@ -1479,7 +1519,8 @@ python -m pytest tests/ -v
 
 | テストクラス | テスト内容 |
 |---|---|
-| `TestFtsQuoting` | `\ / # = @ * $ %`・`AND/OR/NOT`・`"`・制御文字を含むクエリで例外にならない、記号を含む語がヒットする、`search_fts` が例外を出しても `hybrid_search` が続く。**v1.5.0**: 語を `OR` でつなぐ（文のようなクエリが、その語の一部だけを含む記録にヒットする）、3 文字未満の語（`AI`、`東京`）は捨て、そういう語だけのクエリは FTS を飛ばす、クエリの句読点で語が分かれる（`「アルファ9」の気温は？` が `架空の惑星「アルファ9」の気温設定` にヒットする） |
+| `TestFtsQuoting` | `\ / # = @ * $ %`・`AND/OR/NOT`・`"`・制御文字を含むクエリで例外にならない、記号を含む語がヒットする、`search_fts` が例外を出しても `hybrid_search` が続く。**v1.5.0**: 語を `OR` でつなぐ（文のようなクエリが、その語の一部だけを含む記録にヒットする）、3 文字未満の語（`AI`、`東京`）は捨て、そういう語だけのクエリは FTS を飛ばす、クエリの句読点で語が分かれる（`「アルファ9」の気温は？` が `架空の惑星「アルファ9」の気温設定` にヒットする）。**2026-11-17**: 最大 40 語、CJK を含む 4 文字以上の語は 3 文字ずつに分ける |
+| `test_search_port_2026_11_17.py`（2026-11-17） | 空白のない日本語の文が、その語を含む記録に当たる。ひらがなだけの 3 文字を捨てる。記号だけ・2 文字だけの質問で例外にならない。`bigram_text('N3MCの設定')` が `N3MC の設 設定`。`記憶` と `PR` がバイグラムの索引で（`hybrid_search` でも）当たる。バイグラムの検索が失敗しても trigram の結果が残る。`delete_memory` のあとバイグラムの行が残らない。`--repair` が古い DB のバイグラムの行を 1 回だけ埋める（2 回動かしても 1 記録 1 行）。`<agent-message from=...>` と `<system-reminder>` の入力は保存も検索もせず `turn_id` を変えない。`<agent-message` や `<div>` で始まるユーザーの質問は飛ばさない。返答との近さの並べ直しは既定で off、on なら返答の近い往復が上に来る、DB のエラーでは入力をそのまま返す |
 | `TestVectorFilter` | `since` 付きの検索で範囲内の記録が KNN の上位外にあっても返る、`rowid IN` が使えないときに全件計算に切り替わる |
 | `TestNoSimilarityDedup` | 似た分割（cos ≥ 0.95）がすべて保存される、同じ `turn_id` の完全一致は飛ばす、別の `turn_id` の完全一致は保存する、`turn_id` なしは全体で完全一致を飛ばす |
 | `TestSearchShaping` | `vector_min_cos` 未満の候補を捨てる、相対の足切り、`_version_group` は足切りで落ちない、新しい版が上に来る、同じ content の集約、`pair_top_n`・`pair_max_chars` と `pairs_omitted`。**v1.5.0**: 類似度の低い現在のセッションの記録があっても、類似度の高い 30 日前の別セッションの記録が相対の足切りで残る、別セッションのキーワードのみのヒットが `min_score` で残る、並びは今も最終スコア順（現在のセッションが先）。**v1.6.0**: 類似度の高い 400 日前の記録が、ほかに候補がなくても返る（`min_score` と相対の足切りは `time_decay` を見ない）、同じ類似度の新しい記録と 400 日前の記録が両方返り、新しいほうが上に来る |

@@ -733,15 +733,17 @@ class TestFtsQuoting(TestFtsQuoting):  # v1.5.0 additions
         assert fts_builder()('AI 東京') == ''
         assert fts_builder()('AI 東京 tokyo') == '"tokyo"'
 
-    def test_max_30_terms(self):
+    def test_max_40_terms(self):
+        # 2026-11-17: 30 → 40 (a Japanese sentence now becomes many grams)
         q = ' '.join(f'term{i:02d}' for i in range(50))
-        assert fts_builder()(q).count(' OR ') == 29
+        assert fts_builder()(q).count(' OR ') == 39
 
     def test_punctuation_splits_terms(self, tmp_path):
         path = new_db(tmp_path)
         add(path, '架空の惑星「アルファ9」の気温設定')
         built = fts_builder()('「アルファ9」の気温は？')
-        assert built == '"アルファ9" OR "の気温は"'
+        # 2026-11-17: CJK words of 4+ chars are split into 3-char grams
+        assert built == ('"アルフ" OR "ルファ" OR "ファ9" OR "の気温" OR "気温は"')
         conn = db.get_connection(path)
         try:
             rows = db.search_fts(conn, '「アルファ9」の気温は？')
