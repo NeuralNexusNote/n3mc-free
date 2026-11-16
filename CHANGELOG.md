@@ -4,6 +4,28 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Fixes from the review of the v1.6.0 code (2026-11-16), applied through the
+specification (EN and JP). No schema or config changes.
+
+### Fixed
+- **A prompt that was only a JSON array was not saved and not searched**:
+  `_extract_text()` read every string that parsed as a JSON array as a
+  multimodal array, so `[1, 2, 3]` or `["apple", "banana"]` typed as the
+  whole prompt became empty (it was only in `audit.log`). Only a non-empty
+  array of objects with a `type` key is a multimodal array now; other text
+  is kept as typed.
+- **`/repair` reported records it did not repair**: `count` (and the
+  `Repaired N record(s)` line) counted every record looked at, so while the
+  embedding model was unavailable each call reported N and repaired none.
+  It now counts only records that were changed.
+
+### Changed
+- `.claude/rules/n3mc-behavior.md` in this repository is the current
+  template (`<!-- n3mc-behavior v3 -->`, with the "Weak Matches" section);
+  it was still the v2 text.
+
 ## [1.6.0] - 2026-11-16
 
 Spec files renamed `v1.5.0 → v1.6.0`. Fixes from scoring the v1.5.0 code

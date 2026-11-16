@@ -105,6 +105,14 @@ class TestExtractText:
         assert _extract_text('') == ''
         assert _extract_text(None) == ''
 
+    def test_json_text_is_kept_as_typed(self):
+        # spec §4.5 (2026-11-16): only an array of objects with a `type` key
+        # is a multimodal array; other valid JSON is the user's own text.
+        from n3memorycore.n3memory import _extract_text
+        for typed in ('[1, 2, 3]', '["apple", "banana"]', '[]', '[{"id": 1}]',
+                      '[{"type": "text", "text": "a"}, 5]', '{"a": 1}', '123'):
+            assert _extract_text(typed) == typed
+
 
 # ---------------------------------------------------------------------------
 class TestCompleteRecording:
