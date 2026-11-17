@@ -6,6 +6,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-17
+
 ### Search changes ported from N3MC-Pro (2026-11-17)
 
 Applied through the specification (EN and JP). Adds one FTS5 table

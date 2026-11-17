@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.6.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.7.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -121,7 +121,7 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.6.0_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.7.0_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
@@ -1359,7 +1359,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.6.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.7.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
