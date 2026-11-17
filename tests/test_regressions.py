@@ -1056,10 +1056,10 @@ class TestServerApi:
             def read(self):
                 return b'{}'
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             seen.append(req.get_header('Host'))
             return Resp()
-        monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+        monkeypatch.setattr(n3memory, '_local_open', fake_open)      # F16: no proxy
         REAL_POST({'server_port': 18777}, '/x', {})
         REAL_GET({'server_port': 18777}, '/x')
         assert seen == ['127.0.0.1:18777', '127.0.0.1:18777']
@@ -1851,3 +1851,163 @@ class TestConfig(TestConfig):  # v1.6.0 additions
         c = n3memory._load_config()
         assert c['min_results'] == 0
         assert 'config_type' not in notices()
+
+# --------------------------------------------------------------------------- proxy (final review 2026-11-18, F16)
+class TestNoProxyToOwnServer:
+    """HTTP_PROXY must not send the CLI's and the hooks' requests to a proxy (spec §3 Communication)."""
+
+    def test_http_proxy_is_ignored(self, monkeypatch):
+        import http.server
+        import threading
+        hits = {'server': 0, 'proxy': 0}
+
+        def handler(name):
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    hits[name] += 1
+                    body = b'{"status": "ok"}'
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *a):
+                    pass
+            return H
+        servers = [http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler(n)) for n in ('server', 'proxy')]
+        for s in servers:
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+        try:
+            port, proxy_port = servers[0].server_address[1], servers[1].server_address[1]
+            for var in ('HTTP_PROXY', 'http_proxy'):
+                monkeypatch.setenv(var, f'http://127.0.0.1:{proxy_port}')
+            for var in ('NO_PROXY', 'no_proxy'):
+                monkeypatch.delenv(var, raising=False)
+            assert REAL_GET({'server_port': port}, '/health') == {'status': 'ok'}
+            assert hits == {'server': 1, 'proxy': 0}
+        finally:
+            for s in servers:
+                s.shutdown()
+                s.server_close()
+
+
+# --------------------------------------------------------------------------- /repair and the write lock (final review 2026-11-18, F11)
+class TestRepairKeepsWritesOpen:
+    """spec §3.5: /repair embeds a batch before it writes, so a save is not locked out meanwhile."""
+
+    def test_write_while_repair_embeds(self, tmp_path, monkeypatch):
+        import threading
+        path = new_db(tmp_path, 'lock.db')
+        monkeypatch.setattr(n3memory, 'DB_PATH', path)
+        monkeypatch.setattr(n3memory, '_srv_cfg', {'owner_id': 'o', 'local_id': 'l', 'server_port': 18998})
+        conn = db.get_connection(path)
+        for i in range(10):
+            db.insert_memory(conn, f'id-{i}', f'record number {i}', '2026-11-18T00:00:00+00:00', 'o')
+        conn.commit()
+        conn.close()
+        started = threading.Event()
+
+        def slow_embed(text):
+            started.set()
+            time.sleep(0.2)
+            return fake_embed(text)
+        monkeypatch.setattr(proc, 'embed_passage', slow_embed)
+        t = threading.Thread(target=n3memory._repair_db)
+        t.start()
+        assert started.wait(5)
+        time.sleep(0.5)                      # /repair is embedding the batch (10 x 0.2 s)
+        other = sqlite3.connect(path, timeout=0.5)
+        try:
+            other.execute('BEGIN IMMEDIATE')  # what /buffer does (insert_memory_once)
+            other.execute('COMMIT')
+        finally:
+            other.close()
+        t.join(30)
+        assert not t.is_alive()
+        check = db.get_connection(path)
+        try:
+            assert check.execute('SELECT COUNT(*) FROM memories_vec').fetchone()[0] == 10
+        finally:
+            check.close()
+
+    def test_busy_timeout_is_explicit(self, tmp_path):
+        assert db.BUSY_TIMEOUT_SECONDS == 10
+
+
+# --------------------------------------------------------------------------- lone surrogates (final review 2026-11-18, F12)
+class TestLoneSurrogateHook:
+    """spec §4.5: a prompt or reply with a lone surrogate is saved without it; the hook does not fail."""
+
+    def test_prompt_and_reply_are_saved(self, monkeypatch, capsys):
+        saved, queries = [], []
+        monkeypatch.setattr(n3memory, 'ensure_server', lambda c: True)
+
+        def fake_post(c, p, *a, **k):
+            if p == '/search':
+                queries.append((a[0] if a else k.get('payload', {})).get('query'))
+                return {'results': [], 'pairs': {}, 'pairs_omitted': {}}
+            return {}
+        monkeypatch.setattr(n3memory, '_post', fake_post)
+        monkeypatch.setattr(n3memory, '_do_buffer', lambda text, c, **k: saved.append(text))
+        monkeypatch.setattr('sys.stdin', io.StringIO(
+            '{"session_id": "s", "prompt": "broken \\ud83d emoji", "last_assistant_message": "reply \\udc00 half"}'))
+        n3memory.cmd_hook_submit({'server_port': 1, 'search_query_max_chars': 2000, 'owner_id': 'o'})
+        out = capsys.readouterr().out
+        out.encode('utf-8')
+        assert '# Recalled Memory Context' in out
+        assert saved == ['[claude] reply  half', '[user] broken  emoji']
+        assert queries and all('\ud83d' not in (q or '') for q in queries)
+
+    def test_stop_hook_reply(self, monkeypatch):
+        saved = []
+        monkeypatch.setattr(n3memory, 'ensure_server', lambda c: True)
+        monkeypatch.setattr(n3memory, '_do_buffer', lambda text, c, **k: saved.append(text))
+        monkeypatch.setattr('sys.stdin', io.StringIO('{"session_id": "s2", "last_assistant_message": "end \\ud83d here"}'))
+        n3memory.cmd_save_claude_turn({'server_port': 1, 'owner_id': 'o'})
+        assert saved == ['[claude] end  here']
+
+
+# --------------------------------------------------------------------------- DB corruption that raises (final review 2026-11-18, F13)
+class TestDbCorruptRaises:
+    """spec §3.5: a damaged file that makes SQLite raise is set aside like one that fails the check."""
+
+    def _corrupt(self, how):
+        path = n3memory.DB_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if how == 'garbage':
+            with open(path, 'wb') as f:
+                f.write(b'this is not a database ' * 300)
+            return
+        c = db.get_connection(path)
+        db.init_db(c)
+        for i in range(50):
+            db.insert_memory(c, f'i{i}', 'x' * 500, '2026-11-18T00:00:00+00:00', 'o')
+        c.commit()
+        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        c.close()
+        with open(path, 'r+b') as f:            # the first page, after the 100-byte header
+            f.seek(100)
+            f.write(b'\xff' * 3900)
+
+    @pytest.mark.parametrize('how', ['garbage', 'first_page'])
+    def test_direct_save_sets_it_aside(self, how):
+        import glob
+        self._corrupt(how)
+        n3memory._buffer_direct('saved after the corruption', {'owner_id': 'o'})
+        assert len(glob.glob(n3memory.DB_PATH + '.corrupt-*.bak')) == 1
+        assert count(n3memory.DB_PATH) == 1
+        assert 'db_corrupt' in notices()
+
+    def test_startup_check_sets_it_aside(self):
+        import glob
+        self._corrupt('garbage')
+        conn = n3memory._connect_checked('integrity_check')
+        conn.close()
+        assert len(glob.glob(n3memory.DB_PATH + '.corrupt-*.bak')) == 1
+
+    def test_other_errors_are_not_corruption(self):
+        assert not n3memory._is_corruption_error(sqlite3.OperationalError('database is locked'))
+        assert not n3memory._is_corruption_error(sqlite3.DatabaseError('Failed to load sqlite-vec extension: x'))
+        assert n3memory._is_corruption_error(sqlite3.DatabaseError('file is not a database'))
+        assert n3memory._is_corruption_error(sqlite3.DatabaseError('database disk image is malformed'))

@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import shutil
+import sqlite3
 import subprocess
 import sysconfig
 import tempfile
@@ -68,6 +69,8 @@ _HEADING = "# Recalled Memory Context"
 _CLI_SESSION_ID = os.environ.get('N3MC_SESSION_ID') or str(uuid.uuid4())
 
 _FATAL_SAVE_MSG = "⚠️ Physical save failed. Current memories may be lost."
+_SAVE_FAILED_MSG = ("A record could not be saved ({error}). Current memories may be lost; "
+                    "if it happens again, check that no other program holds the memory database.")
 
 
 def _norm(path: str) -> str:
@@ -427,6 +430,15 @@ def _code_version() -> str:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+def _local_open(req, timeout):
+    """Open a request to this PC's own server, never through a proxy (spec §3 Communication, F16).
+
+    urllib's default opener follows HTTP_PROXY / the system proxy settings; with a proxy and no
+    NO_PROXY entry for 127.0.0.1 the request went to the proxy and the server looked down."""
+    import urllib.request
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+
+
 def _post(cfg: dict, path: str, payload: dict, timeout: int = 30) -> dict:
     import urllib.request
     url = f"http://127.0.0.1:{cfg['server_port']}{path}"
@@ -437,7 +449,7 @@ def _post(cfg: dict, path: str, payload: dict, timeout: int = 30) -> dict:
                  'Host': f"127.0.0.1:{cfg['server_port']}"},   # spec §3 Host check
         method='POST',
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _local_open(req, timeout) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
@@ -446,7 +458,7 @@ def _get(cfg: dict, path: str, timeout: int = 30) -> dict:
     url = f"http://127.0.0.1:{cfg['server_port']}{path}"
     req = urllib.request.Request(
         url, headers={'Host': f"127.0.0.1:{cfg['server_port']}"}, method='GET')
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _local_open(req, timeout) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
@@ -853,19 +865,53 @@ def ensure_server(cfg: dict) -> bool:
 # Direct buffer fallback (no embedding — used when server is down/foreign)
 # ---------------------------------------------------------------------------
 
-def _quick_check_once(conn):
-    """spec §3.5 (v1.5.0): PRAGMA quick_check at most once per process.
-    Returns a fresh connection when the DB was set aside as corrupt."""
-    global _QUICK_CHECK_DONE
-    if _QUICK_CHECK_DONE:
+def _is_corruption_error(e: BaseException) -> bool:
+    """spec §3.5 (F13): the DatabaseError of a damaged file — "file is not a
+    database" or "database disk image is malformed". Not OperationalError
+    (e.g. "database is locked") and not the sqlite-vec load failure."""
+    if not isinstance(e, sqlite3.DatabaseError) or isinstance(e, sqlite3.OperationalError):
+        return False
+    msg = str(e).lower()
+    return 'file is not a database' in msg or 'malformed' in msg
+
+
+def _connect_checked(pragma: Optional[str]):
+    """spec §3.5: open DB_PATH and run `PRAGMA <pragma>` (quick_check /
+    integrity_check; None = no check). A DB that fails the check — a result
+    other than 'ok', or (F13) a corruption error raised by opening it or by
+    the check itself — is set aside (_handle_corrupt_db) and a new empty DB
+    is opened. Any other error is raised unchanged."""
+    try:
+        conn = get_connection(DB_PATH)
+    except sqlite3.DatabaseError as e:
+        if not _is_corruption_error(e):
+            raise
+        _handle_corrupt_db()
+        return get_connection(DB_PATH)
+    if pragma is None:
         return conn
-    _QUICK_CHECK_DONE = True
-    result = conn.execute("PRAGMA quick_check").fetchone()
+    try:
+        result = conn.execute(f"PRAGMA {pragma}").fetchone()
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        if not _is_corruption_error(e):
+            raise
+        _handle_corrupt_db()
+        return get_connection(DB_PATH)
     if result and result[0] != 'ok':
         conn.close()
         _handle_corrupt_db()
-        conn = get_connection(DB_PATH)
+        return get_connection(DB_PATH)
     return conn
+
+
+def _quick_check_once():
+    """spec §3.5 (v1.5.0): PRAGMA quick_check at most once per process
+    (the direct-save path). Returns an open connection."""
+    global _QUICK_CHECK_DONE
+    pragma = None if _QUICK_CHECK_DONE else 'quick_check'
+    _QUICK_CHECK_DONE = True
+    return _connect_checked(pragma)
 
 
 # Set once quick_check has run in this process (spec §3.5, v1.5.0).
@@ -886,11 +932,10 @@ def _buffer_direct(
     if not content or not content.strip():
         return
 
-    conn = get_connection(DB_PATH)
+    # spec §3.5: quick_check in the fallback path (lighter than
+    # integrity_check), once per process
+    conn = _quick_check_once()
     try:
-        # spec §3.5: quick_check in the fallback path (lighter than
-        # integrity_check), once per process
-        conn = _quick_check_once(conn)
         init_db(conn)
         migrate_schema(conn)
         # spec §5.4: exact text only (same turn_id when given) — same rule as /buffer
@@ -1254,24 +1299,34 @@ def _repair_db(max_records: Optional[int] = None) -> int:
             if not rows:
                 break
             batch_repaired = 0
+            # spec §3.5 (F11): every embedding of the batch is computed first,
+            # outside any transaction; only then are the rows written and
+            # committed. Until then the first INSERT opened the write
+            # transaction and it stayed open while the rest of the batch was
+            # embedded, so a /buffer that came meanwhile waited for the busy
+            # timeout and failed with "database is locked".
+            if conn.in_transaction:
+                conn.commit()
+            vecs = {}
+            for row in rows:
+                if row['vec_rowid'] is None:
+                    try:
+                        vecs[row['rowid']] = embed_passage(row['content'])
+                    except Exception as e:
+                        logger.warning(f"Repair embed rowid={row['rowid']}: {e}")
             for row in rows:
                 rowid    = row['rowid']
                 content  = row['content']
-                has_vec  = row['vec_rowid'] is not None
                 has_fts  = row['fts_rowid'] is not None
                 changed  = False
 
-                if not has_vec:
-                    try:
-                        vec = embed_passage(content)
-                        conn.execute(
-                            "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                            (rowid, serialize_vector(vec))
-                        )
-                        batch_repaired += 1
-                        changed = True
-                    except Exception as e:
-                        logger.warning(f"Repair embed rowid={rowid}: {e}")
+                if rowid in vecs:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                        (rowid, serialize_vector(vecs[rowid]))
+                    )
+                    batch_repaired += 1
+                    changed = True
 
                 if not has_fts:
                     stripped = strip_fts_punctuation(content)
@@ -1341,14 +1396,9 @@ try:
 
         from .core.database import get_connection, init_db, migrate_schema
 
-        conn = get_connection(DB_PATH)
+        # spec §3.5: integrity_check on startup (once, not in fallback path)
+        conn = _connect_checked('integrity_check')
         try:
-            # spec §3.5: integrity_check on startup (once, not in fallback path)
-            ok = conn.execute("PRAGMA integrity_check").fetchone()
-            if ok and ok[0] != 'ok':
-                conn.close()
-                _handle_corrupt_db()
-                conn = get_connection(DB_PATH)
             init_db(conn)
             migrate_schema(conn)
         finally:
@@ -1571,6 +1621,9 @@ def _do_buffer(
         except Exception as e2:
             # spec §5.4: fatal failure warning (DB write failed)
             print(f"{_FATAL_SAVE_MSG} ({e2})", file=sys.stderr)
+            # F11: the hook's stderr is read by nobody; the notice reaches the
+            # next search output
+            _notify('save_failed', _SAVE_FAILED_MSG.format(error=f"{type(e2).__name__}: {e2}"))
 
     # spec §3: another folder's server owns the port → never write to its DB.
     # No server for this command (still starting / failed to start): save
@@ -2125,6 +2178,10 @@ def cmd_hook_submit(cfg: dict) -> None:
         data = {}
     if not isinstance(data, dict):
         data = {}
+    # spec §4.5 (F12): lone surrogates (e.g. "\ud83d") cannot be encoded as
+    # UTF-8; remove them before the text is searched, printed or saved.
+    from .core.processor import sanitize_surrogates
+    data = sanitize_surrogates(data)
 
     user_text     = _extract_text(data.get('prompt') or data.get('message') or '')
     cc_session_id = data.get('session_id', '') or ''
@@ -2145,7 +2202,8 @@ def cmd_hook_submit(cfg: dict) -> None:
     if not isinstance(last_claude, str) or not last_claude.strip():
         last_claude = ''
         try:
-            last_claude = _read_previous_response(data.get('transcript_path'), user_text)
+            last_claude = sanitize_surrogates(
+                _read_previous_response(data.get('transcript_path'), user_text))
         except TranscriptUnreadable as e:
             _append_audit({'hook': 'UserPromptSubmit', 'stage': 'transcript_unreadable',
                            'reason': str(e)[:200]})
@@ -2193,6 +2251,10 @@ def cmd_save_claude_turn(cfg: dict) -> None:
         data = {}
     if not isinstance(data, dict):
         data = {}
+    # spec §4.5 (F12): lone surrogates (e.g. "\ud83d") cannot be encoded as
+    # UTF-8; remove them before the text is searched, printed or saved.
+    from .core.processor import sanitize_surrogates
+    data = sanitize_surrogates(data)
 
     last_claude   = data.get('last_assistant_message') or ''
     cc_session_id = data.get('session_id', '') or ''
@@ -2504,7 +2566,8 @@ def main() -> None:
         if text.strip():
             cmd_buffer(text, cfg, agent_name=args.agent_id)
     elif args.search is not None:
-        cmd_search(args.search, cfg, since=since, until=until)
+        from .core.processor import sanitize_surrogates
+        cmd_search(sanitize_surrogates(args.search), cfg, since=since, until=until)
     elif args.repair:
         cmd_repair(cfg)
     elif args.reembed:
