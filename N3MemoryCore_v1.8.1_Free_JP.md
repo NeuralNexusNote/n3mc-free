@@ -285,7 +285,7 @@ from .core.processor import (
 - **ポート**: デフォルト `18520`（`config.json` の `server_port` で変更可）。同じ PC で別の N3MC（Pro 版など）を動かすときは、フォルダごとに `server_port` を分けること。
 - **待ち受けアドレス**: `bind_host`（既定 `127.0.0.1`）。**既定のまま使うこと。** サーバーの API（検索・一覧・`/shutdown` 等）には認証がないため、ほかの値にするとネットワークから届く。`127.0.0.1` 以外が設定されていたら、起動時に stderr へ警告を出す。
 - **起動タイミング**: `n3mc` のいずれかのサブコマンド（または `python -m n3memorycore.n3memory`）の実行時、下の「サーバーの確認と入れ替え（`ensure_server`）」に従い、必要なら `python -m n3memorycore.n3memory --run-server` として自動的にバックグラウンド起動せよ。PID ファイルの書き込みはアトミック操作（例: `open(..., 'x')` 排他作成フラグ）を使用し、複数プロセスの同時起動を防止すること。
-- **通信方式**: HTTP over TCP (`http://127.0.0.1:{port}`)
+- **通信方式**: HTTP over TCP (`http://127.0.0.1:{port}`)。**プロキシを通さない**（2026-11-18 の最終レビュー、F16）：`_post` / `_get` は、`urllib.request.urlopen` ではなく `urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=…)` で要求を開く。既定の opener は `HTTP_PROXY` やシステムのプロキシ設定に従う。プロキシがあり、`NO_PROXY` に `127.0.0.1` がないと（社内の PC ではふつうにある）、要求がすべてプロキシに送られ、サーバーがないと判断され、フックのたびにサーバーの起動を待ち、検索は「still starting」になり、保存はベクトルなしの直接保存になっていた。
 - **Host ヘッダーの確認（v1.5.0）**: すべてのエンドポイントは、リクエストの `Host` ヘッダーが `127.0.0.1:<port>` または `localhost:<port>` でなければ 403 を返す。そうしないと、ユーザーのブラウザで開いた Web ページが DNS リバインディング（127.0.0.1 に解決される名前）でサーバーに届き、`GET /list` を読めてしまう。CLI は常に `Host: 127.0.0.1:<port>` を送る。FastAPI の `TestClient` は `testserver` を送るので、テストではヘッダーを明示するか、確認を差し替える。
 - **エンドポイントでイベントループを止めない（v1.5.0）**: 埋め込みや DB を扱うエンドポイント（`/buffer`・`/search`・`/repair`・`/list`）は `async def` ではなく普通の `def` で定義し、FastAPI のスレッドプールで動かす。これで長い `/repair` の間も `/health` が応答し続ける。（v1.4.0 では中で同期処理をする `async def` だったため、長い `/repair` の間 `/health` がタイムアウトし、CLI がサーバーなしと判断して起動・入れ替えの処理に入っていた。）エンドポイントが使う SQLite 接続はそのエンドポイントの呼び出しの中で開き（リクエストごとに 1 接続）、スレッドをまたいで共有しない。
 - **死活監視**: CLI実行のたびに `/health` エンドポイントへPINGし、応答の中身でサーバーが自分のものか・最新のコードか を判定せよ（下記）。
@@ -744,11 +744,13 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 > **⚠️ 理由（v1.5.0、Free v1.4.0 のレビューで見つかった）**: v1.4.0 は固定の名前 `.corrupt.bak` を使っていたので、2 回目の破損で 1 回目のバックアップが上書きされた（Windows で確認）。また WAL と SHM のファイルを削除し、復旧に使えたはずの記録を捨てていた。知らせる手段は、フックでは表示されない stderr の 1 行だけだった。
 
-`get_connection` 内で `PRAGMA` 実行時に `DatabaseError` が発生した場合は、復旧手順を含むエラーメッセージを付与して re-raise する。
+**SQLite が例外を出す壊れ方（2026-11-18 の最終レビュー、F13）**：DB を開くとき（`get_connection` の中の `PRAGMA`）や確認そのものが `sqlite3.DatabaseError` — その下位の `OperationalError`（`database is locked` など）ではないもの — を出し、そのメッセージに `file is not a database` か `malformed`（`database disk image is malformed`）が含まれるときは、`ok` 以外の結果と同じに扱う：上の手順 1〜4（退避、新しい空の DB、通知）。2 つの確認を 1 つの関数で行う：`_connect_checked(pragma)` は `DB_PATH` を開き、`PRAGMA <pragma>`（起動時は `integrity_check`、`_buffer_direct` ではプロセスごとに 1 回 `quick_check`、そのあとはなし）を実行し、開いた接続を返す。`_is_corruption_error(e)` が上の判定である。`get_connection` は、失敗した `PRAGMA` を再送出する前に接続を閉じる（Windows でファイルを移せるように）。ほかの `DatabaseError` はそのまま再送出する。sqlite-vec の読み込みの失敗は、`Recovery: pip install sqlite-vec` を含む自分のメッセージのままにする。（それまでは「ok 以外の行を返す」確認だけを扱っていた。中身がごみのファイルは `file is not a database`、先頭のページが壊れたものは `database disk image is malformed` になり、退避も通知もなく、フックの保存は毎回 stderr だけの「Physical save failed」で失敗し、サーバーは起動しなかった。）
 
 ### マイグレーションのバッチ処理
 
 `/repair` 内の一括マイグレーション（ベクトル再インデックス・FTS 句読点クリーニング）は **200 件ずつバッチ処理**で実行する。大規模 DB でのメモリ枯渇を防止するため、`fetchall()` ではなく `LIMIT 200` でフェッチする。**`OFFSET` は常に `0` に固定すること**——修復済みレコードは `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` の結果セットから自動的に消えるため、`OFFSET` をバッチごとに加算すると残りの未修復レコードをスキップしてしまう（例：400 件未修復 → 200 件修復 → `OFFSET 200` で 0 件ヒット → 残り 200 件が永久に未修復になる）。各バッチで 1 件も修復できなかった場合（埋め込みモデル利用不可等）は無限ループを防ぐために即時終了する。
+
+**埋め込みの間は書き込みのロックを持たない（2026-11-18 の最終レビュー、F11）**：ベクトルの修復は、バッチ全体の埋め込みを先に、トランザクションの外で計算し（開いているものは先にコミットする）、そのあとでバッチの `memories_vec` / `memories_fts` / `memories_fts_bi` の行を入れてコミットする — `--reembed` と同じ順序。（それまでは、最初の `INSERT … memories_vec` が書き込みのトランザクションを開き、バッチの残り — 最大 200 件 — を埋め込む間ずっと開いたままだった。その間に届いた `/buffer` は busy timeout まで待って `database is locked` で失敗し、`_buffer_direct` への切り替えも同じく失敗して、質問が保存されなかった。60 件と、1 件 0.25 秒の代役のモデルで再現した。）
 
 **フックからの呼び出しごとの上限（v1.5.0）**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。
 
@@ -1166,7 +1168,7 @@ python -m n3memorycore.n3memory --show-turn <turn_id>
 echo '{"session_id":"…","transcript_path":"/path/to/session.jsonl","prompt":"ユーザー入力"}' | n3mc --hook-submit
 ```
 
-stdin から UserPromptSubmit の JSON を読み取る。Claude Code は `session_id`、`transcript_path`、`cwd`、`permission_mode`、`hook_event_name`、`prompt` を送る（新しい版ではキーが増える。知らないキーは無視する）。`message` は `prompt` の別名として受け付ける。**この入力に `last_assistant_message` はない**（このキーは Stop の入力にだけある）。それでも呼び出し側が渡してきた場合は、トランスクリプトを読む代わりにそれを使う。単一プロセス内で HTTP リクエスト経由により全 UserPromptSubmit 処理を実行する：`--repair` → `--buffer`（Claude の前の回答を保存。トランスクリプトから読む — 下記）→ `--search` → `--buffer`（ユーザー発言を保存）。`n3mc-hook` エントリポイント（`n3memorycore/n3mc_hook.py`）から呼び出される。AI が手動で実行する必要はない。このフックで保存される全レコードには `agent_name = "claude-code"` が自動タグ付けされる。
+stdin から UserPromptSubmit の JSON を読み取る。Claude Code は `session_id`、`transcript_path`、`cwd`、`permission_mode`、`hook_event_name`、`prompt` を送る（新しい版ではキーが増える。知らないキーは無視する）。`message` は `prompt` の別名として受け付ける。**この入力に `last_assistant_message` はない**（このキーは Stop の入力にだけある）。それでも呼び出し側が渡してきた場合は、トランスクリプトを読む代わりにそれを使う。単一プロセス内で HTTP リクエスト経由により全 UserPromptSubmit 処理を実行する：`--repair` → `--buffer`（Claude の前の回答を保存。トランスクリプトから読む — 下記）→ `--search` → `--buffer`（ユーザー発言を保存）。`n3mc-hook` エントリポイント（`n3memorycore/n3mc_hook.py`）から呼び出される。AI が手動で実行する必要はない。このフックで保存される全レコードには `agent_name = "claude-code"` が自動タグ付けされる。**単独サロゲート（2026-11-18 の最終レビュー、F12）**：`--hook-submit` と `--save-claude-turn` は、解析した直後に、フックの JSON 全体を `sanitize_surrogates` に通す。トランスクリプトから読んだ前の応答も同じにする。`--search` も引数に同じことをする。そのあとの手順（検索、出力する `Search query:` の行、比較、保存）は、すべて取り除いたあとの文を使う。（それまでは、`\ud83d` のような単独サロゲートを含む質問は、検索の結果は返るが、出力を書くところで `UnicodeEncodeError` になり — 質問を保存する前に — 質問が失われ、何も差し込まれなかった。）
 
 - **トランスクリプトから前の Claude の返答を読む（決定 D3、v1.5.0）**: `transcript_path` はセッションの JSONL トランスクリプトである。末尾から読み、**今のプロンプトより前にある、最後の assistant のテキストブロック**を取り出す。これは Stop フックが `last_assistant_message` として受け取るテキストと同じものである。
   1. 行を後ろから順にたどる。JSON オブジェクトでない行、`isSidechain: true` の行（サブエージェント）、`type` が `user` でも `assistant` でもない行は飛ばす。
@@ -1284,6 +1286,8 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 - **【実装仕様】致命的故障の警告**: DB書き込み失敗、またはINSERT後にDB件数が変化しない場合のみ以下を強調表示せよ:
   > ⚠️ 物理保存に失敗。現在の記憶は失われる可能性があります。
+
+  直接の保存（`_buffer_direct`）も失敗したときは、あわせて `_notify('save_failed', "A record could not be saved (<ErrorType>: <message>). Current memories may be lost; if it happens again, check that no other program holds the memory database.")` を呼び、次の検索の出力に出す（F11：フックの stderr の警告は誰も読まない）。
 - **【実装仕様】文脈注入（stdout のみ）**: `--search` の結果は **stdout に `print()` で出力**せよ。UserPromptSubmit フックの stdout は Claude Code がそのターンのコンテキストに入れる。stdout 出力がないと Claude が検索結果を認識できず、記憶があるにもかかわらず「記憶にありません」と応答する原因になる。**`memory_context.md` などのファイルには書かない**（v1.4.0 で廃止。§4「memory_context.md の廃止」）。
 - **【実装仕様】毎回の出力（劣化状態も必ず出す）**: `cmd_search` は呼び出されるたびに、結果に関わらず stdout に必ず出力せよ。失敗パスでは「劣化状態を示すプレースホルダー」を出し、記憶層の状態を Claude に見えるようにする:
   - **空クエリ**（画像のみのプロンプト、または `--search ""`）→ `# Recalled Memory Context\n\n_No relevant memories found._\n`。
@@ -1297,7 +1301,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【カスタマイズ】言語ローカライズ**: 該当なし。完全記録契約により `_SKIP_PATTERNS` は**廃止**され、フックフィルタ層に言語依存の対象は存在しない。
 - **【実装仕様】重複排除と HTTP 失敗時フォールバック**:
   - 保存を飛ばすのは**完全に同じ文**だけ（`check_exact_duplicate(conn, content, turn_id=...)`）。`turn_id` があるときは**同じ `turn_id` の中だけ**で比べる。`turn_id` がないとき（手動の `--buffer`）は全体で比べる。`/buffer` と `_buffer_direct` の両方で同じ規則。
-  - **書き込みの中でもう一度確かめる（2026-11-17 の 2 回目のレビュー、R04）**：上の確認は埋め込みの前に行うので、重複ならモデルを呼ばずに済む。それでも、同じターンの同じ文の保存が同時に 2 つ届くことはある（タイムアウトの後にやり直したフック、`/buffer` と `_buffer_direct` が同時に）。その 2 つはどちらも上の確認を通る。そこで、どの保存の経路（`/buffer`、`_buffer_direct`）も、`core/database.py` の `insert_memory_once(conn, id, content, timestamp, owner_id, turn_id=..., insert_memory のほかの引数)` を通して書く：開いているトランザクションがあればコミットし、`BEGIN IMMEDIATE`（書き手は一度に 1 つ。接続の busy timeout まで待つ）、`check_exact_duplicate` をもう一度行い、重複ならロールバックして `None` を返す — 最初の確認と同じに伝える（`/buffer` は `{"status": "skipped", "count": 0, "reason": "exact_duplicate"}`）。重複でなければ `insert_memory`（コミットする）を呼んで rowid を返す。（それまでは、そういう 2 つの保存がどちらも行を書いた。2 つのスレッドで再現した。）
+  - **書き込みの中でもう一度確かめる（2026-11-17 の 2 回目のレビュー、R04）**：上の確認は埋め込みの前に行うので、重複ならモデルを呼ばずに済む。それでも、同じターンの同じ文の保存が同時に 2 つ届くことはある（タイムアウトの後にやり直したフック、`/buffer` と `_buffer_direct` が同時に）。その 2 つはどちらも上の確認を通る。そこで、どの保存の経路（`/buffer`、`_buffer_direct`）も、`core/database.py` の `insert_memory_once(conn, id, content, timestamp, owner_id, turn_id=..., insert_memory のほかの引数)` を通して書く：開いているトランザクションがあればコミットし、`BEGIN IMMEDIATE`（書き手は一度に 1 つ。接続の busy timeout の 10 秒まで待つ — `get_connection` は `sqlite3.connect(db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_SECONDS)` で開く。`core/database.py` の `BUSY_TIMEOUT_SECONDS = 10`。F11）、`check_exact_duplicate` をもう一度行い、重複ならロールバックして `None` を返す — 最初の確認と同じに伝える（`/buffer` は `{"status": "skipped", "count": 0, "reason": "exact_duplicate"}`）。重複でなければ `insert_memory`（コミットする）を呼んで rowid を返す。（それまでは、そういう 2 つの保存がどちらも行を書いた。2 つのスレッドで再現した。）
   - **類似度（cos_sim）による重複排除は行わない（v1.4.0 で廃止）。** v1.3.x は cos_sim ≥ 0.95 の記録があると新しいほうを捨てていた。multilingual-e5 では、形のそろった長い返答の分割どうしや、ほぼ同じ文の設定の新版と旧版が 0.95 前後になり、「同じ内容の新版」と「形の似た別の内容」を区別できない。その結果、約 2,000 字・12 項目の設定を保存すると分割の 1 つが残らない、設定を作り直すと新しい版の一部が欠ける、ということが起き、完全記録契約が破れていた。新しい版を優先したいときは、消さずに検索の並べ替えで扱う（§5「検索結果の絞り込みと並べ替え」）。
   - **全体で比べないのは**、作り直した設定のうち変えていない分割が旧版と全く同じ文になり、全体で比べると新しい版の往復が欠けるため。
   - 埋め込みサーバーへの HTTP POST 失敗時（サーバー停止・タイムアウト・非 2xx）: 書き込みは `_buffer_direct()` にフォールバックし、埋め込みベクトルなしで直接 SQLite に INSERT する。欠損した vec インデックスエントリは次回の `--repair` で修復される。**無言のドロップは禁止**：すべての失敗経路は `_buffer_direct` で成功するか、stderr へメッセージを出力する。Step 0 の監査ログと組み合わせて、ユーザー発言と、フックに届いた Claude の回答が失われないことを保証する。Claude の回答は Stop フックで、Stop が動かなかったときは次の質問でのトランスクリプトの読み取り（§4.5）でフックに届く。どちらのフックも動かない回答（例: Stop が飛ばされたまま Claude Code を閉じる前の最後の返答）は保存されない。
@@ -1533,7 +1537,7 @@ python -m pytest tests/ -v
 | `TestHealth` | `health_ok` | サーバー状態 |
 | `TestBuffer` | `save_content`, `empty_content_skipped`, `agent_name_saved`, `exact_dedup`, `code_block_purified` | 保存API |
 | `TestSearch` | `empty_db_search`, `save_then_search`, `empty_query`, `score_returned` | 検索API |
-| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API。埋め込みを計算できないとき `count` は 0 |
+| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API。埋め込みを計算できないとき `count` は 0。`/repair` がバッチを埋め込んでいる間（1 件 0.2 秒の代役のモデル）に、別の接続が 0.5 秒以内に `BEGIN IMMEDIATE` を取れる。`BUSY_TIMEOUT_SECONDS` は 10（F11） |
 | `TestList` | `list_returns_records`, `list_after_save` | 一覧API |
 | `TestDelete` | `delete_returns_403`, `delete_nonexistent_also_403`, `delete_detail_is_pro` | Pro 専用エンドポイント → 403 |
 | `TestGC` | `gc_returns_403`, `gc_detail_is_pro` | Pro 専用エンドポイント → 403 |
@@ -1572,14 +1576,14 @@ python -m pytest tests/ -v
 | `TestBehaviorMd` | 目印が同じなら触れない、過去のひな形なら控えを取って置き換える（**v1.6.0**: `v2` のひな形、ハッシュ `5af3c015c06c62c1` も含む。新しいファイルの 1 行目は `<!-- n3mc-behavior v3 -->` で、Weak Matches の節がある）、手で編集したものは置き換えず知らせを出す。**v1.5.0**: 知らせのキーにパスのハッシュが入り、メッセージにパスが入る、手で編集したファイルが 2 つあれば知らせも 2 つ、ファイルの 1 行目が今の目印になったら知らせが消える |
 | `TestServerDecision` | 正常／`code_version` 違い／別のフォルダ／`root` なしで確かめられない、`/shutdown` を先に使う、`root` が違えば 403、死んだ PID ファイルは待たない |
 | `TestServerStart`（v1.5.0） | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え） |
-| `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る |
+| `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る。`HTTP_PROXY` を別のローカルのサーバーに向けても、`_get` は N3MC のサーバーに届き、プロキシには何も届かない（F16） |
 | `TestForeignServer` | 別のフォルダのサーバーのとき、保存は自分の DB に直接、検索はしない、`--repair` は何もしない |
 | `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
 | `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない。**v1.5.0**: 前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く |
 | `TestPurifyBeforeChunk`（v1.5.0） | 2 つのコードブロックとその間の文章を持つ 500 字を超えるユーザー発言で、文章は残り、どちらのコードブロックも保存されない、400 字より長いコードブロックは保存されず置き換えられる |
 | `TestChunkSentences`（v1.5.0） | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
 | `TestTimeBounds`（v1.5.0） | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（UTC 以外の固定のタイムゾーンで）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー |
-| `TestDbCorrupt`（v1.5.0） | 2 回の破損で 2 つのバックアップ（`n3memory.db.corrupt-<time>.bak`）ができ、`-wal` / `-shm` は削除されずに隣へ移される、知らせ `db_corrupt` が出る、`quick_check` は 1 プロセスに 1 回 |
+| `TestDbCorrupt`（v1.5.0） | 2 回の破損で 2 つのバックアップ（`n3memory.db.corrupt-<time>.bak`）ができ、`-wal` / `-shm` は削除されずに隣へ移される、知らせ `db_corrupt` が出る、`quick_check` は 1 プロセスに 1 回。中身がごみのファイルと、先頭のページが壊れた DB は、次の直接保存と起動時の確認で退避され、`db_corrupt` の通知が出る。`OperationalError` と sqlite-vec の失敗は破損として扱わない（F13） |
 | `TestInit`（v1.5.0、一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、(v1.6.0)`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる |
 | `TestHousekeeping`（v1.5.0） | `--stop` が 30 日より古い `turn_id_*.txt` を消し、新しいものは残す、50 MB を超えた `audit.log` を `audit.log.1` にローテーションする（テストではサイズのしきい値を差し替える） |
 | `TestModelRetry`（v1.5.0） | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |

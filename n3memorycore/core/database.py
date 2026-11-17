@@ -153,8 +153,13 @@ def _load_vec_extension(conn: sqlite3.Connection) -> None:
         raise
 
 
+BUSY_TIMEOUT_SECONDS = 10
+
+
 def get_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    # spec §3 (F11): an explicit busy timeout of 10 s (the default was
+    # 5 s); writers wait this long for another connection's write.
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_SECONDS)
     try:
         _load_vec_extension(conn)
     except Exception as e:
@@ -163,10 +168,15 @@ def get_connection(db_path: str) -> sqlite3.Connection:
             f"Failed to load sqlite-vec extension: {e}. "
             "Recovery: pip install sqlite-vec"
         ) from e
-    # spec §3: SQLite durability settings
-    conn.execute("PRAGMA synchronous = FULL")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA wal_autocheckpoint = 1000")
+    # spec §3: SQLite durability settings. A failure here (F13: e.g. "file is
+    # not a database") closes the connection first, so the file can be moved.
+    try:
+        conn.execute("PRAGMA synchronous = FULL")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA wal_autocheckpoint = 1000")
+    except BaseException:
+        conn.close()
+        raise
     conn.row_factory = sqlite3.Row
     return conn
 

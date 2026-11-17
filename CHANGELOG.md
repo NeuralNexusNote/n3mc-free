@@ -6,6 +6,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (final review of 2026-11-18)
+- **`HTTP_PROXY` no longer takes requests away from the local server** (F16;
+  spec §3 Communication): the CLI and the hooks open their requests with a
+  proxy-less opener. Until then, with a proxy and no `NO_PROXY` for
+  127.0.0.1, the server looked down.
+- **A save is no longer locked out while `/repair` embeds** (final review of
+  2026-11-18, F11; spec §3.5): the vector repair embeds a whole batch first and
+  writes it in one short transaction afterwards. Until then the write
+  transaction stayed open while up to 200 records were embedded, and a
+  `/buffer` (and its direct-save fallback) that came meanwhile failed with
+  `database is locked`. The connection's busy timeout is now an explicit
+  10 seconds, and a failed direct save also leaves a `save_failed` notice for
+  the next search.
+- **A lone surrogate in a prompt or reply no longer loses the turn** (F12;
+  spec §4.5): `--hook-submit`, `--save-claude-turn` and `--search` remove lone
+  surrogates right after reading their input.
+- **A damaged DB that makes SQLite raise is set aside** (F13; spec §3.5):
+  `file is not a database` and `database disk image is malformed` from
+  opening the DB or from the check are handled like a failed check (set
+  aside, new DB, `db_corrupt` notice). Until then nothing was set aside and
+  every save failed.
+
+Tests: 316 passed (Windows 11, Python 3.12). The new tests fail on 1.8.1.
+
 ## [1.8.1] - 2026-11-17
 
 ### Fixed
