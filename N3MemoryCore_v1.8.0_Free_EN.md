@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.7.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.8.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -121,11 +121,11 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.7.0_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.8.0_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
-│   ├── n3memory.py              # main CLI module (--init / --buffer / --search / --list / --recall-thread / --show-turn / --stop / --repair / --hook-submit / --save-claude-turn / --run-server) + FastAPI app
+│   ├── n3memory.py              # main CLI module (--init / --buffer / --search / --list / --recall-thread / --show-turn / --stop / --repair / --reembed / --hook-submit / --save-claude-turn / --run-server) + FastAPI app
 │   ├── n3mc_hook.py             # UserPromptSubmit hook entry: writes audit.log → calls --hook-submit
 │   ├── n3mc_stop_hook.py        # Stop hook entry: writes audit.log → calls --save-claude-turn → calls --stop
 │   └── core/
@@ -161,8 +161,9 @@ n3mc-free/                       # Repository root
     ├── notices.json                # Notices that need human action (port conflict, unreadable config.json, etc.; §3 "Notices")
     ├── .memory_context_retired     # Marker showing the old memory_context.md has been cleaned up (§4 --stop)
     ├── turn_id_<session>.txt       # Q-A pairing handoff between UserPromptSubmit and Stop hooks (one per Claude Code session_id; turn_id.txt when there is no session_id; files older than 30 days are removed by --stop)
-    ├── fts_punct_cleaned           # one-time FTS5 punctuation-clean migration marker (touched by --repair)
-    ├── fts_bigram_v1               # one-time CJK bigram index fill marker (touched by --repair; 2026-11-17)
+    ├── vec_model.txt               # v1.7.0 and earlier: model marker; read once to fill meta.embed_model (§3.5), never written
+    ├── fts_punct_cleaned           # v1.7.0 and earlier: marker file; no longer read (meta table, §3.5)
+    ├── fts_bigram_v1               # v1.7.0 and earlier: marker file; no longer read (meta table, §3.5)
     └── vec_e5v2_migrated           # one-time vector-reindex migration marker (touched by --repair)
 ```
 
@@ -237,10 +238,10 @@ Examples a user might configure:
 **Upgrade procedure (same-dimension model swap)**:
 1. Edit `~/.n3mc/config.json` → set `embed_model` to the new model name.
 2. Restart the server (kill the PID file's process, or just let the next CLI call relaunch it).
-3. The next `n3mc --repair` call detects the model mismatch (via the `vec_model.txt` marker in `~/.n3mc/.memory/`) and prints a warning. The on-disk vectors are still from the OLD model, so search quality will be degraded until they are regenerated.
-4. To force a full re-embed: delete `~/.n3mc/.memory/vec_model.txt` and the `memories_vec` rows for affected records (or drop and rebuild the entire vec table), then run `n3mc --repair` to rebuild vectors using the new model.
+3. The next `/repair` detects the model mismatch (`meta.embed_model`, §3.5 "Index metadata") and shows the notice `embed_model_mismatch`. The stored vectors are still from the OLD model, so search quality is degraded until they are re-made.
+4. Run `n3mc --reembed`: it re-embeds every record with the new model (resumable; §3.5). Deleting a marker and running `n3mc --repair` does **not** re-make vectors: `--repair` only adds missing ones.
 
-**⚠️ Different-dimension model swap**: NOT supported by the reference implementation without manual SQL. Drop the `memories_vec` table, recreate it with the new dimension, delete `vec_model.txt`, then run `n3mc --repair`.
+**⚠️ Different-dimension model swap**: NOT supported by the reference implementation without manual SQL. Drop the `memories_vec` table, recreate it with the new dimension, delete the `embed_model`, `embed_dim` and `embed_model_at` rows of `meta`, then run `n3mc --reembed`. (`--reembed` on its own refuses a model whose dimension differs from the table's.)
 
 ### Inter-module Imports
 Use proper package-relative imports (no `sys.path` hacks). Inside the package:
@@ -575,14 +576,14 @@ def _build_fts_query(query: str) -> str:
 - `insert_memory` writes both tables. **Every delete path** deletes from both (see above).
 - The query side (`build_bigram_query`) OR-s the query's bigram tokens, quoted. Hiragana-only tokens are dropped when anything else is left; a 1-character non-CJK token is dropped.
 - `hybrid_search` always searches both tables (`search_fts` and `search_fts_bigram`) and merges them as described under "keyword_relevance". If the bigram search fails, continue with the trigram results.
-- Records saved before the table existed are indexed once by `--repair` (marker `.memory/fts_bigram_v1`; not limited by `max_records`, since it embeds nothing).
+- Records saved before the table existed are indexed once by `--repair` (key `fts_bigram` of the `meta` table, §3.5; not limited by `max_records`, since it embeds nothing).
 - Why (measured in N3MC-Pro, 2026-11-16, 138 labeled questions): removing the bigram index lowered MRR by 0.046 (95% interval −0.089 to −0.007).
 
 > **⚠️ Quoting each term is mandatory (v1.4.0)**: Even after punctuation stripping, ASCII symbols such as `\ / # = @ * $ % + ^ ~ |` and bare `AND` / `OR` / `NOT` / `NEAR` remain. Passing them to `MATCH` as-is causes an FTS5 syntax error (`fts5: syntax error near "\"`, etc.), `/search` returns HTTP 500, and memory injection degrades to "memory search unavailable" (observed on about 12% of prompts). Wrapping each term as an FTS5 string `"..."` makes symbols and operators match literally. (Since v1.5.0 the quoted terms are joined with `OR`; the `OR` written between them is outside the quotes and is the operator, while a user's `OR` inside a term stays literal.)
 >
 > **Keep searching on exceptions**: `hybrid_search` catches exceptions from `search_fts` and continues with no keyword results (vector search only). An FTS failure must not fail the whole search.
 
-During `--repair`, detect existing FTS records that were indexed with punctuation and re-register them with stripped text. This FTS cleaning runs as a **one-time migration**: after completion, create a marker file (`.memory/fts_punct_cleaned`). If the marker exists, skip the scan to avoid a full-table scan on every session start.
+During `--repair`, detect existing FTS records that were indexed with punctuation and re-register them with stripped text. This FTS cleaning runs as a **one-time migration**: after completion, write the key `fts_punct_cleaned` of the `meta` table (§3.5 "Index metadata"). If the key exists, skip the scan to avoid a full-table scan on every session start.
 
 **Score for FTS-only Hits**: Records that appear in FTS results but not in vector search results should be included in results with `cos_sim = 0.0` for integrated score calculation. Their final score is at most `0.3 × time_decay × b_session`, but they must not be excluded from ranking. Because `min_score` (0.2) and the relative cutoff are judged on `filter_score` (the score **without** `time_decay` and `b_session`, below), a keyword-only hit (at most 0.3 as a `filter_score`) is kept when its `keyword_relevance` is at least 0.67, however old it is and whichever session wrote it.
 
@@ -754,6 +755,37 @@ Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) 
 **Per-call limit for hooks (v1.5.0)**: `/repair` accepts an optional body `{"max_records": int}`. `--hook-submit` sends `{"max_records": 200}` (one batch), so a large backlog — e.g. many records saved through `_buffer_direct` while another folder's server held the port — is worked off a batch per turn instead of blocking one prompt for minutes. `n3mc --repair` sends no limit and processes everything. The one-time migrations (FTS punctuation cleaning, vector re-index) follow the same limit; their markers are written only when the migration has finished.
 
 The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`.
+
+### Index metadata (`meta` table) and `--reembed` (v1.8.0)
+
+The facts that describe how the indexes of `n3memory.db` were built live **inside the database**, in a table created by `init_db`:
+
+```sql
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+```
+
+| Key | Value | Written by |
+|---|---|---|
+| `embed_model` | name of the model that made the vectors in `memories_vec` | `/repair` (first time) and `--reembed` |
+| `embed_dim` | dimension of `memories_vec` (`768`) | same |
+| `embed_model_at` | when `embed_model` was written (UTC ISO 8601) | same |
+| `fts_punct_cleaned` | `1` when the FTS punctuation cleaning has finished | `/repair` |
+| `fts_bigram` | `1` when `memories_fts_bi` has been filled for older rows | `/repair` |
+| `reembed_model`, `reembed_cursor` | progress of an unfinished `--reembed` | `--reembed` (removed when it finishes) |
+
+- **`/repair`** runs a one-time step (FTS punctuation cleaning, bigram fill) when its key is missing **in the database**, and writes the key only when the step has finished. Both steps are idempotent, so running one again on a database that had it already only costs one scan.
+- **`embed_model` when missing**: if `memories_vec` has no rows, the configured `embed_model`; otherwise the content of `.memory/vec_model.txt` when that file exists and is not empty (the marker of v1.7.0 and earlier); otherwise the configured `embed_model`. The file is only read for this; it is never written or deleted.
+- **Model mismatch**: when `meta.embed_model` differs from the configured `embed_model`, `/repair` emits the notice `embed_model_mismatch` (§3 "Notices"): `The stored vectors were made with <recorded>, but config.json sets embed_model to <configured>. Search quality is degraded until they are re-made: run n3mc --reembed (it re-embeds all <N> records with <configured>), or set embed_model back to <recorded>.` When they match, the notice is cleared.
+- **`n3mc --reembed`** re-embeds every record with the configured `embed_model`, **in the CLI process** (it can take minutes; an HTTP call would time out):
+  1. Stop this folder's server (the same `/shutdown` request as a stale server, §3 "Starting the server"), so that it is started again with the configured model by the next CLI call. A server of another folder is left alone.
+  2. Load the configured model and embed one probe text. If its dimension differs from the dimension of `memories_vec`, print `N3MC: --reembed: <model> makes <d>-dimensional vectors but memories_vec has <D>; a different dimension needs the manual procedure in §3 "Embeddings".`, change nothing, and exit with status 1.
+  3. Resume point: when `meta.reembed_model` equals the configured model, start after `meta.reembed_cursor` (a `memories.rowid`); otherwise start from the beginning and write `reembed_model`.
+  4. Batches of 200 rows ordered by `rowid`: embed the batch (`"passage: " + content`, normalized), then in one transaction delete those rows from `memories_vec`, insert the new vectors, and set `reembed_cursor` to the last rowid. Print `Re-embedded <done> / <total>` to stderr after each batch.
+  5. When no rows remain: set `embed_model`, `embed_dim`, `embed_model_at`; delete `reembed_model` and `reembed_cursor`; clear the `embed_model_mismatch` notice; print `Re-embedded <N> record(s) with <model>.`
+  - An interrupted run (Ctrl+C, crash) keeps every finished batch; running `--reembed` again continues from the cursor. Rows saved while it runs are embedded by the restarted server with the configured model.
+  - `--reembed` is not in the auto-approved permission rules (§4 ②): a human runs it.
+
+> **Why (v1.8.0, design review of 2026-11-17, proposal 3)**: up to v1.7.0 these facts were marker files next to the database (`vec_model.txt`, `fts_punct_cleaned`, `fts_bigram_v1`), but the backup procedure saves `n3memory.db` and `config.json` only. Restoring an older backup on the same PC kept the newer markers, so the bigram fill was skipped and older records lost their CJK keyword hits; moving a database built with another model to a new PC wrote the configured model into a new `vec_model.txt`, so the mismatch was never reported. The warning also said "delete `vec_model.txt`, then run `n3mc --repair`", but `--repair` only adds vectors that are missing: the old vectors stayed and the warning went silent.
 
 ---
 
@@ -1276,7 +1308,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Implementation Specs] _load_vec_extension idempotency**: Loading the sqlite-vec extension twice on the same connection is a no-op — if the extension is already loaded, the load call raises an exception containing "already" or "duplicate" in its message. Catch such exceptions and continue; re-raise all others.
 - **[Implementation Specs] delete_memory transactional**: `delete_memory` calls `_load_vec_extension(conn)` first, then wraps all three DELETEs (memories_fts, memories_vec, memories) in a try/except with `conn.rollback()` on failure. All three indexes succeed or all roll back together.
 - **[Implementation Specs] lifespan startup**: Use FastAPI's `@asynccontextmanager` lifespan pattern (`async def lifespan(app: FastAPI)` with `yield`, passed to `FastAPI(lifespan=lifespan)`) instead of the deprecated `@app.on_event("startup")`.
-- **[Implementation Specs] Vector model marker**: On every `--repair` call, the server writes the currently-active embedding model name into `~/.n3mc/.memory/vec_model.txt` (creating it on first run). If the file exists with a name that differs from `cfg['embed_model']`, the server prints a warning to stderr — the on-disk vectors were generated by a different model than the one currently configured, so similarity search will be degraded until the vectors are regenerated. The reference implementation does NOT auto-trigger re-embedding (the operation can take many minutes on a large DB); the user is responsible for the manual upgrade procedure documented in §3 "Switching to a language-specialised model".
+- **[Implementation Specs] Vector model record**: On every `/repair`, the server compares `meta.embed_model` (written the first time, §3.5 "Index metadata") with `cfg['embed_model']` and emits or clears the notice `embed_model_mismatch`. It does NOT re-embed on its own (the operation can take many minutes on a large DB); the notice tells the user to run `n3mc --reembed`.
 
 ### Q-A Pairing Contract
 Every [user] and [claude i/N] row recorded for the same conversational turn shares a `turn_id` (UUID4). This lets N3MemoryCore reassemble the full previous exchange when a similar question returns later, instead of surfacing only isolated chunks.
@@ -1365,7 +1397,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.7.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.8.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
@@ -1397,10 +1429,10 @@ After implementation is complete, autonomously resolve the following tests and r
    - Japanese example: save `架空の惑星「アルファ9」の気温設定`, search with `アルファ9の気温`
    - Additionally, run `--search` with a query containing symbols (e.g. `C:\Users\test #tag = @a * $b % AND OR NOT "q"`) and confirm that it **does not error** (no `memory search unavailable` on stdout) and returns results (§3 "Quoting each term is mandatory").
 
-6. **--repair FTS Migration Test**: Delete the `~/.n3mc/.memory/fts_punct_cleaned` marker file, then run `n3mc --repair` and verify the following:
+6. **--repair FTS Migration Test**: Delete the `fts_punct_cleaned` row of the `meta` table (`sqlite3 ~/.n3mc/.memory/n3memory.db "DELETE FROM meta WHERE key='fts_punct_cleaned'"`), then run `n3mc --repair` and verify the following:
    - FTS cleaning is executed (if punctuated records exist, the count is reported)
-   - The `~/.n3mc/.memory/fts_punct_cleaned` marker file is created
-   - Running `n3mc --repair` again skips FTS cleaning (full-table scan is avoided due to the marker)
+   - The `meta` row `fts_punct_cleaned` is written again
+   - Running `n3mc --repair` again skips FTS cleaning (full-table scan is avoided due to the key)
 
 7. **Hook integration test**: Verify the following within a Claude Code session:
    1. **Global hook registration is in place** (mandatory gate — see §4 ① "Mandatory automated step"). Run:
@@ -1451,7 +1483,8 @@ n3mc-free/
     ├── test_hooks_encoding.py # Regression tests for surrogate stripping and UTF-8
     ├── test_regressions.py  # Layer 5: Regression tests for the v1.4.0 – v1.6.0 fixes (no model needed)
     ├── test_search_port_2026_11_17.py # Layer 5: Japanese FTS grams, bigram index, skipped system inputs, reply re-rank
-    └── test_review_2026_11_17.py      # Layer 5: chunk length bound, Windows hook paths (no model needed)
+    ├── test_review_2026_11_17.py      # Layer 5: chunk length bound, Windows hook paths (no model needed)
+    └── test_index_meta.py             # Layer 5: meta table, model mismatch notice, --reembed (v1.8.0; no model needed)
 ```
 
 **Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
@@ -1532,6 +1565,7 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 |---|---|
 | `TestFtsQuoting` | Queries containing `\ / # = @ * $ %`, `AND/OR/NOT`, `"`, or control characters do not raise; terms containing symbols are hit; `hybrid_search` continues when `search_fts` raises. **v1.5.0**: terms are joined with `OR` (a sentence-like query hits a record that contains only some of its words); terms under 3 characters (`AI`, `東京`) are dropped and a query of only such terms skips FTS; punctuation in the query splits terms (`「アルファ9」の気温は？` hits `架空の惑星「アルファ9」の気温設定`). **2026-11-17**: at most 40 terms; CJK words of 4+ characters become 3-character grams |
 | `test_search_port_2026_11_17.py` (2026-11-17) | A Japanese sentence without spaces hits a record containing its words; hiragana-only grams are dropped; symbol-only and 2-character queries do not raise; `bigram_text('N3MCの設定')` is `N3MC の設 設定`; `記憶` and `PR` hit through the bigram index (and through `hybrid_search`); a failing bigram search keeps the trigram results; `delete_memory` leaves no bigram row; `--repair` fills the bigram rows of an old DB once (two runs, one row per record); `<agent-message from=...>` and `<system-reminder>` prompts are neither saved nor searched and keep `turn_id`, while a user question starting with `<agent-message` or `<div>` is not skipped; the reply re-rank is off by default, moves the exchange with the closer reply up when on, and returns its input on a DB error |
+| `test_index_meta.py` (v1.8.0) | `init_db` creates `meta`; `/repair` writes `fts_punct_cleaned` / `fts_bigram` / `embed_model` / `embed_dim`; a restored older database (no `meta` keys) next to v1.7.0 marker files gets its bigram index filled; `embed_model` comes from `vec_model.txt` only when vectors exist; a mismatch emits `embed_model_mismatch` and a match clears it; `--reembed` replaces every vector with the configured model's, writes `embed_model`, clears the notice, resumes from `reembed_cursor`, and refuses a model of another dimension without changing anything |
 | `test_review_2026_11_17.py` (2026-11-17) | No chunk is longer than `max_chars` (paragraph and sentence paths, `max_chars` 400 and small values, Japanese text); `chunk_text('x' * 10 + '\n\n' + 'y' * 400)` keeps all 410 letters and returns chunks of at most 400; `is_own_hook` recognizes `C:\Tools\n3mc-hook.exe` and `C:\Tools\n3mc-stop-hook.exe` written with backslashes and no quotes, and `--init` then replaces such an entry instead of adding a second one |
 | `TestVectorFilter` | A search with `since` returns in-range records even if they are outside the global KNN top; falls back to exact computation when `rowid IN` is unavailable |
 | `TestNoSimilarityDedup` | Similar chunks (cos ≥ 0.95) are all saved; exact matches within the same `turn_id` are skipped; exact matches in a different `turn_id` are saved; without `turn_id`, exact matches are skipped globally |

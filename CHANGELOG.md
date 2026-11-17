@@ -6,6 +6,36 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-17
+
+### Design review (2026-11-17, proposal 3)
+
+Applied through the specification (EN and JP) first, then the code and
+tests (`tests/test_index_meta.py`).
+
+#### Changed
+- **How the indexes were built is kept inside the database** (spec §3.5
+  "Index metadata"): a `meta` table holds `embed_model`, `embed_dim`,
+  `embed_model_at`, `fts_punct_cleaned` and `fts_bigram`. Up to 1.7.0 these
+  were marker files next to the database, which the backup procedure
+  (`n3memory.db` + `config.json`) does not save: restoring an older backup
+  on the same PC skipped the bigram fill (older records lost their CJK
+  keyword hits), and a database moved to a new PC never reported a model
+  mismatch. `vec_model.txt` is read once to fill `embed_model`; the other
+  marker files are no longer read.
+- **A model mismatch is a notice** (`embed_model_mismatch`), shown at the
+  top of search output, instead of a line on the server's stderr.
+
+#### Added
+- **`n3mc --reembed`** re-embeds every record with the configured
+  `embed_model`, in resumable batches of 200, and records the model. A model
+  of another dimension is refused without changing anything.
+
+#### Fixed
+- The mismatch warning said "delete `vec_model.txt`, then run `n3mc
+  --repair`", but `--repair` only adds missing vectors: the old vectors
+  stayed and the warning went silent. The notice now points to `--reembed`.
+
 ## [1.7.0] - 2026-11-17
 
 ### Code review (2026-11-17)

@@ -205,12 +205,41 @@ def init_db(conn: sqlite3.Connection) -> None:
             embedding float[768]
         )
     """)
+    # spec §3.5 "Index metadata" (v1.8.0): how the indexes were built, kept
+    # inside the database so that a copied or restored DB carries it.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
     cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()}
     if 'turn_id' in cols:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)"
         )
     conn.commit()
+
+
+def meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Caller commits."""
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def meta_delete(conn: sqlite3.Connection, key: str) -> None:
+    """Caller commits."""
+    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+
+def vec_table_dim(conn: sqlite3.Connection) -> Optional[int]:
+    """Dimension of memories_vec from its CREATE statement."""
+    import re
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'memories_vec'").fetchone()
+    m = re.search(r"float\s*\[\s*(\d+)\s*\]", row[0] if row and row[0] else "")
+    return int(m.group(1)) if m else None
 
 
 def migrate_schema(conn: sqlite3.Connection) -> None:
