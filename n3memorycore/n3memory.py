@@ -1060,12 +1060,113 @@ _srv_code_version: str = ""
 _HOOK_REPAIR_MAX_RECORDS = 200
 
 
+_EMBED_MISMATCH_MSG = (
+    "The stored vectors were made with {recorded}, but config.json sets embed_model to "
+    "{configured}. Search quality is degraded until they are re-made: run n3mc --reembed "
+    "(it re-embeds all {n} records with {configured}), or set embed_model back to {recorded}."
+)
+
+
+def _record_embed_model(conn, model: str) -> None:
+    from .core.database import meta_set, vec_table_dim
+    meta_set(conn, 'embed_model', model)
+    meta_set(conn, 'embed_dim', str(vec_table_dim(conn) or ''))
+    meta_set(conn, 'embed_model_at', datetime.now(timezone.utc).isoformat(timespec='seconds'))
+
+
+def _check_embed_model(conn, current_model: str) -> None:
+    """spec §3.5: fill meta.embed_model once, then compare it with the configured model."""
+    from .core.database import meta_get
+    recorded = meta_get(conn, 'embed_model')
+    if recorded is None:
+        has_vectors = conn.execute("SELECT 1 FROM memories_vec LIMIT 1").fetchone() is not None
+        recorded = current_model
+        legacy = os.path.join(MEMORY_DIR, 'vec_model.txt')
+        if has_vectors and os.path.exists(legacy):
+            try:
+                with open(legacy, 'r', encoding='utf-8') as f:
+                    recorded = f.read().strip() or current_model
+            except OSError:
+                recorded = current_model
+        _record_embed_model(conn, recorded)
+        conn.commit()
+    if recorded != current_model:
+        n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        _notify('embed_model_mismatch', _EMBED_MISMATCH_MSG.format(
+            recorded=recorded, configured=current_model, n=n))
+    else:
+        _clear_notice('embed_model_mismatch')
+
+
+def cmd_reembed(cfg: dict) -> int:
+    """spec §3.5 `--reembed`: re-embed every record with the configured model, in this
+    process, in resumable batches of 200. Returns the exit status."""
+    from .core.database import (get_connection, init_db, migrate_schema, meta_get, meta_set,
+                                meta_delete, serialize_vector, vec_table_dim)
+    from .core.processor import get_model
+    model_name = cfg.get('embed_model') or _DEFAULT_CONFIG['embed_model']
+    _request_shutdown(cfg)          # this folder's server only; restarted by the next CLI call
+    try:
+        model = get_model(model_name)
+        probe = model.encode("passage: probe", normalize_embeddings=True)
+    except Exception as e:
+        print(f"N3MC: --reembed: the model {model_name} could not be loaded: {e}", file=sys.stderr)
+        return 1
+    conn = get_connection(DB_PATH)
+    try:
+        init_db(conn)
+        migrate_schema(conn)
+        table_dim = vec_table_dim(conn)
+        if table_dim is not None and len(probe) != table_dim:
+            print(f"N3MC: --reembed: {model_name} makes {len(probe)}-dimensional vectors but "
+                  f"memories_vec has {table_dim}; a different dimension needs the manual procedure "
+                  "in \u00a73 \"Embeddings\".", file=sys.stderr)
+            return 1
+        cursor = -1
+        if meta_get(conn, 'reembed_model') == model_name:
+            try:
+                cursor = int(meta_get(conn, 'reembed_cursor') or -1)
+            except ValueError:
+                cursor = -1
+        else:
+            meta_set(conn, 'reembed_model', model_name)
+            meta_delete(conn, 'reembed_cursor')
+            conn.commit()
+        total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        done = conn.execute("SELECT COUNT(*) FROM memories WHERE rowid <= ?", (cursor,)).fetchone()[0]
+        while True:
+            rows = conn.execute("SELECT rowid, content FROM memories WHERE rowid > ? "
+                                "ORDER BY rowid LIMIT 200", (cursor,)).fetchall()
+            if not rows:
+                break
+            vecs = model.encode(["passage: " + r[1] for r in rows], normalize_embeddings=True)
+            ids = [r[0] for r in rows]
+            conn.executemany("DELETE FROM memories_vec WHERE rowid = ?", [(i,) for i in ids])
+            conn.executemany("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                             [(i, serialize_vector(list(v))) for i, v in zip(ids, vecs)])
+            cursor = ids[-1]
+            meta_set(conn, 'reembed_cursor', str(cursor))
+            conn.commit()
+            done += len(rows)
+            print(f"Re-embedded {done} / {total}", file=sys.stderr)
+        _record_embed_model(conn, model_name)
+        meta_delete(conn, 'reembed_model')
+        meta_delete(conn, 'reembed_cursor')
+        conn.commit()
+    finally:
+        conn.close()
+    _clear_notice('embed_model_mismatch')
+    print(f"Re-embedded {done} record(s) with {model_name}.", file=sys.stderr)
+    return 0
+
+
 def _repair_db(max_records: Optional[int] = None) -> int:
     """Body of /repair. max_records limits the records changed in this call
     (FTS punctuation cleaning and index repair); None = everything."""
     from .core.database import (
         get_connection, find_unindexed_memories, serialize_vector,
         strip_fts_punctuation, bigram_text, fill_bigram_index,
+        init_db, meta_get, meta_set, vec_table_dim,
     )
     from .core.processor import embed_passage
 
@@ -1077,9 +1178,10 @@ def _repair_db(max_records: Optional[int] = None) -> int:
     conn = get_connection(DB_PATH)
     repaired = 0
     try:
-        # spec §3: FTS punct cleaning — one-time migration with marker
-        marker = os.path.join(MEMORY_DIR, 'fts_punct_cleaned')
-        if not os.path.exists(marker):
+        init_db(conn)   # spec §3.5 (v1.8.0): the meta table of an older DB
+        # spec §3: FTS punct cleaning — one-time migration; key in the meta
+        # table (v1.8.0: was the file .memory/fts_punct_cleaned)
+        if meta_get(conn, 'fts_punct_cleaned') != '1':
             last_rowid = -1
             cleaned_count = 0
             finished = False
@@ -1116,10 +1218,10 @@ def _repair_db(max_records: Optional[int] = None) -> int:
                 if len(rows) < 200:
                     finished = True
                     break
-            # The marker is written only when the migration has finished.
+            # The key is written only when the migration has finished.
             if finished:
-                with open(marker, 'w', encoding='utf-8') as f:
-                    f.write('done')
+                meta_set(conn, 'fts_punct_cleaned', '1')
+                conn.commit()
             if cleaned_count > 0:
                 print(f"FTS punctuation cleaned: {cleaned_count} record(s).", file=sys.stderr)
 
@@ -1127,31 +1229,17 @@ def _repair_db(max_records: Optional[int] = None) -> int:
         # saved before memories_fts_bi existed. New records are indexed by
         # insert_memory, so later calls skip this. Not limited by
         # max_records: it embeds nothing (about 5 s for 18,000 records).
-        bi_marker = os.path.join(MEMORY_DIR, 'fts_bigram_v1')
-        if not os.path.exists(bi_marker):
+        if meta_get(conn, 'fts_bigram') != '1':
             n_bi = fill_bigram_index(conn)
-            with open(bi_marker, 'w', encoding='utf-8') as f:
-                f.write('done')
+            meta_set(conn, 'fts_bigram', '1')
+            conn.commit()
             if n_bi > 0:
                 print(f"FTS bigram index: {n_bi} record(s).", file=sys.stderr)
 
-        # spec §5: vec_model.txt marker — warn if embed model changed
+        # spec §3.5 "Index metadata" (v1.8.0): the model that made the
+        # stored vectors, recorded in the DB; a mismatch is a notice.
         current_model = (_srv_cfg or {}).get('embed_model', 'intfloat/multilingual-e5-base')
-        vec_marker = os.path.join(MEMORY_DIR, 'vec_model.txt')
-        if not os.path.exists(vec_marker):
-            with open(vec_marker, 'w', encoding='utf-8') as f:
-                f.write(current_model)
-        else:
-            with open(vec_marker, 'r', encoding='utf-8') as f:
-                recorded = f.read().strip()
-            if recorded and recorded != current_model:
-                print(
-                    f"Warning: embed_model in config.json ({current_model}) "
-                    f"differs from the model used to build the vector index ({recorded}). "
-                    f"Search quality will degrade until vectors are re-embedded. "
-                    f"To rebuild: delete '{vec_marker}', then run `n3mc --repair`.",
-                    file=sys.stderr,
-                )
+        _check_embed_model(conn, current_model)
 
         # spec §3.5: batch 200 at a time; OFFSET always 0 (repaired records
         # disappear from WHERE clause automatically)
@@ -2370,6 +2458,8 @@ def main() -> None:
     grp.add_argument('--buffer', metavar='TEXT', nargs='?', const='-')
     grp.add_argument('--search', metavar='QUERY')
     grp.add_argument('--repair', action='store_true')
+    grp.add_argument('--reembed', action='store_true',
+                     help='Re-embed every record with the configured embed_model')
     grp.add_argument('--list',   action='store_true')
     grp.add_argument('--recall-thread', metavar='TURN_ID', dest='recall_thread')
     grp.add_argument('--show-turn', metavar='TURN_ID', dest='show_turn',
@@ -2413,6 +2503,8 @@ def main() -> None:
         cmd_search(args.search, cfg, since=since, until=until)
     elif args.repair:
         cmd_repair(cfg)
+    elif args.reembed:
+        sys.exit(cmd_reembed(cfg))
     elif args.list:
         cmd_list(cfg, since=since, until=until, fmt=args.fmt)
     elif args.recall_thread:

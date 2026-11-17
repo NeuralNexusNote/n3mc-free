@@ -130,11 +130,13 @@ class TestBigramIndex:
             conn.commit()
         finally:
             conn.close()
-        marker = os.path.join(n3memory.MEMORY_DIR, 'fts_bigram_v1')
-        assert not os.path.exists(marker)
         n3memory._repair_db()
         n3memory._repair_db()
-        assert os.path.exists(marker)
+        conn = db.get_connection(n3memory.DB_PATH)
+        try:   # v1.8.0: the key lives in the meta table (spec §3.5)
+            assert db.meta_get(conn, 'fts_bigram') == '1'
+        finally:
+            conn.close()
         conn = db.get_connection(n3memory.DB_PATH)
         try:
             assert conn.execute("SELECT COUNT(*) FROM memories_fts_bi").fetchone()[0] == 2

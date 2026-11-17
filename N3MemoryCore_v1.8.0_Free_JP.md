@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.7.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.8.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -121,11 +121,11 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.7.0_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.8.0_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
-│   ├── n3memory.py              # メイン CLI モジュール（--init / --buffer / --search / --list / --recall-thread / --show-turn / --stop / --repair / --hook-submit / --save-claude-turn / --run-server）+ FastAPI アプリ
+│   ├── n3memory.py              # メイン CLI モジュール（--init / --buffer / --search / --list / --recall-thread / --show-turn / --stop / --repair / --reembed / --hook-submit / --save-claude-turn / --run-server）+ FastAPI アプリ
 │   ├── n3mc_hook.py             # UserPromptSubmit フックエントリ: audit.log 書き込み → --hook-submit 呼び出し
 │   ├── n3mc_stop_hook.py        # Stop フックエントリ: audit.log 書き込み → --save-claude-turn → --stop 呼び出し
 │   └── core/
@@ -161,8 +161,9 @@ n3mc-free/                       # リポジトリルート
     ├── notices.json                # 人が対応すべき知らせ（ポートの重なり、読めない config.json 等。§3「知らせ」）
     ├── .memory_context_retired     # 旧 memory_context.md を片付け済みであることを示すマーカー（§4 --stop）
     ├── turn_id_<session>.txt       # UserPromptSubmit と Stop フック間で Q-A pairing をハンドオフ（Claude Code の session_id ごと。session_id がないときは turn_id.txt。30 日より古いファイルは --stop が削除する）
-    ├── fts_punct_cleaned           # FTS5 句読点クリーニングの一回限りマイグレーションマーカー（--repair が touch）
-    ├── fts_bigram_v1               # CJK バイグラム索引を一度だけ埋めた印（--repair が touch。2026-11-17）
+    ├── vec_model.txt               # v1.7.0 以前：モデルの印。meta.embed_model を埋めるために一度だけ読む（§3.5）。書き込まない
+    ├── fts_punct_cleaned           # v1.7.0 以前：印のファイル。もう読まない（meta 表、§3.5）
+    ├── fts_bigram_v1               # v1.7.0 以前：印のファイル。もう読まない（meta 表、§3.5）
     └── vec_e5v2_migrated           # ベクトル再インデックスの一回限りマイグレーションマーカー（--repair が touch）
 ```
 
@@ -237,10 +238,10 @@ text_to_embed = "query: " + keyword
 **アップグレード手順（同一次元のモデル切り替え）**:
 1. `~/.n3mc/config.json` を編集 → `embed_model` を新モデル名に変更。
 2. サーバー再起動（PID ファイルのプロセスを kill するか、次回 CLI 呼び出しで自動的に再起動される）。
-3. 次回 `n3mc --repair` 呼び出しで `~/.n3mc/.memory/vec_model.txt` マーカーによりモデル不一致が検出され、警告が出力される。ディスク上のベクトルは旧モデルのままなので、再生成するまで検索品質は劣化する。
-4. 強制全再埋め込み: `~/.n3mc/.memory/vec_model.txt` を削除し、対象レコードの `memories_vec` 行を削除（または vec テーブルをまるごと再作成）してから `n3mc --repair` を実行 → 新モデルでベクトルが再構築される。
+3. 次回の `/repair` がモデルの食い違いを見つけ（`meta.embed_model`、§3.5「索引の情報」）、通知 `embed_model_mismatch` を出す。保存されたベクトルは旧モデルのままなので、作り直すまで検索品質は劣化する。
+4. `n3mc --reembed` を実行する：すべての記録を新しいモデルで埋め込み直す（途中から再開できる。§3.5）。印を消して `n3mc --repair` を実行しても、ベクトルは作り直され**ない**：`--repair` は欠けたベクトルを足すだけである。
 
-**⚠️ 異なる次元のモデル切り替え**: リファレンス実装では手動 SQL なしには非対応。`memories_vec` テーブルを drop → 新次元で再作成 → `vec_model.txt` を削除 → `n3mc --repair`。
+**⚠️ 異なる次元のモデル切り替え**: リファレンス実装では手動 SQL なしには非対応。`memories_vec` テーブルを drop → 新次元で再作成 → `meta` の `embed_model`・`embed_dim`・`embed_model_at` の行を削除 → `n3mc --reembed`。（`--reembed` だけでは、表と次元の違うモデルを受け付けない。）
 
 ### モジュール間インポート
 `sys.path` ハックは使用せず、パッケージ相対インポートを使用すること。パッケージ内部:
@@ -573,14 +574,14 @@ def _build_fts_query(query: str) -> str:
 - `insert_memory` が両方の表に書く。**消す道すべて**で、両方の表から消す（上の DELETE）。
 - 質問の側（`build_bigram_query`）は、質問のバイグラムの語を引用符で囲んで OR でつなぐ。ひらがなだけの語は、ほかの語が残るなら捨てる。CJK でない 1 文字の語は捨てる。
 - `hybrid_search` は、いつも両方の表（`search_fts` と `search_fts_bigram`）を探し、「keyword_relevance」に書いたとおりに合わせる。バイグラムの検索が失敗したら、trigram の結果だけで続ける。
-- 表ができる前に保存された記録は、`--repair` が一度だけ索引する（印 `.memory/fts_bigram_v1`。埋め込みを作らないので `max_records` で制限しない）。
+- 表ができる前に保存された記録は、`--repair` が一度だけ索引する（`meta` 表のキー `fts_bigram`、§3.5。埋め込みを作らないので `max_records` で制限しない）。
 - 理由（N3MC-Pro で測定、2026-11-16、ラベル付きの質問 138 問）: バイグラムの索引を外すと MRR が 0.046 下がった（95% 区間 −0.089〜−0.007）。
 
 > **⚠️ 語の引用符囲みは必須（v1.4.0）**: 句読点除去のあとも `\ / # = @ * $ % + ^ ~ |` などの ASCII 記号や、単独の `AND` / `OR` / `NOT` / `NEAR` が残る。これをそのまま `MATCH` に渡すと FTS5 の文法エラー（`fts5: syntax error near "\"` 等）になり、`/search` が HTTP 500 を返して記憶の差し込みが「memory search unavailable」になる（実測で質問の約 12% で発生）。各語を FTS5 の文字列として `"..."` で囲めば、記号も演算子も文字どおりに照合される。（v1.5.0 からは引用符で囲んだ語を `OR` でつなぐ。語の間に書く `OR` は引用符の外にあるので演算子になり、語の中にあるユーザーの `OR` は文字どおりのまま。）
 >
 > **例外時も検索を続ける**: `hybrid_search` は `search_fts` の例外を捕まえ、キーワードの結果なし（ベクトル検索だけ）で続行する。FTS の失敗で検索全体を失敗させてはならない。
 
-`--repair` 実行時に、既存 FTS レコードのうち句読点付きで登録されたものを検出し、句読点除去済みテキストで再登録せよ。この FTS クリーニングは**一度きりのマイグレーション**として実行し、完了後にマーカーファイル（`.memory/fts_punct_cleaned`）を作成せよ。マーカーが存在する場合はスキップし、毎セッション開始時の全件スキャンを回避すること。
+`--repair` 実行時に、既存 FTS レコードのうち句読点付きで登録されたものを検出し、句読点除去済みテキストで再登録せよ。この FTS クリーニングは**一度きりのマイグレーション**として実行し、完了後に `meta` 表のキー `fts_punct_cleaned` を書け（§3.5「索引の情報」）。キーが存在する場合はスキップし、毎セッション開始時の全件スキャンを回避すること。
 
 **FTSのみヒットした場合のスコア**: ベクトル検索にはヒットせず FTS のみにヒットしたレコードは、`cos_sim = 0.0` として統合スコアを計算し、結果に含めよ。最終スコアは最大でも `0.3 × time_decay × b_session` だが、ランキング対象から除外してはならない。`min_score`（0.2）と相対足切りは `filter_score`（`time_decay` と `b_session` を**掛けない**スコア、下記）で判定するので、キーワードのみのヒット（`filter_score` は最大 0.3）は、`keyword_relevance` が 0.67 以上なら、どれほど古くても、どのセッションの記録でも残る。
 
@@ -752,6 +753,37 @@ db_path = base_dir + "\\data\\memory.db" # NG
 **フックからの呼び出しごとの上限（v1.5.0）**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。
 
 ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。
+
+### 索引の情報（`meta` 表）と `--reembed`（v1.8.0）
+
+`n3memory.db` の索引がどう作られたかを示す情報は、**データベースの中**の、`init_db` が作る表に持つ：
+
+```sql
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+```
+
+| キー | 値 | 書くもの |
+|---|---|---|
+| `embed_model` | `memories_vec` のベクトルを作ったモデルの名前 | `/repair`（初回）と `--reembed` |
+| `embed_dim` | `memories_vec` の次元（`768`） | 同上 |
+| `embed_model_at` | `embed_model` を書いた時刻（UTC の ISO 8601） | 同上 |
+| `fts_punct_cleaned` | FTS の句読点クリーニングが終わったら `1` | `/repair` |
+| `fts_bigram` | 古い行の `memories_fts_bi` を埋め終わったら `1` | `/repair` |
+| `reembed_model`、`reembed_cursor` | 終わっていない `--reembed` の進み具合 | `--reembed`（終わったら消す） |
+
+- **`/repair`** は、一度きりの処理（FTS の句読点クリーニング、バイグラムの埋め込み）を、そのキーが**データベースの中に**ないときに行い、処理が終わったときだけキーを書く。どちらも何度行っても結果は同じなので、すでに済んだデータベースでもう一度行っても、1 回の走査で済む。
+- **`embed_model` がないとき**：`memories_vec` に行がなければ、設定の `embed_model`。そうでなければ、`.memory/vec_model.txt` があって空でなければその内容（v1.7.0 以前の印）。それもなければ、設定の `embed_model`。このファイルはこのためだけに読み、書き込みも削除もしない。
+- **モデルの食い違い**：`meta.embed_model` が設定の `embed_model` と違うとき、`/repair` は通知 `embed_model_mismatch` を出す（§3「通知」）：`The stored vectors were made with <recorded>, but config.json sets embed_model to <configured>. Search quality is degraded until they are re-made: run n3mc --reembed (it re-embeds all <N> records with <configured>), or set embed_model back to <recorded>.` 一致すれば通知を消す。
+- **`n3mc --reembed`** は、すべての記録を設定の `embed_model` で埋め込み直す。**CLI のプロセスの中で**行う（数分かかることがあり、HTTP の呼び出しでは時間切れになる）：
+  1. このフォルダーのサーバーを止める（古いサーバーと同じ `/shutdown` の要求、§3「サーバーの起動」）。次の CLI の呼び出しで、設定のモデルで起動し直される。ほかのフォルダーのサーバーには触れない。
+  2. 設定のモデルを読み込み、試しの文を 1 つ埋め込む。その次元が `memories_vec` の次元と違えば、`N3MC: --reembed: <model> makes <d>-dimensional vectors but memories_vec has <D>; a different dimension needs the manual procedure in §3 "Embeddings".` を出し、何も変えずに終了コード 1 で終わる。
+  3. 再開の位置：`meta.reembed_model` が設定のモデルと同じなら、`meta.reembed_cursor`（`memories.rowid`）の次から始める。違えば最初から始め、`reembed_model` を書く。
+  4. `rowid` の順に 200 行ずつ：その行を埋め込み（`"passage: " + content`、正規化）、1 つのトランザクションで、その行を `memories_vec` から消し、新しいベクトルを入れ、`reembed_cursor` を最後の rowid にする。1 回ごとに stderr に `Re-embedded <done> / <total>` を出す。
+  5. 行が残っていなければ：`embed_model`、`embed_dim`、`embed_model_at` を書き、`reembed_model` と `reembed_cursor` を消し、通知 `embed_model_mismatch` を消し、`Re-embedded <N> record(s) with <model>.` を出す。
+  - 途中で止まっても（Ctrl+C、異常終了）、終わった回の分は残る。もう一度 `--reembed` を実行すれば、続きから行う。実行中に保存された行は、起動し直したサーバーが設定のモデルで埋め込む。
+  - `--reembed` は自動許可の規則（§4 ②）に入れない：人が実行するものである。
+
+> **理由（v1.8.0、2026-11-17 の設計レビュー、提案 3）**：v1.7.0 までは、これらの情報をデータベースの隣の印のファイル（`vec_model.txt`、`fts_punct_cleaned`、`fts_bigram_v1`）に置いていた。しかしバックアップの手順で保存するのは `n3memory.db` と `config.json` だけである。同じ PC で古いバックアップを戻すと新しい印が残るので、バイグラムの埋め込みが行われず、古い記録の CJK のキーワード検索が当たらなくなった。別のモデルで作ったデータベースを新しい PC に移すと、設定のモデル名が新しい `vec_model.txt` に書かれ、食い違いが知らされなかった。警告も「`vec_model.txt` を消して `n3mc --repair` を実行する」と案内していたが、`--repair` は欠けたベクトルを足すだけなので、古いベクトルは残り、警告だけが消えた。
 
 ---
 
@@ -1274,7 +1306,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【実装仕様】_load_vec_extension 冪等性**: 同一コネクションで sqlite-vec 拡張を2回ロードしても副作用はない。拡張がすでにロード済みの場合、ロード呼び出しは "already" または "duplicate" を含む例外を発生させる。そのような例外はキャッチして続行し、それ以外の例外は再スローする。
 - **【実装仕様】delete_memory のトランザクション化**: `delete_memory` はまず `_load_vec_extension(conn)` を呼び出し、次に3件の DELETE（memories_fts・memories_vec・memories）を try/except で囲み、失敗時は `conn.rollback()` を実行する。3つのインデックスがすべて成功するか、すべてロールバックされる。
 - **【実装仕様】lifespan 起動**: 非推奨の `@app.on_event("startup")` の代わりに、FastAPI の `@asynccontextmanager` lifespan パターン（`async def lifespan(app: FastAPI)` に `yield` を含め、`FastAPI(lifespan=lifespan)` に渡す）を使用する。
-- **【実装仕様】ベクトルモデルマーカー**: 各 `--repair` 呼び出し時、サーバーは現在有効な埋め込みモデル名を `~/.n3mc/.memory/vec_model.txt` に書き込む（初回時に作成）。既存ファイルの内容が `cfg['embed_model']` と異なる場合は stderr に警告を出力する — ディスク上のベクトルは現在の設定とは異なるモデルで生成されており、再生成するまで類似度検索が劣化する。リファレンス実装は再埋め込みを自動起動しない（大規模 DB では数分〜数十分かかる可能性があるため）。再埋め込みの実行はユーザーの判断に委ねられる（手動アップグレード手順は §3「言語特化モデルへの切り替え」を参照）。
+- **【実装仕様】ベクトルモデルの記録**: 各 `/repair` で、サーバーは `meta.embed_model`（初回に書く、§3.5「索引の情報」）と `cfg['embed_model']` を比べ、通知 `embed_model_mismatch` を出すか消す。自分からは埋め込み直さない（大規模 DB では数分〜数十分かかる可能性があるため）。通知が、`n3mc --reembed` を実行するよう利用者に伝える。
 
 ### Q-A ペアリング契約
 同一対話ターンで記録された [user] / [claude i/N] の各行は、共通の `turn_id`（UUID4）を共有します。これにより、同じ質問が後日再出現した場合に、ばらばらのチャンクではなく完全な前回のやり取りを復元して提示できます。
@@ -1363,7 +1395,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.7.0 Evidence Report]）
+## 6. 自律評価（[N3MC v1.8.0 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **実装完了の定義**: 以下のテスト 1〜7 を自律実施 → `n3mc --init` 実行（「次のセッションから保存できます。」が表示される）→ 満点（⭐⭐⭐⭐⭐）で報告するまでが「実装完了」。テスト 8〜10 はセッション中の実動作（`--search` 実行・フック発火・会話ターン）で自動的に確認される。3ステップすべてが完了して初めて実装完了とみなす。
@@ -1393,10 +1425,10 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 5. **FTS 句読点耐性テスト**: 括弧・句読点を含むテキスト（例: `架空の惑星「アルファ9」の気温設定`）を `--buffer` で保存後、括弧を含まないクエリ（例: `アルファ9の気温`）で `--search` を実行し、**上位3件以内にヒット**することを合格基準とする。FTS5 trigram のインデックスに句読点除去が適用されていること、およびクエリ側でも同じ除去が行われていることの両方を検証するテストである。
    - 加えて、記号を含むクエリ（例: `C:\Users\test #tag = @a * $b % AND OR NOT "q"`）で `--search` を実行し、**エラーにならず**（stdout に `memory search unavailable` が出ない）結果が返ることを確認せよ（§3「語の引用符囲みは必須」）。
 
-6. **--repair FTS マイグレーションテスト**: `~/.n3mc/.memory/fts_punct_cleaned` マーカーファイルを削除した状態で `n3mc --repair` を実行し、以下を確認せよ:
+6. **--repair FTS マイグレーションテスト**: `meta` 表の `fts_punct_cleaned` の行を消した状態で（`sqlite3 ~/.n3mc/.memory/n3memory.db "DELETE FROM meta WHERE key='fts_punct_cleaned'"`）`n3mc --repair` を実行し、以下を確認せよ:
    - FTS クリーニングが実行されること（句読点付きレコードがあれば件数が報告される）
-   - `~/.n3mc/.memory/fts_punct_cleaned` マーカーファイルが生成されること
-   - 再度 `n3mc --repair` を実行しても FTS クリーニングがスキップされること（マーカーにより全件スキャンが回避される）
+   - `meta` 表の `fts_punct_cleaned` の行がまた書かれること
+   - 再度 `n3mc --repair` を実行しても FTS クリーニングがスキップされること（キーにより全件スキャンが回避される）
 
 7. **フック統合テスト**: Claude Code のセッション内で以下を確認せよ。
    1. **グローバルフック登録の存在確認**（必須ゲート — §4 ①「必須・自動実行ステップ」参照）。以下を実行:
@@ -1447,7 +1479,8 @@ n3mc-free/
     ├── test_hooks_encoding.py # サロゲート除去・UTF-8 の回帰テスト
     ├── test_regressions.py  # Layer 5: v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要）
     ├── test_search_port_2026_11_17.py # Layer 5: 日本語の FTS、バイグラムの索引、システムの入力を飛ばす、返答との近さの並べ直し
-    └── test_review_2026_11_17.py      # Layer 5: チャンクの長さの上限、Windows のフックのパス（モデル不要）
+    ├── test_review_2026_11_17.py      # Layer 5: チャンクの長さの上限、Windows のフックのパス（モデル不要）
+    └── test_index_meta.py             # Layer 5: meta 表、モデルの食い違いの通知、--reembed（v1.8.0。モデル不要）
 ```
 
 **本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。
@@ -1528,6 +1561,7 @@ python -m pytest tests/ -v
 |---|---|
 | `TestFtsQuoting` | `\ / # = @ * $ %`・`AND/OR/NOT`・`"`・制御文字を含むクエリで例外にならない、記号を含む語がヒットする、`search_fts` が例外を出しても `hybrid_search` が続く。**v1.5.0**: 語を `OR` でつなぐ（文のようなクエリが、その語の一部だけを含む記録にヒットする）、3 文字未満の語（`AI`、`東京`）は捨て、そういう語だけのクエリは FTS を飛ばす、クエリの句読点で語が分かれる（`「アルファ9」の気温は？` が `架空の惑星「アルファ9」の気温設定` にヒットする）。**2026-11-17**: 最大 40 語、CJK を含む 4 文字以上の語は 3 文字ずつに分ける |
 | `test_search_port_2026_11_17.py`（2026-11-17） | 空白のない日本語の文が、その語を含む記録に当たる。ひらがなだけの 3 文字を捨てる。記号だけ・2 文字だけの質問で例外にならない。`bigram_text('N3MCの設定')` が `N3MC の設 設定`。`記憶` と `PR` がバイグラムの索引で（`hybrid_search` でも）当たる。バイグラムの検索が失敗しても trigram の結果が残る。`delete_memory` のあとバイグラムの行が残らない。`--repair` が古い DB のバイグラムの行を 1 回だけ埋める（2 回動かしても 1 記録 1 行）。`<agent-message from=...>` と `<system-reminder>` の入力は保存も検索もせず `turn_id` を変えない。`<agent-message` や `<div>` で始まるユーザーの質問は飛ばさない。返答との近さの並べ直しは既定で off、on なら返答の近い往復が上に来る、DB のエラーでは入力をそのまま返す |
+| `test_index_meta.py`（v1.8.0） | `init_db` が `meta` を作る。`/repair` が `fts_punct_cleaned` / `fts_bigram` / `embed_model` / `embed_dim` を書く。v1.7.0 の印のファイルの隣に戻した古いデータベース（`meta` のキーなし）でバイグラム索引が埋まる。`embed_model` を `vec_model.txt` から取るのはベクトルがあるときだけ。食い違いで `embed_model_mismatch` が出て、一致で消える。`--reembed` がすべてのベクトルを設定のモデルのものに替え、`embed_model` を書き、通知を消し、`reembed_cursor` から再開し、次元の違うモデルは何も変えずに断る |
 | `test_review_2026_11_17.py`（2026-11-17） | どのチャンクも `max_chars` を超えない（段落と文の経路、`max_chars` が 400 と小さい値、日本語の文）。`chunk_text('x' * 10 + '\n\n' + 'y' * 400)` は 410 個の文字（`x` と `y`）をすべて残し、400 字以下のチャンクを返す。`is_own_hook` は、引用符なしで `\` 区切りの `C:\Tools\n3mc-hook.exe` と `C:\Tools\n3mc-stop-hook.exe` を自分のフックと認識し、`--init` はそのエントリを足さずに置き換える |
 | `TestVectorFilter` | `since` 付きの検索で範囲内の記録が KNN の上位外にあっても返る、`rowid IN` が使えないときに全件計算に切り替わる |
 | `TestNoSimilarityDedup` | 似た分割（cos ≥ 0.95）がすべて保存される、同じ `turn_id` の完全一致は飛ばす、別の `turn_id` の完全一致は保存する、`turn_id` なしは全体で完全一致を飛ばす |
