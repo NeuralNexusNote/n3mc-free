@@ -162,7 +162,11 @@ def _merge_chunks(parts: list, max_chars: int, overlap: int, sep: str) -> list:
             chunks.extend(sub)
         elif current and len(current) + len(sep) + len(part) > max_chars:
             chunks.append(current)
-            tail = current[-overlap:] if overlap else ""
+            # spec §5 "Length bound" (2026-11-17): the tail, the separator and
+            # the part together stay within max_chars; shorten the tail to fit.
+            room = max_chars - len(sep) - len(part)
+            keep = min(overlap, room) if overlap else 0
+            tail = current[-keep:] if keep > 0 else ""
             current = (tail + sep + part) if tail else part
         else:
             current = (current + sep + part) if current else part
