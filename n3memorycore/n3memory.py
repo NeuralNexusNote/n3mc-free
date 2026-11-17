@@ -30,7 +30,7 @@ from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FI
 from .paths import TURN_ID_FILE, CONTEXT_FILE, CONTEXT_RETIRED_MARKER
 from .paths import SERVER_LOG, SERVER_START_FAILED_MARKER
 from .core.database import (
-    get_connection, init_db, migrate_schema, insert_memory,
+    get_connection, init_db, migrate_schema, insert_memory, insert_memory_once,
     check_exact_duplicate, search_vector, find_unindexed_memories,
     strip_fts_punctuation, serialize_vector,
 )
@@ -899,7 +899,7 @@ def _buffer_direct(
 
         before = count_memories(conn)
         ts = datetime.now(timezone.utc).isoformat()
-        insert_memory(
+        rowid = insert_memory_once(
             conn, str(uuid7()), content, ts,
             owner_id=cfg['owner_id'],
             local_id=cfg.get('local_id'),
@@ -907,6 +907,8 @@ def _buffer_direct(
             session_id=session_id or _CLI_SESSION_ID,
             turn_id=turn_id,
         )
+        if rowid is None:
+            return                      # spec §5.4 (R04): saved meanwhile
         if count_memories(conn) == before:
             raise RuntimeError("record count did not change after INSERT")
     finally:
@@ -1393,7 +1395,7 @@ try:
     def ep_buffer(req: BufferRequest):
         # Looked up at call time so tests can patch processor.embed_passage.
         from .core.database import (
-            get_connection, check_exact_duplicate, insert_memory, count_memories,
+            get_connection, check_exact_duplicate, insert_memory, insert_memory_once, count_memories,
         )
         from .core.processor import embed_passage, purify_text
         from uuid_extensions import uuid7
@@ -1422,7 +1424,7 @@ try:
 
             before = count_memories(conn)
             ts = datetime.now(timezone.utc).isoformat()
-            insert_memory(
+            rowid = insert_memory_once(
                 conn, str(uuid7()), content, ts,
                 owner_id=_srv_cfg['owner_id'],
                 embedding=vec,
@@ -1431,6 +1433,8 @@ try:
                 session_id=sess,
                 turn_id=tid,
             )
+            if rowid is None:               # spec §5.4 (R04): saved meanwhile
+                return {'status': 'skipped', 'count': 0, 'reason': 'exact_duplicate'}
             if count_memories(conn) == before:
                 # spec §5.4: record count unchanged after INSERT → fatal
                 return {'status': 'error',

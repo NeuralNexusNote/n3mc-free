@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.8.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.8.1 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -121,7 +121,7 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.8.0_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.8.1_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
@@ -269,7 +269,7 @@ from .database import (
 # n3memorycore/n3memory.py
 from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE, claude_paths
 from .core.database import (
-    get_connection, init_db, migrate_schema, insert_memory,
+    get_connection, init_db, migrate_schema, insert_memory, insert_memory_once,
     check_exact_duplicate, search_vector, find_unindexed_memories,
     strip_fts_punctuation, serialize_vector,
 )
@@ -1299,6 +1299,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Customization] Language localization**: Not applicable. Skip patterns (`_SKIP_PATTERNS`) have been REMOVED in favor of the complete-recording contract; there is nothing language-specific to localize in the hook filter layer.
 - **[Implementation Specs] Deduplication & HTTP-failure fallback**:
   - Saving is skipped **only for exactly identical text** (`check_exact_duplicate(conn, content, turn_id=...)`). With a `turn_id`, compare **only within the same `turn_id`**. Without a `turn_id` (manual `--buffer`), compare across all records. The same rule applies to both `/buffer` and `_buffer_direct`.
+  - **Checked again inside the write (second review of 2026-11-17, R04)**: the check above runs before the embedding, so a duplicate costs no model call. Two saves of the same text for the same turn can still arrive at once (a hook retried after a timeout, `/buffer` and `_buffer_direct` together) and both pass it. So every save path (`/buffer`, `_buffer_direct`) writes through `insert_memory_once(conn, id, content, timestamp, owner_id, turn_id=..., **the other insert_memory arguments)` in `core/database.py`: commit any open transaction, `BEGIN IMMEDIATE` (one writer at a time; it waits up to the connection's busy timeout), run `check_exact_duplicate` again, then either roll back and return `None` — reported like the first check (`/buffer`: `{"status": "skipped", "count": 0, "reason": "exact_duplicate"}`) — or call `insert_memory` (which commits) and return its rowid. (Until then two such saves both wrote a row: reproduced with two threads.)
   - **No similarity-based (cos_sim) deduplication is performed (removed in v1.4.0).** v1.3.x discarded a new record whenever an existing record had cos_sim ≥ 0.95. With multilingual-e5, chunks of a long, uniformly formatted reply, or the new and old versions of an almost identical settings text, score around 0.95, so "a new version of the same content" cannot be distinguished from "different content that looks alike". As a result, saving a settings text of about 2,000 characters with 12 items could lose one of its chunks, and recreating the settings could drop parts of the new version — breaking the Complete-Recording Contract. To prefer the newer version, handle it in search ordering instead of deleting (§5 "Search Result Filtering and Ordering").
   - **The reason for not comparing across all records** is that unchanged chunks of recreated settings are exactly identical to the old version, so comparing across all records would leave holes in the new version's exchange.
   - On HTTP POST failure to the embedding server (server stopped, timeout, or non-2xx): the write falls back to `_buffer_direct()`, which inserts the record directly into SQLite without an embedding vector. The missing vec-index entry is repaired on the next `--repair` call. **Silent drops are forbidden**: every failure path either succeeds via `_buffer_direct` or emits a message to stderr. Combined with the Step 0 audit log, this guarantees that no user message, and no Claude response that reaches a hook, is lost. A Claude response reaches a hook through the Stop hook or, when Stop did not run, through the next prompt's transcript lookup (§4.5); a response after which neither hook runs (e.g. the last reply before Claude Code is closed while Stop is skipped) is not saved.
@@ -1397,7 +1398,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.8.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.8.1 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
@@ -1510,7 +1511,7 @@ python -m pytest tests/ -v
 | `TestSchema` | `tables_created`, `migrate_idempotent`, `add_missing_columns`, `fts_tokenizer_is_trigram`, `migrate_tokenizer_to_trigram` | Schema creation & migration (incl. `session_id` / `turn_id`) |
 | `TestInsertAndRetrieve` | `insert_count`, `three_table_consistency`, `insert_without_embedding`, `rowid_returned` | CRUD & 3-table consistency |
 | `TestDelete` | `delete_three_tables`, `delete_nonexistent` | Transactional delete |
-| `TestDedup` | `exact_duplicate_detected`, `no_false_positive` | Exact dedup |
+| `TestDedup` | `exact_duplicate_detected`, `no_false_positive`, `concurrent_same_turn_saved_once` (two threads with a barrier call the `/buffer` handler with the same text and `turn_id`: one row, one `ok` and one `exact_duplicate`; the same text with another `turn_id` is still saved; R04) | Exact dedup |
 | `TestUnindexed` | `vec_missing_detected`, `all_indexed` | Repair detection |
 | `TestFTS` | `punctuation_removal`, `short_query_skipped`, `basic_search`, `punctuation_tolerance`, `max_terms_limit` | FTS5 tokenization |
 | `TestVectorSearch` | `vector_search_results`, `empty_db_vector_search` | KNN search |
