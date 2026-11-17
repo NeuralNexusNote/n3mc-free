@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.6.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.7.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -121,7 +121,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.6.0_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.7.0_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -873,6 +873,11 @@ OURS = {  # イベント -> (エントリポイント名, モジュール名)
 }
 
 def _tokens(command: str) -> list:
+    # 先に "\" を "/" に置き換える。posix の shlex は、引用符の外の "\" を
+    # エスケープとして消すので、C:\Tools\n3mc-hook.exe は C:Toolsn3mc-hook.exe
+    # になり、自分のフックだと分からなかった(2026-11-17 のレビュー)。
+    # トークンは比べるだけで、実行はしない。
+    command = command.replace("\\", "/")
     try:
         return shlex.split(command, posix=True)
     except ValueError:
@@ -1215,6 +1220,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 1. すべてのユーザー発言、およびすべての Claude 回答は**一字一句、切り捨てなく**記録される。
 2. 長文は `chunk_text`（max_chars=400、overlap=40、段落→文→ハード窓の優先順位）で重複付きチャンクに分割される。各チャンクは単一なら `[user]` / `[claude]`、複数なら `[user i/N]` / `[claude i/N]` とタグ付けされる。
    - **文の終わり（v1.5.0）**: 文は、`.` `!` `?` のあとに空白が続くところ、**または** `。` `！` `？` のところ（空白は不要）で終わる。v1.4.0 は ASCII の記号しか知らなかったので、空行のない日本語の文章は 400 字のハード窓まで落ち、文の途中で切られていた。
+   - **長さの上限（2026-11-17）**: どのチャンクも、重なりと区切りを含めて `max_chars` 字を超えない。前のチャンクの末尾 40 字、区切り、次の部分を足すと `max_chars` を超えるときは、末尾を収まる長さまで縮める（部分だけでチャンクが埋まるときは末尾を付けず、区切りも付けない）。`max_chars` より長い部分はハード窓に回し、その窓も `max_chars` 字以下にする。理由: 2026-11-17 まで、末尾を確かめずに足していたので、`chunk_text('x' * 10 + '\n\n' + 'y' * 400)` が 412 字のチャンクを返していた。1 字がおよそ 1 トークンになる日本語では、チャンクが埋め込みモデルの入力上限（512 トークン）に近づき、超えた部分は埋め込まれない。
    - **「一字一句」の範囲**: メッセージのすべての文字が、順番どおりにどれかのチャンクに入る。チャンクの境目はバイト単位で正確ではない: 段落は前後の空白を除いて 1 つの空行（`\n\n`）でつなぎ直し、文は 1 つの空白でつなぎ、隣り合うチャンクは最大 40 字の重なりを共有する。そのため、チャンクをつなげても段落や文の間の元の空白は再現されない。生の入力は `audit.log` に残る。
 3. **長さフィルタなし、スキップパターンフィルタなし**（従来の「ok / yes / thanks」等の無言ドロップは廃止）。**複数行コードブロックは文書設計に従い `[code omitted]` に置換される**（チャンク分割の前にメッセージ**全体**に 1 回かける — §5.4）——N3MemoryCore は会話テキストを記録する製品であり、ソースコードは記録対象外。これが唯一の文書化された例外で、会話記録のみが対象。インラインコード（`...`）はそのまま保持。
 4. `~/.n3mc/.memory/audit.log` に追記専用 JSONL の監査ログを書き込む。これは他のどの処理よりも先に実行されるため、失敗しようがない最後の砦。すべてのフック呼び出し（UserPromptSubmit + Stop）は 1 件の JSON レコード `{"ts", "hook", "raw", "payload"}` を残す。
@@ -1357,7 +1363,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.6.0 Evidence Report]）
+## 6. 自律評価（[N3MC v1.7.0 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **実装完了の定義**: 以下のテスト 1〜7 を自律実施 → `n3mc --init` 実行（「次のセッションから保存できます。」が表示される）→ 満点（⭐⭐⭐⭐⭐）で報告するまでが「実装完了」。テスト 8〜10 はセッション中の実動作（`--search` 実行・フック発火・会話ターン）で自動的に確認される。3ステップすべてが完了して初めて実装完了とみなす。
@@ -1424,7 +1430,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 >
 > **前提**: `pip install pytest httpx`
 >
-> **Embedding モデル**: Embedding モデルを必要とするテスト（`test_processor.py::TestEmbedding`、`test_api.py`）は session スコープのフィクスチャでモデルを1回ロード（約5秒）。Layer 1 テストは決定論的なダミーベクトルを使用し、モデル依存を回避。
+> **Embedding モデル**: Embedding モデルを必要とするテスト（`test_processor.py::TestEmbedding`、`test_api.py`）は session スコープのフィクスチャでモデルを1回ロード（約5秒）。`test_api.py` のテストは、どれもモデルが要る。`client` フィクスチャが、最初のテストの前にモデルを読み込むからである。`-k "not TestEmbedding"` では、これを飛ばせない。ほかのテストは、モデルなしで動く（2026-11-17、空のモデルキャッシュと `HF_HUB_OFFLINE=1` で確認）。Layer 1 テストは決定論的なダミーベクトルを使用し、モデル依存を回避。
 
 ### ディレクトリ構成
 
@@ -1440,7 +1446,8 @@ n3mc-free/
     ├── test_hooks.py        # Layer 4: フック統合（完全保存チャンク化、画像除去、監査ログ）
     ├── test_hooks_encoding.py # サロゲート除去・UTF-8 の回帰テスト
     ├── test_regressions.py  # Layer 5: v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要）
-    └── test_search_port_2026_11_17.py # Layer 5: 日本語の FTS、バイグラムの索引、システムの入力を飛ばす、返答との近さの並べ直し
+    ├── test_search_port_2026_11_17.py # Layer 5: 日本語の FTS、バイグラムの索引、システムの入力を飛ばす、返答との近さの並べ直し
+    └── test_review_2026_11_17.py      # Layer 5: チャンクの長さの上限、Windows のフックのパス（モデル不要）
 ```
 
 **本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。
@@ -1521,6 +1528,7 @@ python -m pytest tests/ -v
 |---|---|
 | `TestFtsQuoting` | `\ / # = @ * $ %`・`AND/OR/NOT`・`"`・制御文字を含むクエリで例外にならない、記号を含む語がヒットする、`search_fts` が例外を出しても `hybrid_search` が続く。**v1.5.0**: 語を `OR` でつなぐ（文のようなクエリが、その語の一部だけを含む記録にヒットする）、3 文字未満の語（`AI`、`東京`）は捨て、そういう語だけのクエリは FTS を飛ばす、クエリの句読点で語が分かれる（`「アルファ9」の気温は？` が `架空の惑星「アルファ9」の気温設定` にヒットする）。**2026-11-17**: 最大 40 語、CJK を含む 4 文字以上の語は 3 文字ずつに分ける |
 | `test_search_port_2026_11_17.py`（2026-11-17） | 空白のない日本語の文が、その語を含む記録に当たる。ひらがなだけの 3 文字を捨てる。記号だけ・2 文字だけの質問で例外にならない。`bigram_text('N3MCの設定')` が `N3MC の設 設定`。`記憶` と `PR` がバイグラムの索引で（`hybrid_search` でも）当たる。バイグラムの検索が失敗しても trigram の結果が残る。`delete_memory` のあとバイグラムの行が残らない。`--repair` が古い DB のバイグラムの行を 1 回だけ埋める（2 回動かしても 1 記録 1 行）。`<agent-message from=...>` と `<system-reminder>` の入力は保存も検索もせず `turn_id` を変えない。`<agent-message` や `<div>` で始まるユーザーの質問は飛ばさない。返答との近さの並べ直しは既定で off、on なら返答の近い往復が上に来る、DB のエラーでは入力をそのまま返す |
+| `test_review_2026_11_17.py`（2026-11-17） | どのチャンクも `max_chars` を超えない（段落と文の経路、`max_chars` が 400 と小さい値、日本語の文）。`chunk_text('x' * 10 + '\n\n' + 'y' * 400)` は 410 個の文字（`x` と `y`）をすべて残し、400 字以下のチャンクを返す。`is_own_hook` は、引用符なしで `\` 区切りの `C:\Tools\n3mc-hook.exe` と `C:\Tools\n3mc-stop-hook.exe` を自分のフックと認識し、`--init` はそのエントリを足さずに置き換える |
 | `TestVectorFilter` | `since` 付きの検索で範囲内の記録が KNN の上位外にあっても返る、`rowid IN` が使えないときに全件計算に切り替わる |
 | `TestNoSimilarityDedup` | 似た分割（cos ≥ 0.95）がすべて保存される、同じ `turn_id` の完全一致は飛ばす、別の `turn_id` の完全一致は保存する、`turn_id` なしは全体で完全一致を飛ばす |
 | `TestSearchShaping` | `vector_min_cos` 未満の候補を捨てる、相対の足切り、`_version_group` は足切りで落ちない、新しい版が上に来る、同じ content の集約、`pair_top_n`・`pair_max_chars` と `pairs_omitted`。**v1.5.0**: 類似度の低い現在のセッションの記録があっても、類似度の高い 30 日前の別セッションの記録が相対の足切りで残る、別セッションのキーワードのみのヒットが `min_score` で残る、並びは今も最終スコア順（現在のセッションが先）。**v1.6.0**: 類似度の高い 400 日前の記録が、ほかに候補がなくても返る（`min_score` と相対の足切りは `time_decay` を見ない）、同じ類似度の新しい記録と 400 日前の記録が両方返り、新しいほうが上に来る |
@@ -1552,8 +1560,11 @@ python -m pytest tests/ -v
 # 単一レイヤー
 python -m pytest tests/test_database.py -v
 
-# 遅いEmbeddingテストをスキップ
+# TestEmbedding を飛ばす（test_api.py はモデルを読み込む）
 python -m pytest tests/ -v -k "not TestEmbedding"
+
+# Embedding モデルなしで（オフライン、または初回のダウンロード前）
+python -m pytest tests/ -v --ignore=tests/test_api.py -k "not TestEmbedding"
 ```
 
 > **⚠️ Evidence Report との関係**: 自動テストの不合格は §6 の ⭐⭐⭐⭐⭐ 評価をブロックしない。Evidence Report が実装完了の唯一の合否基準である。自動テストは開発者が任意で実行する補助的な回帰テストであり、初回実装時に無限の修正・再試行ループを引き起こしてはならない。

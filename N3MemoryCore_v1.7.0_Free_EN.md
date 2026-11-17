@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.6.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.7.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -121,7 +121,7 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.6.0_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.7.0_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
@@ -875,6 +875,11 @@ OURS = {  # event -> (entry-point name, module name)
 }
 
 def _tokens(command: str) -> list:
+    # Backslashes become "/" first: posix shlex treats an unquoted "\" as an
+    # escape, so C:\Tools\n3mc-hook.exe would turn into C:Toolsn3mc-hook.exe
+    # and the entry would be missed (review of 2026-11-17). The tokens are only
+    # compared, never executed.
+    command = command.replace("\\", "/")
     try:
         return shlex.split(command, posix=True)
     except ValueError:
@@ -1217,6 +1222,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 1. Every user message and every Claude response is recorded in FULL, character-for-character, with no truncation.
 2. Long content is split into overlapping chunks by `chunk_text` (max_chars=400, overlap=40, paragraph → sentence → hard-window hierarchy). Each chunk is tagged `[user]` / `[claude]` for single-chunk content, or `[user i/N]` / `[claude i/N]` for multi-chunk content.
    - **Sentence ends (v1.5.0)**: a sentence ends at `.` `!` `?` followed by whitespace, **or** at `。` `！` `？` (no whitespace needed). v1.4.0 knew only the ASCII marks, so Japanese text without blank lines fell through to the 400-character hard window and was cut mid-sentence.
+   - **Length bound (2026-11-17)**: no chunk is longer than `max_chars`, overlap and separator included. When the previous chunk's 40-character tail, the separator and the next part would together exceed `max_chars`, the tail is shortened to fit (to nothing when the part alone fills the chunk; the separator is then dropped too). A part longer than `max_chars` goes to the hard window, whose windows are at most `max_chars` long. Why: until 2026-11-17 the tail was added without checking, so `chunk_text('x' * 10 + '\n\n' + 'y' * 400)` returned a 412-character chunk; for Japanese text, where a character is about one token, that moves a chunk toward the embedding model's 512-token input limit, beyond which the text is not embedded.
    - **What "character-for-character" covers**: every character of the message is in some chunk, in order. The chunk boundaries are not byte-exact: paragraphs are stripped and re-joined with one blank line (`\n\n`), sentences with one space, and neighbouring chunks share up to 40 characters of overlap. Joining the chunks therefore does not reproduce the original whitespace between paragraphs and sentences; `audit.log` keeps the raw input.
 3. NO length filter, NO skip-pattern filter. Fenced code blocks ARE substituted with `[code omitted]` per documented product design (applied once to the **whole** message before chunking — §5.4); this is the single documented exception and applies to conversation records only (source code is not in scope of complete recording). N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved.
 4. An append-only JSONL audit log at `~/.n3mc/.memory/audit.log` is written BEFORE anything can fail. This is the last-resort authoritative transcript. Every hook invocation (UserPromptSubmit + Stop) writes one JSON record: `{"ts", "hook", "raw", "payload"}`.
@@ -1359,7 +1365,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.6.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.7.0 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
@@ -1428,7 +1434,7 @@ After implementation is complete, autonomously resolve the following tests and r
 >
 > **Prerequisites**: `pip install pytest httpx`
 >
-> **Embedding model**: Tests that require the embedding model (`test_processor.py::TestEmbedding`, `test_api.py`) use a session-scoped fixture to load the model once (~5s). Layer 1 tests use deterministic dummy vectors to avoid model dependency.
+> **Embedding model**: Tests that require the embedding model (`test_processor.py::TestEmbedding`, `test_api.py`) use a session-scoped fixture to load the model once (~5s). Every test in `test_api.py` needs the model, because its `client` fixture loads it before the first test; `-k "not TestEmbedding"` does not skip that. All other tests run without the model (verified 2026-11-17 with an empty model cache and `HF_HUB_OFFLINE=1`). Layer 1 tests use deterministic dummy vectors to avoid model dependency.
 
 ### Directory Structure
 
@@ -1444,7 +1450,8 @@ n3mc-free/
     ├── test_hooks.py        # Layer 4: Hook integration (complete-preservation chunking, image strip, audit log)
     ├── test_hooks_encoding.py # Regression tests for surrogate stripping and UTF-8
     ├── test_regressions.py  # Layer 5: Regression tests for the v1.4.0 – v1.6.0 fixes (no model needed)
-    └── test_search_port_2026_11_17.py # Layer 5: Japanese FTS grams, bigram index, skipped system inputs, reply re-rank
+    ├── test_search_port_2026_11_17.py # Layer 5: Japanese FTS grams, bigram index, skipped system inputs, reply re-rank
+    └── test_review_2026_11_17.py      # Layer 5: chunk length bound, Windows hook paths (no model needed)
 ```
 
 **Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
@@ -1525,6 +1532,7 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 |---|---|
 | `TestFtsQuoting` | Queries containing `\ / # = @ * $ %`, `AND/OR/NOT`, `"`, or control characters do not raise; terms containing symbols are hit; `hybrid_search` continues when `search_fts` raises. **v1.5.0**: terms are joined with `OR` (a sentence-like query hits a record that contains only some of its words); terms under 3 characters (`AI`, `東京`) are dropped and a query of only such terms skips FTS; punctuation in the query splits terms (`「アルファ9」の気温は？` hits `架空の惑星「アルファ9」の気温設定`). **2026-11-17**: at most 40 terms; CJK words of 4+ characters become 3-character grams |
 | `test_search_port_2026_11_17.py` (2026-11-17) | A Japanese sentence without spaces hits a record containing its words; hiragana-only grams are dropped; symbol-only and 2-character queries do not raise; `bigram_text('N3MCの設定')` is `N3MC の設 設定`; `記憶` and `PR` hit through the bigram index (and through `hybrid_search`); a failing bigram search keeps the trigram results; `delete_memory` leaves no bigram row; `--repair` fills the bigram rows of an old DB once (two runs, one row per record); `<agent-message from=...>` and `<system-reminder>` prompts are neither saved nor searched and keep `turn_id`, while a user question starting with `<agent-message` or `<div>` is not skipped; the reply re-rank is off by default, moves the exchange with the closer reply up when on, and returns its input on a DB error |
+| `test_review_2026_11_17.py` (2026-11-17) | No chunk is longer than `max_chars` (paragraph and sentence paths, `max_chars` 400 and small values, Japanese text); `chunk_text('x' * 10 + '\n\n' + 'y' * 400)` keeps all 410 letters and returns chunks of at most 400; `is_own_hook` recognizes `C:\Tools\n3mc-hook.exe` and `C:\Tools\n3mc-stop-hook.exe` written with backslashes and no quotes, and `--init` then replaces such an entry instead of adding a second one |
 | `TestVectorFilter` | A search with `since` returns in-range records even if they are outside the global KNN top; falls back to exact computation when `rowid IN` is unavailable |
 | `TestNoSimilarityDedup` | Similar chunks (cos ≥ 0.95) are all saved; exact matches within the same `turn_id` are skipped; exact matches in a different `turn_id` are saved; without `turn_id`, exact matches are skipped globally |
 | `TestSearchShaping` | Candidates below `vector_min_cos` are discarded; relative cutoff; `_version_group` rows survive the cutoff; the newer version comes first; identical content is collapsed; `pair_top_n`, `pair_max_chars`, and `pairs_omitted`. **v1.5.0**: a 30-day-old record from another session with high similarity survives the relative cutoff while a current-session record with lower similarity is present; a keyword-only hit from another session survives `min_score`; the order is still by the final score (current session first). **v1.6.0**: a 400-day-old record with high similarity is returned even when it is the only candidate (`min_score` and the relative cutoff ignore `time_decay`); when a new and a 400-day-old record with the same similarity are both present, both are returned and the new one comes first |
@@ -1556,8 +1564,11 @@ python -m pytest tests/ -v
 # Single layer
 python -m pytest tests/test_database.py -v
 
-# Skip slow embedding tests
+# Skip TestEmbedding (test_api.py still loads the model)
 python -m pytest tests/ -v -k "not TestEmbedding"
+
+# Without the embedding model (offline, or before the first download)
+python -m pytest tests/ -v --ignore=tests/test_api.py -k "not TestEmbedding"
 ```
 
 > **⚠️ Relationship to Evidence Report**: Automated test failures do **not** block the ⭐⭐⭐⭐⭐ evaluation in §6. The Evidence Report is the sole pass/fail criterion for implementation completion. Automated tests are a supplementary regression suite that developers run at their discretion — they must not cause an infinite fix-and-retry loop during initial implementation.

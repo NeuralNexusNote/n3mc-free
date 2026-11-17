@@ -6,6 +6,29 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-17
+
+### Code review (2026-11-17)
+
+Applied through the specification (EN and JP) first, then the code and
+tests (`tests/test_review_2026_11_17.py`).
+
+#### Fixed
+- **A chunk could be longer than `max_chars` (400).** The 40-character
+  overlap and the separator were added without checking the total, so
+  `chunk_text('x' * 10 + '\n\n' + 'y' * 400)` returned a 412-character chunk.
+  The overlap is now shortened to fit; no chunk is longer than `max_chars`.
+- **`--init` missed a hook written with backslashes and no quotes**
+  (`C:\Tools\n3mc-hook.exe`): the shell-style split dropped the backslashes,
+  so the entry was kept and a second one was added. Backslashes are now read
+  as `/` when the command is compared.
+
+#### Changed
+- Specification §7: `-k "not TestEmbedding"` skips only `TestEmbedding`;
+  every `test_api.py` test still loads the embedding model. A new command runs
+  everything else without the model:
+  `python -m pytest tests/ -v --ignore=tests/test_api.py -k "not TestEmbedding"`.
+
 ### Search changes ported from N3MC-Pro (2026-11-17)
 
 Applied through the specification (EN and JP). Adds one FTS5 table

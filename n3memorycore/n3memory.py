@@ -2168,7 +2168,11 @@ _OTHER_N3MC_MARKERS = ('n3mc_hook', 'n3mc-hook', 'n3mc_stop_hook', 'n3mc-stop-ho
 
 
 def _hook_tokens(command: str) -> list:
+    """spec §4: backslashes become "/" first. posix shlex drops an unquoted
+    "\\" as an escape, so C:\\Tools\\n3mc-hook.exe was not recognized (review of
+    2026-11-17). The tokens are only compared, never executed."""
     import shlex
+    command = command.replace('\\', '/')
     try:
         return shlex.split(command, posix=True)
     except ValueError:
