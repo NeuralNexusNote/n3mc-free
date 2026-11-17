@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.8.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.8.1 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -121,7 +121,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.8.0_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.8.1_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -269,7 +269,7 @@ from .database import (
 # n3memorycore/n3memory.py
 from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE, claude_paths
 from .core.database import (
-    get_connection, init_db, migrate_schema, insert_memory,
+    get_connection, init_db, migrate_schema, insert_memory, insert_memory_once,
     check_exact_duplicate, search_vector, find_unindexed_memories,
     strip_fts_punctuation, serialize_vector,
 )
@@ -1297,6 +1297,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【カスタマイズ】言語ローカライズ**: 該当なし。完全記録契約により `_SKIP_PATTERNS` は**廃止**され、フックフィルタ層に言語依存の対象は存在しない。
 - **【実装仕様】重複排除と HTTP 失敗時フォールバック**:
   - 保存を飛ばすのは**完全に同じ文**だけ（`check_exact_duplicate(conn, content, turn_id=...)`）。`turn_id` があるときは**同じ `turn_id` の中だけ**で比べる。`turn_id` がないとき（手動の `--buffer`）は全体で比べる。`/buffer` と `_buffer_direct` の両方で同じ規則。
+  - **書き込みの中でもう一度確かめる（2026-11-17 の 2 回目のレビュー、R04）**：上の確認は埋め込みの前に行うので、重複ならモデルを呼ばずに済む。それでも、同じターンの同じ文の保存が同時に 2 つ届くことはある（タイムアウトの後にやり直したフック、`/buffer` と `_buffer_direct` が同時に）。その 2 つはどちらも上の確認を通る。そこで、どの保存の経路（`/buffer`、`_buffer_direct`）も、`core/database.py` の `insert_memory_once(conn, id, content, timestamp, owner_id, turn_id=..., insert_memory のほかの引数)` を通して書く：開いているトランザクションがあればコミットし、`BEGIN IMMEDIATE`（書き手は一度に 1 つ。接続の busy timeout まで待つ）、`check_exact_duplicate` をもう一度行い、重複ならロールバックして `None` を返す — 最初の確認と同じに伝える（`/buffer` は `{"status": "skipped", "count": 0, "reason": "exact_duplicate"}`）。重複でなければ `insert_memory`（コミットする）を呼んで rowid を返す。（それまでは、そういう 2 つの保存がどちらも行を書いた。2 つのスレッドで再現した。）
   - **類似度（cos_sim）による重複排除は行わない（v1.4.0 で廃止）。** v1.3.x は cos_sim ≥ 0.95 の記録があると新しいほうを捨てていた。multilingual-e5 では、形のそろった長い返答の分割どうしや、ほぼ同じ文の設定の新版と旧版が 0.95 前後になり、「同じ内容の新版」と「形の似た別の内容」を区別できない。その結果、約 2,000 字・12 項目の設定を保存すると分割の 1 つが残らない、設定を作り直すと新しい版の一部が欠ける、ということが起き、完全記録契約が破れていた。新しい版を優先したいときは、消さずに検索の並べ替えで扱う（§5「検索結果の絞り込みと並べ替え」）。
   - **全体で比べないのは**、作り直した設定のうち変えていない分割が旧版と全く同じ文になり、全体で比べると新しい版の往復が欠けるため。
   - 埋め込みサーバーへの HTTP POST 失敗時（サーバー停止・タイムアウト・非 2xx）: 書き込みは `_buffer_direct()` にフォールバックし、埋め込みベクトルなしで直接 SQLite に INSERT する。欠損した vec インデックスエントリは次回の `--repair` で修復される。**無言のドロップは禁止**：すべての失敗経路は `_buffer_direct` で成功するか、stderr へメッセージを出力する。Step 0 の監査ログと組み合わせて、ユーザー発言と、フックに届いた Claude の回答が失われないことを保証する。Claude の回答は Stop フックで、Stop が動かなかったときは次の質問でのトランスクリプトの読み取り（§4.5）でフックに届く。どちらのフックも動かない回答（例: Stop が飛ばされたまま Claude Code を閉じる前の最後の返答）は保存されない。
@@ -1395,7 +1396,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.8.0 Evidence Report]）
+## 6. 自律評価（[N3MC v1.8.1 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **実装完了の定義**: 以下のテスト 1〜7 を自律実施 → `n3mc --init` 実行（「次のセッションから保存できます。」が表示される）→ 満点（⭐⭐⭐⭐⭐）で報告するまでが「実装完了」。テスト 8〜10 はセッション中の実動作（`--search` 実行・フック発火・会話ターン）で自動的に確認される。3ステップすべてが完了して初めて実装完了とみなす。
@@ -1506,7 +1507,7 @@ python -m pytest tests/ -v
 | `TestSchema` | `tables_created`, `migrate_idempotent`, `add_missing_columns`, `fts_tokenizer_is_trigram`, `migrate_tokenizer_to_trigram` | スキーマ作成とマイグレーション（`session_id` / `turn_id` を含む） |
 | `TestInsertAndRetrieve` | `insert_count`, `three_table_consistency`, `insert_without_embedding`, `rowid_returned` | CRUD と 3 テーブルの整合性 |
 | `TestDelete` | `delete_three_tables`, `delete_nonexistent` | トランザクション保護された削除 |
-| `TestDedup` | `exact_duplicate_detected`, `no_false_positive` | 完全一致の重複排除 |
+| `TestDedup` | `exact_duplicate_detected`, `no_false_positive`, `concurrent_same_turn_saved_once`（2 つのスレッドがバリアで合わせて、同じ文と `turn_id` で `/buffer` の処理を呼ぶ：行は 1 つ、`ok` と `exact_duplicate` が 1 つずつ。別の `turn_id` なら同じ文でも保存される。R04） | 完全一致の重複排除 |
 | `TestUnindexed` | `vec_missing_detected`, `all_indexed` | 修復検出 |
 | `TestFTS` | `punctuation_removal`, `short_query_skipped`, `basic_search`, `punctuation_tolerance`, `max_terms_limit` | FTS5 |
 | `TestVectorSearch` | `vector_search_results`, `empty_db_vector_search` | KNN検索 |

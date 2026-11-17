@@ -6,6 +6,18 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-11-17
+
+### Fixed
+- **Two saves of the same text for the same turn at once are stored once**
+  (second review of 2026-11-17, R04; spec §5.4): every save path writes through
+  `insert_memory_once`, which repeats the exact-duplicate check inside
+  `BEGIN IMMEDIATE`. Until then both saves passed the check made before the
+  embedding and both wrote a row (reproduced with two threads).
+
+### Verified
+- 307 tests passed (Windows 11, Python 3.12). The new tests fail on 1.8.0.
+
 ## [1.8.0] - 2026-11-17
 
 ### Design review (2026-11-17, proposal 3)

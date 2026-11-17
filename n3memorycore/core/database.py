@@ -331,6 +331,27 @@ def insert_memory(
     return rowid
 
 
+def insert_memory_once(conn: sqlite3.Connection, id: str, content: str, timestamp: str,
+                       owner_id: str, turn_id: Optional[str] = None, **kw) -> Optional[int]:
+    """spec §5.4 (R04): the exact-duplicate check again, inside the write.
+
+    BEGIN IMMEDIATE lets one writer in at a time, so two saves of the same text
+    for the same turn that both passed the first check cannot both insert.
+    Returns the new rowid, or None for a duplicate (nothing written)."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if check_exact_duplicate(conn, content, turn_id=turn_id):
+            conn.rollback()
+            return None
+        return insert_memory(conn, id, content, timestamp, owner_id, turn_id=turn_id, **kw)
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def search_vector(
     conn: sqlite3.Connection, embedding: list, k: int = 50
 ) -> List[sqlite3.Row]:
