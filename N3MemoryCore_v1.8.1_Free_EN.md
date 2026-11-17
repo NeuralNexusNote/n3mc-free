@@ -133,13 +133,18 @@ n3mc-free/                       # Repository root
 │       ├── database.py          # DB layer: schema definitions, CRUD, PRAGMA settings, migrations
 │       └── processor.py         # Processing layer: embedding generation, ranking calculation, purify (fenced-code substitution per documented design)
 ├── tests/                       # pytest suite (see §7)
+│   ├── __init__.py
 │   ├── conftest.py
 │   ├── test_api.py
 │   ├── test_database.py
+│   ├── test_dedup_concurrent.py # two saves of the same text for the same turn at once (R04; no model needed, §7 Layer 1)
 │   ├── test_hooks.py
 │   ├── test_hooks_encoding.py
 │   ├── test_processor.py
-│   └── test_regressions.py      # regression tests for the v1.4.0 – v1.6.0 fixes (no model needed, §7 Layer 5)
+│   ├── test_regressions.py      # regression tests for the v1.4.0 – v1.6.0 fixes (no model needed, §7 Layer 5)
+│   ├── test_search_port_2026_11_17.py # 2026-11-17 search changes (no model needed, §7 Layer 5)
+│   ├── test_review_2026_11_17.py   # 2026-11-17 code review: chunk length bound, Windows hook paths (no model needed, §7 Layer 5)
+│   └── test_index_meta.py       # meta table, model mismatch notice, --reembed (v1.8.0; no model needed, §7 Layer 5)
 └── .claude/                     # Project-scoped Claude Code config (tracked)
     ├── settings.json            # Permission allowlist (Hooks live in user-global ~/.claude/settings.json — see §4)
     ├── CLAUDE.md                # Per-project guidance (N3MC adds nothing; --stop removes the memory_context.md @import written by older versions)
@@ -417,7 +422,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 ```
 
 - `bind_host`: Address the server listens on. Keep the default `127.0.0.1` (§3 "Resident FastAPI Server").
-- `search_result_limit`: Maximum number of results returned by `--search`.
+- `search_result_limit`: Maximum number of results returned by `--search` (1–1365, §3.5 "Allowed values").
 - `min_score`: Excludes results whose `filter_score` (the score without `time_decay` and `b_session`; §3 "Ranking Formula") is below this value from `--search` output (default `0.2`). Set to `0.0` to disable.
 - `search_query_max_chars`: Maximum characters used from a search query (default `2000`). The embedding model (512 tokens) cannot process more than ~2000 chars meaningfully. Increase at the cost of slower FTS queries.
 - `vector_min_cos`: Minimum cosine similarity for a vector-search candidate (default `0.85`). With multilingual-e5, even unrelated records score 0.80–0.85, so candidates below this are discarded. **0.85 was measured with `multilingual-e5-base`.** Re-measure for other embedding models. A reasonable range is 0.80–0.88 (lower picks up more but mixes in weakly related records; higher shortens the injected context but is more likely to drop relevant records).
@@ -429,7 +434,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 - `dedup_threshold` and `context_char_limit` from v1.3.x are **removed**. If they remain in an existing `config.json`, they are ignored (no need to delete them).
 - Write values without quotes (`"vector_min_cos": 0.83`). Values of the wrong type or outside the allowed range are ignored (§3.5 "Allowed values").
 - Editing `config.json` changes `code_version`, so the next command automatically restarts the server and the new values take effect.
-- Internal processing parameters such as KNN fetch count (K value) and `--repair` batch size are left to the implementer's discretion.
+- Internal processing parameters such as KNN fetch count (K value) and `--repair` batch size are left to the implementer's discretion. The K value must stay within sqlite-vec's limit of 4,096 for every allowed `search_result_limit` (the reference code uses `3 × search_result_limit`; §3.5 "Allowed values").
 
 > **Multi-account usage on a single PC**: When running multiple Claude Code accounts on one machine and connecting them to the same N3MC server (same `server_port` and DB path), each account's `config.json` is auto-generated independently, resulting in different `owner_id` / `local_id` values. In the Free edition this does not affect ranking, but after upgrading to Pro, memories from other accounts will have `B_local=0.8` decay applied. To treat all accounts' memories equally, copy the first account's `config.json` to the other accounts so that `owner_id` / `local_id` are unified.
 
@@ -715,7 +720,8 @@ Users edit `config.json` by hand (e.g. to tune `vector_min_cos`), so assume it m
 | Keys | Type | Allowed range |
 |---|---|---|
 | `server_port` | integer | 1–65535 |
-| `search_result_limit`, `pair_top_n`, `pair_max_chars`, `search_query_max_chars`, `version_min_chars` | integer | ≥ 1 |
+| `search_result_limit` | integer | 1–1365 |
+| `pair_top_n`, `pair_max_chars`, `search_query_max_chars`, `version_min_chars` | integer | ≥ 1 |
 | `min_results` (v1.6.0) | integer | ≥ 0 |
 | `half_life_days` | number (int or float) | > 0 |
 | `bm25_min_threshold` | number | ≥ 0 |
@@ -724,6 +730,7 @@ Users edit `config.json` by hand (e.g. to tune `vector_min_cos`), so assume it m
 
 - "Integer" means a JSON integer (`2000`). A float such as `2000.0` is **not** accepted, even when its value is whole: these keys are used as slice bounds and counts (`user_text[:search_query_max_chars]`), and v1.4.0 accepted `2000.0`, after which every `--hook-submit` failed with `TypeError` before searching and the user message never reached the DB (it was only in `audit.log`). A negative `server_port` or `half_life_days: 0` also passed v1.4.0's check.
 - Out-of-range values are treated exactly like wrongly typed ones: that key alone uses its default and the `config_type` notice names it.
+- **Why `search_result_limit` stops at 1365 (final review of 2026-11-18, C-06)**: the reference code's vector search asks sqlite-vec for `k = 3 × search_result_limit` neighbours, and sqlite-vec refuses a `k` above 4,096. With 1366 or more, every vector search returned nothing (sqlite-vec: "k value in knn query too large"; only a log warning) and the search went on with keyword hits only. 3 × 1365 = 4,095 is the largest value that works.
 
 **Writing `config.json` (v1.5.0)**:
 
@@ -1175,10 +1182,11 @@ Reads the UserPromptSubmit JSON from stdin. Claude Code sends `session_id`, `tra
 - **Previous Claude response from the transcript (decision D3, v1.5.0)**: `transcript_path` is the session's JSONL transcript. Read it from the end and take **the last assistant text block that precedes the current prompt** — the same text the Stop hook receives as `last_assistant_message`:
   1. Walk the lines backwards. Skip lines that are not JSON objects, lines with `isSidechain: true` (sub-agents), and every line whose `type` is neither `user` nor `assistant`.
   2. Skip `user` lines that are **not a real prompt**: lines with `isMeta: true`; lines whose `message.content` has no string and no `type: "text"` part (`tool_result` only — part of the same reply); and lines whose text starts with `[Request interrupted by user` (the marker Claude Code writes when the user interrupts), `<command-`, `<local-command-` (slash commands and their output), or one of `_SYSTEM_PROMPT_PREFIXES`.
-  3. Skip the current prompt itself: real-prompt lines at the end whose text is the new prompt (the transcript may or may not contain it yet).
+  3. Skip the current prompt itself — **the trailing line only**: the newest `user` or `assistant` line of the walk (lines skipped in step 1 and `isMeta` lines do not count) is skipped when it is a real prompt whose text is the new prompt (the transcript may or may not contain it yet). An older real-prompt line ends the walk (step 4) even when its text is the same as the new prompt.
   4. The first `assistant` line found that has a non-empty `type: "text"` part gives the answer: its **last** non-empty text part. Ignore `thinking` and `tool_use` parts. If another real user prompt is reached first, there is no previous response.
   - **Why the last block only**: Claude Code's Stop input carries only the final text block of a reply (measured on 2026-11-13 with this session's transcript: each of the 6 latest Stop inputs equalled one text block of the transcript, and none equalled the text blocks of its turn joined together). Taking the same block makes the exact-match check skip it when Stop already saved it; joining the blocks would store a second, slightly different copy for every turn that used tools. Text written before tool calls in the same reply is not saved — Stop does not save it either.
   - **Why the interruption marker is skipped**: when the user interrupts, Claude Code writes a `user` line with the text `[Request interrupted by user]` (or `… for tool use]`) after the partial reply. Treating it as a prompt would stop the walk right there, and the interrupted reply — the case this lookup exists for — would never be found.
+  - **Why the trailing line only (final review of 2026-11-18, C-05)**: until then every real-prompt line whose text was the new prompt was skipped. When the user interrupted a prompt before any reply text and sent the same text again, the walk skipped the interrupted prompt as well and returned the reply of the exchange before it, which was then saved again under the interrupted exchange's `turn_id`. When the transcript contains the current prompt, it is the newest line; a line with the same text behind an interruption marker or a reply is an earlier prompt.
   - Read at most the last 5 MB of the file (seek from the end), and treat any failure (missing path, unreadable file, unexpected structure) as "no previous response": write `{"hook": "UserPromptSubmit", "stage": "transcript_unreadable", "reason": "<short reason>"}` to `audit.log` and continue. The transcript is only a recovery source; it must never make the hook fail.
   - Save the response with the turn_id from `turn_id_<session>.txt` (the previous exchange), through the normal chunking (`purify_text` on the whole text, then `[claude]` / `[claude i/N]`). When the Stop hook already saved it, the chunks are identical and the exact-match check within the same `turn_id` (§5.4) skips every chunk, so nothing is stored twice.
   - **Measured input (2026-11-13)**: in the Pro edition's audit log on the development PC, the latest 47 UserPromptSubmit inputs (2026-11-13) all had the keys `session_id, transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode, hook_event_name, prompt` (+ `session_title`), and none had `last_assistant_message`. The Free audit log of 2026-05-31 showed the same for 201 inputs. The transcript lines carry `type`, `isSidechain` and `message.role` / `message.content` as described above.
@@ -1274,7 +1282,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   2. `python -m n3memorycore.n3memory --stop` — prepares the AI behavioral guidelines and cleans up the old memory_context (see §4 "`--stop` Hook Specification").
 
   Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (`--save-claude-turn` + `--stop`) = 3 calls.
-- **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records. Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired. **`count` (found 2026-11-16)**: the `count` of the `/repair` response and of the warning is the number of records this call actually changed — an FTS row cleaned or re-inserted, or a vector added. A record that was looked at but not changed (its embedding could not be computed and its FTS row was already there) is not counted. Before this rule the code counted every record it looked at, so while the embedding model was unavailable each call reported `Repaired N record(s)` and repaired none.
+- **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records (into `memories_fts`, and into `memories_fts_bi` when its row is missing too). Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired. **`count` (found 2026-11-16)**: the `count` of the `/repair` response and of the warning is the number of records this call actually changed — an FTS row cleaned or re-inserted, or a vector added. A record that was looked at but not changed (its embedding could not be computed and its FTS row was already there) is not counted. Before this rule the code counted every record it looked at, so while the embedding model was unavailable each call reported `Repaired N record(s)` and repaired none.
 ### 5.3 AI Behavioral Guidelines
 
 - **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. **Every non-empty user message and every non-empty Claude response is recorded in FULL, character-for-character, with no truncation.** There is no length filter (the previous `len(text) >= 10` / `>= 3` thresholds are REMOVED) and no skip-pattern filter (the previous `_SKIP_PATTERNS` "ok / yes / thanks" routine-response filter is REMOVED). Short acknowledgements such as `ok` or `yes` are now recorded like any other input.
@@ -1311,7 +1319,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Implementation Specs] ensure_server() concurrent startup wait**: **Only when the process with the PID-file number is verified to be this folder's server (another process is starting it)**, wait up to 60 seconds (120 × 0.5s). If it is still starting after that (first-run model download takes 2–10 minutes), this command proceeds without the server and does not start a second one. If that process is dead or is a different process, start the server without waiting (§3 "PID file handling").
 - **[Implementation Specs] audit.log size and contents (v1.5.0)**: `audit.log` holds the raw hook input — every prompt and reply in full, **including code blocks and anything pasted** (it is not purified). Treat it as private data. When it exceeds 50 MB, `--stop` renames it to `audit.log.1` (replacing an older `audit.log.1`) and the next hook starts a new file, so at most about 100 MB is kept. Write failures of `audit.log` go to stderr and never stop a hook.
 - **[Implementation Specs] _load_vec_extension idempotency**: Loading the sqlite-vec extension twice on the same connection is a no-op — if the extension is already loaded, the load call raises an exception containing "already" or "duplicate" in its message. Catch such exceptions and continue; re-raise all others.
-- **[Implementation Specs] delete_memory transactional**: `delete_memory` calls `_load_vec_extension(conn)` first, then wraps all three DELETEs (memories_fts, memories_vec, memories) in a try/except with `conn.rollback()` on failure. All three indexes succeed or all roll back together.
+- **[Implementation Specs] delete_memory transactional**: `delete_memory` calls `_load_vec_extension(conn)` first, then wraps the four DELETEs (memories_fts, memories_fts_bi, memories_vec, memories) in a try/except with `conn.rollback()` on failure. All four tables succeed or all roll back together.
 - **[Implementation Specs] lifespan startup**: Use FastAPI's `@asynccontextmanager` lifespan pattern (`async def lifespan(app: FastAPI)` with `yield`, passed to `FastAPI(lifespan=lifespan)`) instead of the deprecated `@app.on_event("startup")`.
 - **[Implementation Specs] Vector model record**: On every `/repair`, the server compares `meta.embed_model` (written the first time, §3.5 "Index metadata") with `cfg['embed_model']` and emits or clears the notice `embed_model_mismatch`. It does NOT re-embed on its own (the operation can take many minutes on a large DB); the notice tells the user to run `n3mc --reembed`.
 
@@ -1482,6 +1490,7 @@ n3mc-free/
 └── tests/
     ├── conftest.py          # Shared fixtures: isolated DB, config, dummy vectors
     ├── test_database.py     # Layer 1: DB unit tests (CRUD, schema, transactions)
+    ├── test_dedup_concurrent.py # Layer 1: two saves of the same text for the same turn at once (R04; no model needed)
     ├── test_processor.py    # Layer 2: Ranking math, purify `[code omitted]` substitution, Refresh
     ├── test_api.py          # Layer 3: FastAPI endpoint tests (TestClient)
     ├── test_hooks.py        # Layer 4: Hook integration (complete-preservation chunking, image strip, audit log)
@@ -1515,12 +1524,14 @@ python -m pytest tests/ -v
 | `TestSchema` | `tables_created`, `migrate_idempotent`, `add_missing_columns`, `fts_tokenizer_is_trigram`, `migrate_tokenizer_to_trigram` | Schema creation & migration (incl. `session_id` / `turn_id`) |
 | `TestInsertAndRetrieve` | `insert_count`, `three_table_consistency`, `insert_without_embedding`, `rowid_returned` | CRUD & 3-table consistency |
 | `TestDelete` | `delete_three_tables`, `delete_nonexistent` | Transactional delete |
-| `TestDedup` | `exact_duplicate_detected`, `no_false_positive`, `concurrent_same_turn_saved_once` (two threads with a barrier call the `/buffer` handler with the same text and `turn_id`: one row, one `ok` and one `exact_duplicate`; the same text with another `turn_id` is still saved; R04) | Exact dedup |
+| `TestDedup` | `exact_duplicate_detected`, `no_false_positive` | Exact dedup |
 | `TestUnindexed` | `vec_missing_detected`, `all_indexed` | Repair detection |
 | `TestFTS` | `punctuation_removal`, `short_query_skipped`, `basic_search`, `punctuation_tolerance`, `max_terms_limit` | FTS5 tokenization |
 | `TestVectorSearch` | `vector_search_results`, `empty_db_vector_search` | KNN search |
 | `TestRetentionAndRange` | `old_records_retained`, `no_gc_decrements_count`, `since_filter_excludes_old`, `until_filter_excludes_new` | Free never deletes old records; time-range filter (named `TestGC` before v1.5.0) |
 | `TestSerialization` | `roundtrip` | Binary encoding |
+
+**`test_dedup_concurrent.py` (3 tests, R04; no model needed)**: `TestDedupConcurrent` — `concurrent_same_turn_saved_once` (two threads with a barrier call the `/buffer` handler with the same text and `turn_id`: one row, one `ok` and one `exact_duplicate`), `same_text_other_turn_still_saved` (the same text with another `turn_id` is saved twice), `insert_memory_once_returns_none_for_a_duplicate` (the second insert of the same text and `turn_id` returns `None`, leaves no open transaction, and the DB has one row).
 
 ### Layer 2: `test_processor.py` (24 tests)
 
@@ -1582,8 +1593,8 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestServerStart` (v1.5.0) | A child that exits during the wait stops the wait at once and emits `server_start_failed` naming `server.log`; within 5 minutes of a failure no new start is attempted; a later successful start clears the notice and the marker; a PID-file process still starting after 60 s is neither replaced nor duplicated; `Popen` gets the detach flags for the platform and stderr goes to `server.log` (process creation replaced by a fake) |
 | `TestServerApi` (v1.5.0) | A request with `Host: evil.example` gets 403 on every endpoint, `127.0.0.1:<port>` and `localhost:<port>` pass; `/buffer`, `/search`, `/repair`, `/list` are plain `def` functions; `/repair` with `{"max_records": 200}` processes at most 200 records and `--hook-submit` sends that limit; with `HTTP_PROXY` pointing to another local server, `_get` still reaches the N3MC server and nothing reaches the proxy (F16) |
 | `TestForeignServer` | With another folder's server on the port: saves go directly to our own DB, no search, `--repair` does nothing |
-| `TestConfig` | Does not overwrite an unreadable `config.json`; ignores only the mistyped key; notices clear once fixed; `code_version` changes only when the contents of `config.json` change. **v1.5.0**: `2000.0` for `search_query_max_chars`, `0` for `half_life_days`, `70000` / `-1` for `server_port`, `1.5` for `min_score` are ignored with `config_type` (**v1.6.0**: so are `-1` and `1.5` for `min_results`, while `0` is accepted); a missing file is created with exclusive creation and a concurrent creator's file is read, not overwritten (one `owner_id`); updates go through a temporary file and `os.replace` |
-| `TestHookSubmit` | Input starting with `<task-notification>` is neither saved nor searched and does not change `turn_id`; Stop does not clear `turn_id`. **v1.5.0**: the previous Claude response is read from a sample `transcript_path` JSONL (the last text block only; `tool_result`-only user lines, `isMeta` lines, the `[Request interrupted by user]` marker, slash-command lines, `thinking`, `tool_use` and `isSidechain` lines skipped; the current prompt skipped; an interrupted reply is found) and saved under the previous `turn_id`; when Stop already saved it nothing is duplicated; a missing or broken transcript is logged as `transcript_unreadable` and the hook still searches and saves the prompt; an image-only prompt writes a new `turn_id` |
+| `TestConfig` | Does not overwrite an unreadable `config.json`; ignores only the mistyped key; notices clear once fixed; `code_version` changes only when the contents of `config.json` change. **v1.5.0**: `2000.0` for `search_query_max_chars`, `0` for `half_life_days`, `70000` / `-1` for `server_port`, `1.5` for `min_score` are ignored with `config_type` (**v1.6.0**: so are `-1` and `1.5` for `min_results`, while `0` is accepted; **C-06**: `1366` for `search_result_limit` is ignored with `config_type`, while `1365` is accepted and a vector search with `k = 4095` works); a missing file is created with exclusive creation and a concurrent creator's file is read, not overwritten (one `owner_id`); updates go through a temporary file and `os.replace` |
+| `TestHookSubmit` | Input starting with `<task-notification>` is neither saved nor searched and does not change `turn_id`; Stop does not clear `turn_id`. **v1.5.0**: the previous Claude response is read from a sample `transcript_path` JSONL (the last text block only; `tool_result`-only user lines, `isMeta` lines, the `[Request interrupted by user]` marker, slash-command lines, `thinking`, `tool_use` and `isSidechain` lines skipped; the current prompt skipped (the trailing line only: an interrupted prompt sent again does not bring back the reply before it); an interrupted reply is found) and saved under the previous `turn_id`; when Stop already saved it nothing is duplicated; a missing or broken transcript is logged as `transcript_unreadable` and the hook still searches and saves the prompt; an image-only prompt writes a new `turn_id` |
 | `TestPurifyBeforeChunk` (v1.5.0) | A user message over 500 characters with two code blocks and prose between them keeps the prose and stores neither code block; a code block longer than 400 characters is replaced, not stored |
 | `TestChunkSentences` (v1.5.0) | Japanese text without blank lines is split after `。` / `！` / `？`, not mid-sentence |
 | `TestTimeBounds` (v1.5.0) | A date-only `--since` is local midnight converted to UTC (with a fixed non-UTC time zone); an offset value is honoured; `T` and space separators give the same bound; `yesterday` exits with status 2 and an error line; `since > until` is an error |

@@ -27,8 +27,25 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opening the DB or from the check are handled like a failed check (set
   aside, new DB, `db_corrupt` notice). Until then nothing was set aside and
   every save failed.
+- **Sending a stopped prompt again no longer saves the reply before it again**
+  (C-05; spec §4.5 step 3): only the trailing transcript line is skipped as
+  the current prompt. Until then, when the user stopped a prompt before any
+  reply text and sent the same text again, the reply of the exchange before
+  it was saved again under the stopped exchange's `turn_id`.
+- **`search_result_limit` is limited to 1–1365** (C-06; spec §3.5): the
+  vector search asks sqlite-vec for `3 × search_result_limit` neighbours, and
+  sqlite-vec refuses more than 4,096; with 1366 or more every vector search
+  returned nothing. A larger value is now ignored with a `config_type` notice.
 
-Tests: 316 passed (Windows 11, Python 3.12). The new tests fail on 1.8.1.
+### Documentation (final review of 2026-11-18, P3)
+- C-07: the test lists match the files (`tests/__init__.py`, `test_dedup_concurrent.py` with its own entry instead of Layer 1 `TestDedup`, `test_index_meta.py`,
+  `test_search_port_2026_11_17.py`, `test_review_2026_11_17.py`), and
+  `memories_fts_bi` is named in the `delete_memory` and repair rules (§5.4).
+  The repository's `.claude/settings.json` has the two missing rules
+  (`n3mc --show-turn`, `n3mc --recall-thread`), so it keeps the same 14 rules
+  as `--init`.
+
+Tests: 322 passed (Windows 11, Python 3.12). The new tests fail on 1.8.1.
 
 ## [1.8.1] - 2026-11-17
 

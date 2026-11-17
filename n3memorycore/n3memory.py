@@ -224,7 +224,8 @@ _DEFAULT_CONFIG: dict = {
 # kind 'int' = JSON integer only (2000.0 is rejected); 'num' = int or float.
 _CONFIG_RULES: dict = {
     'server_port':              ('int', 1, 65535, False),
-    'search_result_limit':      ('int', 1, None, False),
+    # C-06: the vector search uses k = 3 x limit; sqlite-vec refuses k > 4096.
+    'search_result_limit':      ('int', 1, 1365, False),
     'pair_top_n':               ('int', 1, None, False),
     'pair_max_chars':           ('int', 1, None, False),
     'search_query_max_chars':   ('int', 1, None, False),
@@ -2116,6 +2117,9 @@ def _read_previous_response(transcript_path, current_prompt: str) -> str:
 
     current = (current_prompt or '').strip()
     parsed_any = False
+    # spec §4.5 step 3 (C-05): only the trailing line may be the current
+    # prompt. Lines skipped by step 1 and isMeta lines do not count.
+    trailing = True
     for line in reversed(lines):
         line = line.strip()
         if not line:
@@ -2140,15 +2144,20 @@ def _read_previous_response(transcript_path, current_prompt: str) -> str:
                 isinstance(content, list) and any(
                     isinstance(p, dict) and p.get('type') == 'text' for p in content))
             if not is_prompt:
+                trailing = False
                 continue           # tool_result-only line: same reply
             first = (parts[0] if parts else '').lstrip()
             if first.startswith(_NON_PROMPT_PREFIXES) or \
                     first.startswith(tuple(_SYSTEM_PROMPT_PREFIXES)):
+                trailing = False
                 continue           # interruption marker / slash command / system input
             joined = '\n\n'.join(parts or []).strip()
-            if joined == current or ' '.join(parts or []).strip() == current:
-                continue           # the current prompt itself
+            if trailing and (joined == current
+                             or ' '.join(parts or []).strip() == current):
+                trailing = False
+                continue           # the current prompt itself (trailing line only)
             break                  # the previous real user prompt: no response
+        trailing = False
         # assistant: the LAST non-empty text part of the newest assistant line
         # that has one — the same block Stop receives as last_assistant_message.
         parts = _content_texts(content) if isinstance(content, list) else None

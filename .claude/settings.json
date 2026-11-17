@@ -12,7 +12,9 @@
       "Bash(n3mc --buffer *)",
       "Bash(n3mc --list*)",
       "Bash(n3mc --repair*)",
-      "Bash(n3mc --stop*)"
+      "Bash(n3mc --stop*)",
+      "Bash(n3mc --show-turn *)",
+      "Bash(n3mc --recall-thread *)"
     ]
   }
 }

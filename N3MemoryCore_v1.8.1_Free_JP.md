@@ -133,13 +133,18 @@ n3mc-free/                       # リポジトリルート
 │       ├── database.py          # DB 層: スキーマ定義・CRUD・PRAGMA 設定・マイグレーション
 │       └── processor.py         # 処理層: 埋め込み生成・ランキング計算・purify（文書設計によるコードブロック置換）
 ├── tests/                       # pytest スイート（§7 参照）
+│   ├── __init__.py
 │   ├── conftest.py
 │   ├── test_api.py
 │   ├── test_database.py
+│   ├── test_dedup_concurrent.py # 同じターンの同じ文を同時に 2 回保存する（R04。モデル不要、§7 Layer 1）
 │   ├── test_hooks.py
 │   ├── test_hooks_encoding.py
 │   ├── test_processor.py
-│   └── test_regressions.py      # v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要、§7 Layer 5）
+│   ├── test_regressions.py      # v1.4.0〜v1.6.0 の修正の回帰テスト（モデル不要、§7 Layer 5）
+│   ├── test_search_port_2026_11_17.py # 2026-11-17 の検索の変更（モデル不要、§7 Layer 5）
+│   ├── test_review_2026_11_17.py   # 2026-11-17 のコードレビュー: チャンクの長さの上限、Windows のフックのパス（モデル不要、§7 Layer 5）
+│   └── test_index_meta.py       # meta 表、モデルの食い違いの通知、--reembed（v1.8.0。モデル不要、§7 Layer 5）
 └── .claude/                     # プロジェクト固有 Claude Code 設定（git 追跡）
     ├── settings.json            # パーミッション許可リスト（フックはユーザー全体の ~/.claude/settings.json に登録 — §4 参照）
     ├── CLAUDE.md                # プロジェクト用ガイダンス（N3MC は何も書き足さない。旧版の memory_context.md への @import は --stop が取り除く）
@@ -417,7 +422,7 @@ PRAGMA wal_autocheckpoint = 1000;
 ```
 
 - `bind_host`: サーバーが待ち受けるアドレス。既定の `127.0.0.1` のまま使う（§3「常駐型 FastAPI サーバー」）。
-- `search_result_limit`: `--search` が返す最大件数。
+- `search_result_limit`: `--search` が返す最大件数（1〜1365。§3.5「許される値」）。
 - `min_score`: `--search` の結果から、`filter_score`（`time_decay` と `b_session` を掛けないスコア。§3「ランキング計算式」）がこの値未満のものを除外する（規定値 `0.2`）。`0.0` で無効化。
 - `search_query_max_chars`: 検索クエリから使用する最大文字数（規定値 `2000`）。embedding モデル（512トークン）は約2,000文字以上を意味的に処理できません。増加させるとFTSクエリが遅くなる場合があります。
 - `vector_min_cos`: ベクトル検索の候補にする cos 類似度の下限（規定値 `0.85`）。multilingual-e5 は無関係な記録どうしでも 0.80〜0.85 になるため、これ未満の候補を捨てる。**0.85 は `multilingual-e5-base` で測った値。** ほかの埋め込みモデルでは測り直すこと。目安は 0.80〜0.88（下げると拾いやすくなるが関係の薄い記録も混ざり、上げると差し込みは短くなるが関係のある記録も落ちやすい）。
@@ -429,7 +434,7 @@ PRAGMA wal_autocheckpoint = 1000;
 - v1.3.x の `dedup_threshold` と `context_char_limit` は**廃止**。既存の `config.json` に残っていても読まれない（消さなくてよい）。
 - 値は引用符を付けずに書く（`"vector_min_cos": 0.83`）。型が違う値や許される範囲外の値は無視される（§3.5「許される値」）。
 - `config.json` を書き換えると `code_version` が変わり、次のコマンドでサーバーが自動で起動し直して新しい値が効く。
-- KNN の取得件数（K値）・`--repair` のバッチサイズ等の内部処理パラメータは実装者の判断に委ねる。
+- KNN の取得件数（K値）・`--repair` のバッチサイズ等の内部処理パラメータは実装者の判断に委ねる。ただし K 値は、許される `search_result_limit` のどの値でも、sqlite-vec の上限 4,096 以下にする（参照コードは `3 × search_result_limit`。§3.5「許される値」）。
 
 > **複数アカウント運用時の注意**: 1台の PC で複数の Claude Code アカウントを運用し、同じ N3MC サーバー（同じ `server_port`・同じ DB パス）に接続する場合、各アカウントの `config.json` は個別に自動生成されるため `owner_id` / `local_id` が異なる。Free 版ではランキングに影響しないが、Pro 版にアップグレードすると他アカウントの記憶に `B_local=0.8` の減衰が適用される。全アカウントの記憶を同等に扱いたい場合は、1つ目のアカウントの `config.json` を他のアカウントにコピーして `owner_id` / `local_id` を統一すること。
 
@@ -713,7 +718,8 @@ db_path = base_dir + "\\data\\memory.db" # NG
 | キー | 型 | 許される範囲 |
 |---|---|---|
 | `server_port` | 整数 | 1〜65535 |
-| `search_result_limit`, `pair_top_n`, `pair_max_chars`, `search_query_max_chars`, `version_min_chars` | 整数 | ≥ 1 |
+| `search_result_limit` | 整数 | 1〜1365 |
+| `pair_top_n`, `pair_max_chars`, `search_query_max_chars`, `version_min_chars` | 整数 | ≥ 1 |
 | `min_results`（v1.6.0） | 整数 | ≥ 0 |
 | `half_life_days` | 数値（int または float） | > 0 |
 | `bm25_min_threshold` | 数値 | ≥ 0 |
@@ -722,6 +728,7 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 - 「整数」は JSON の整数（`2000`）のこと。`2000.0` のような float は、値が整数であっても**受け付けない**。これらのキーはスライスの境界や件数として使われる（`user_text[:search_query_max_chars]`）。v1.4.0 は `2000.0` を受け付け、そのあと `--hook-submit` はすべて検索の前に `TypeError` で失敗し、ユーザーのメッセージは DB に届かなかった（`audit.log` にしか残らなかった）。負の `server_port` や `half_life_days: 0` も v1.4.0 の確認を通っていた。
 - 範囲外の値は型の違う値とまったく同じに扱う: そのキーだけ既定値を使い、知らせ `config_type` にそのキーを出す。
+- **`search_result_limit` の上限が 1365 である理由（2026-11-18 の最終レビュー、C-06）**: 参照コードのベクトル検索は、sqlite-vec に `k = 3 × search_result_limit` 件の近傍を求める。sqlite-vec は 4,096 を超える `k` を断る。1366 以上では、ベクトル検索が毎回何も返さず（sqlite-vec の「k value in knn query too large」。ログに警告が出るだけ）、検索はキーワードの一致だけで続いていた。3 × 1365 = 4,095 が、動く最大の値である。
 
 **`config.json` の書き込み（v1.5.0）**:
 
@@ -1173,10 +1180,11 @@ stdin から UserPromptSubmit の JSON を読み取る。Claude Code は `sessio
 - **トランスクリプトから前の Claude の返答を読む（決定 D3、v1.5.0）**: `transcript_path` はセッションの JSONL トランスクリプトである。末尾から読み、**今のプロンプトより前にある、最後の assistant のテキストブロック**を取り出す。これは Stop フックが `last_assistant_message` として受け取るテキストと同じものである。
   1. 行を後ろから順にたどる。JSON オブジェクトでない行、`isSidechain: true` の行（サブエージェント）、`type` が `user` でも `assistant` でもない行は飛ばす。
   2. **本物のプロンプトでない** `user` 行は飛ばす。`isMeta: true` の行、`message.content` に文字列も `type: "text"` のパートもない行（`tool_result` だけ。同じ返答の一部）、テキストが `[Request interrupted by user`（ユーザーが割り込んだときに Claude Code が書く印）、`<command-`、`<local-command-`（スラッシュコマンドとその出力）、または `_SYSTEM_PROMPT_PREFIXES` のどれかで始まる行である。
-  3. 今のプロンプトそのものは飛ばす。末尾にある本物のプロンプトの行のうち、テキストが新しいプロンプトと同じもの（トランスクリプトにまだ入っていないこともある）。
+  3. 今のプロンプトそのものは飛ばす。**飛ばすのは末尾の 1 行だけ**である。たどって最初に出会う `user` か `assistant` の行（手順 1 で飛ばした行と `isMeta` の行は数えない）が本物のプロンプトで、テキストが新しいプロンプトと同じなら、その行を飛ばす（トランスクリプトにまだ入っていないこともある）。それより前の本物のプロンプトの行は、テキストが新しいプロンプトと同じでも、手順 4 のとおり、たどるのを止める。
   4. 最初に見つかった、空でない `type: "text"` のパートを持つ `assistant` 行が答えになる。その行の**最後の**空でないテキストパートを取る。`thinking` と `tool_use` のパートは無視する。先に別の本物のユーザープロンプトに着いたら、前の返答はない。
   - **最後のブロックだけを取る理由**: Claude Code の Stop の入力には、返答の最後のテキストブロックだけが入る（2026-11-13 にこのセッションのトランスクリプトで測定。直近 6 件の Stop の入力は、どれもトランスクリプトのテキストブロック 1 つと一致し、そのターンのブロックをつなげたものと一致したものはなかった）。同じブロックを取れば、Stop が保存済みのときは完全一致の検査で飛ばされる。ブロックをつなげると、ツールを使ったターンごとに、少し違う写しがもう 1 つ保存される。同じ返答のうちツール呼び出しより前に書いたテキストは保存されない。Stop も保存しない。
   - **割り込みの印を飛ばす理由**: ユーザーが割り込むと、Claude Code は途中までの返答の後に、テキストが `[Request interrupted by user]`（または `… for tool use]`）の `user` 行を書く。これをプロンプトとして扱うと、たどるのがそこで止まり、割り込まれた返答（この読み取りが必要になる場面）が見つからない。
+  - **末尾の 1 行だけを飛ばす理由（2026-11-18 の最終レビュー、C-05）**: それまでは、テキストが新しいプロンプトと同じ本物のプロンプトの行を、すべて飛ばしていた。返答のテキストが出る前に質問を止め、同じ文を送り直すと、止めた質問の行も飛ばし、その前の往復の返答を返していた。その返答は、止めた往復の `turn_id` でもう一度保存された。トランスクリプトに今のプロンプトがあれば、それは最も新しい行である。割り込みの印や返答より前にある同じテキストの行は、前の質問である。
   - ファイルは最後の 5 MB までしか読まない（末尾から seek する）。失敗（パスがない、ファイルを読めない、構造が想定と違う）はすべて「前の回答なし」として扱い、`audit.log` に `{"hook": "UserPromptSubmit", "stage": "transcript_unreadable", "reason": "<短い理由>"}` を書いて続ける。トランスクリプトは取り戻すための材料にすぎず、これでフックを失敗させてはならない。
   - 回答は `turn_id_<session>.txt` の turn_id（1 つ前の往復）で、通常のチャンク分割（全文に `purify_text` をかけてから `[claude]` / `[claude i/N]`）を通して保存する。Stop フックがすでに保存していれば、チャンクは同じものになり、同じ `turn_id` の中での完全一致の確認（§5.4）がすべてのチャンクを飛ばすので、二重には保存されない。
   - **実測した入力（2026-11-13）**: 開発 PC の Pro 版の監査ログでは、最新の UserPromptSubmit の入力 47 件（2026-11-13）は、どれもキー `session_id, transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode, hook_event_name, prompt`（+ `session_title`）を持ち、`last_assistant_message` を持つものはなかった。2026-05-31 の Free の監査ログでも 201 件の入力で同じだった。トランスクリプトの行は、上に書いたとおり `type`、`isSidechain`、`message.role` / `message.content` を持つ。
@@ -1272,7 +1280,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   2. `python -m n3memorycore.n3memory --stop` — AI 行動指針の用意と旧 memory_context の片付け（§4「`--stop` フック仕様」参照）。
 
   1ターンあたりの合計サブプロセス数: `UserPromptSubmit` × 1（`--hook-submit`）+ `Stop` × 2（`--save-claude-turn` + `--stop`）= 3 回。
-- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。
+- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する（`memories_fts` に入れ、`memories_fts_bi` の行もなければそこにも入れる）。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。
 ### 5.3 AI 行動指針
 
 - **【AI行動指針】全自動保存**: 全会話はフック（UserPromptSubmit / Stop）により自動保存される。Claude が自分で判断して `--buffer` を手動呼び出しする必要はない。**空でないユーザー発言・Claude 回答はすべて、一字一句、切り捨てなしで記録される。** 長さフィルタ（旧 `len(text) >= 10` / `>= 3`）は**廃止**、スキップパターンフィルタ（旧 `_SKIP_PATTERNS`、「ok / yes / thanks」定型応答フィルタ）も**廃止**。`ok` や `yes` のような短い応答も他と同様に記録される。
@@ -1309,7 +1317,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【実装仕様】ensure_server() 競合起動待機**: PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（別プロセスが起動中）だけ**、最大 60 秒（120 × 0.5 秒）待機する。それでもまだ起動中なら（初回のモデルダウンロードは 2〜10 分かかる）、このコマンドはサーバーなしで進め、2 つ目のサーバーは起動しない。番号のプロセスが死んでいる・別のプロセスであるときは待たずに起動する（§3「PID ファイルの扱い」）。
 - **【実装仕様】audit.log の大きさと中身（v1.5.0）**: `audit.log` はフックの生の入力 — すべての質問と返答の全文。**コードブロックや貼り付けたものも含む**（purify しない）— を持つ。個人的なデータとして扱うこと。50 MB を超えたら `--stop` が `audit.log.1` に名前を変え（古い `audit.log.1` は置き換える）、次のフックが新しいファイルを始めるので、残るのは最大で約 100 MB。`audit.log` の書き込みの失敗は stderr に出し、フックを止めることはない。
 - **【実装仕様】_load_vec_extension 冪等性**: 同一コネクションで sqlite-vec 拡張を2回ロードしても副作用はない。拡張がすでにロード済みの場合、ロード呼び出しは "already" または "duplicate" を含む例外を発生させる。そのような例外はキャッチして続行し、それ以外の例外は再スローする。
-- **【実装仕様】delete_memory のトランザクション化**: `delete_memory` はまず `_load_vec_extension(conn)` を呼び出し、次に3件の DELETE（memories_fts・memories_vec・memories）を try/except で囲み、失敗時は `conn.rollback()` を実行する。3つのインデックスがすべて成功するか、すべてロールバックされる。
+- **【実装仕様】delete_memory のトランザクション化**: `delete_memory` はまず `_load_vec_extension(conn)` を呼び出し、次に4件の DELETE（memories_fts・memories_fts_bi・memories_vec・memories）を try/except で囲み、失敗時は `conn.rollback()` を実行する。4つの表がすべて成功するか、すべてロールバックされる。
 - **【実装仕様】lifespan 起動**: 非推奨の `@app.on_event("startup")` の代わりに、FastAPI の `@asynccontextmanager` lifespan パターン（`async def lifespan(app: FastAPI)` に `yield` を含め、`FastAPI(lifespan=lifespan)` に渡す）を使用する。
 - **【実装仕様】ベクトルモデルの記録**: 各 `/repair` で、サーバーは `meta.embed_model`（初回に書く、§3.5「索引の情報」）と `cfg['embed_model']` を比べ、通知 `embed_model_mismatch` を出すか消す。自分からは埋め込み直さない（大規模 DB では数分〜数十分かかる可能性があるため）。通知が、`n3mc --reembed` を実行するよう利用者に伝える。
 
@@ -1478,6 +1486,7 @@ n3mc-free/
 └── tests/
     ├── conftest.py          # 共通フィクスチャ：隔離DB、設定、ダミーベクトル
     ├── test_database.py     # Layer 1: DB単体テスト（CRUD、スキーマ、トランザクション）
+    ├── test_dedup_concurrent.py # Layer 1: 同じターンの同じ文を同時に 2 回保存する（R04。モデル不要）
     ├── test_processor.py    # Layer 2: ランキング数学、purify `[code omitted]` 置換検証、Refresh
     ├── test_api.py          # Layer 3: FastAPIエンドポイントテスト（TestClient）
     ├── test_hooks.py        # Layer 4: フック統合（完全保存チャンク化、画像除去、監査ログ）
@@ -1511,12 +1520,14 @@ python -m pytest tests/ -v
 | `TestSchema` | `tables_created`, `migrate_idempotent`, `add_missing_columns`, `fts_tokenizer_is_trigram`, `migrate_tokenizer_to_trigram` | スキーマ作成とマイグレーション（`session_id` / `turn_id` を含む） |
 | `TestInsertAndRetrieve` | `insert_count`, `three_table_consistency`, `insert_without_embedding`, `rowid_returned` | CRUD と 3 テーブルの整合性 |
 | `TestDelete` | `delete_three_tables`, `delete_nonexistent` | トランザクション保護された削除 |
-| `TestDedup` | `exact_duplicate_detected`, `no_false_positive`, `concurrent_same_turn_saved_once`（2 つのスレッドがバリアで合わせて、同じ文と `turn_id` で `/buffer` の処理を呼ぶ：行は 1 つ、`ok` と `exact_duplicate` が 1 つずつ。別の `turn_id` なら同じ文でも保存される。R04） | 完全一致の重複排除 |
+| `TestDedup` | `exact_duplicate_detected`, `no_false_positive` | 完全一致の重複排除 |
 | `TestUnindexed` | `vec_missing_detected`, `all_indexed` | 修復検出 |
 | `TestFTS` | `punctuation_removal`, `short_query_skipped`, `basic_search`, `punctuation_tolerance`, `max_terms_limit` | FTS5 |
 | `TestVectorSearch` | `vector_search_results`, `empty_db_vector_search` | KNN検索 |
 | `TestRetentionAndRange` | `old_records_retained`, `no_gc_decrements_count`, `since_filter_excludes_old`, `until_filter_excludes_new` | Free は古い記録を消さない。時間範囲フィルタ（v1.5.0 より前の名前は `TestGC`） |
 | `TestSerialization` | `roundtrip` | バイナリ変換 |
+
+**`test_dedup_concurrent.py`（3 テスト、R04。モデル不要）**: `TestDedupConcurrent` — `concurrent_same_turn_saved_once`（2 つのスレッドがバリアで合わせて、同じ文と `turn_id` で `/buffer` の処理を呼ぶ：行は 1 つ、`ok` と `exact_duplicate` が 1 つずつ）、`same_text_other_turn_still_saved`（別の `turn_id` なら同じ文でも 2 行とも保存される）、`insert_memory_once_returns_none_for_a_duplicate`（同じ文と `turn_id` の 2 回目の挿入は `None` を返し、トランザクションを開いたままにせず、DB の行は 1 つ）。
 
 ### Layer 2: `test_processor.py`（24テスト）
 
@@ -1578,8 +1589,8 @@ python -m pytest tests/ -v
 | `TestServerStart`（v1.5.0） | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え） |
 | `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る。`HTTP_PROXY` を別のローカルのサーバーに向けても、`_get` は N3MC のサーバーに届き、プロキシには何も届かない（F16） |
 | `TestForeignServer` | 別のフォルダのサーバーのとき、保存は自分の DB に直接、検索はしない、`--repair` は何もしない |
-| `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
-| `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない。**v1.5.0**: 前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く |
+| `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける。**C-06**: `search_result_limit` の `1366` も `config_type` で無視し、`1365` は受け付ける。`k = 4095` のベクトル検索は動く）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
+| `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない。**v1.5.0**: 前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす（末尾の 1 行だけ。止めた質問を送り直しても、その前の返答は返らない）。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く |
 | `TestPurifyBeforeChunk`（v1.5.0） | 2 つのコードブロックとその間の文章を持つ 500 字を超えるユーザー発言で、文章は残り、どちらのコードブロックも保存されない、400 字より長いコードブロックは保存されず置き換えられる |
 | `TestChunkSentences`（v1.5.0） | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
 | `TestTimeBounds`（v1.5.0） | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（UTC 以外の固定のタイムゾーンで）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー |

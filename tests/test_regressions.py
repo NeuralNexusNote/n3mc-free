@@ -1200,6 +1200,38 @@ class TestHookSubmit(TestHookSubmit):  # v1.5.0 additions
         ]) + '\n', encoding='utf-8')
         assert n3memory._read_previous_response(str(p), 'q2') == 'part two'
 
+    @pytest.mark.parametrize('with_current', [True, False])
+    def test_resent_interrupted_prompt_skips_only_trailing_line(self, tmp_path,
+                                                                with_current):
+        """spec §4.5 step 3 (C-05): the user interrupts 'q2' before any reply
+        text and sends 'q2' again. Only the trailing line is the current prompt;
+        the older 'q2' ends the walk, so the reply to 'q1' is not returned (it
+        would be saved again under the interrupted exchange's turn_id)."""
+        lines = [
+            tline('user', 'q1'),
+            tline('assistant', [{'type': 'text', 'text': 'answer to q1'}]),
+            tline('user', 'q2'),
+            tline('user', [{'type': 'text', 'text': '[Request interrupted by user]'}]),
+        ]
+        if with_current:
+            lines.append(tline('user', 'q2'))
+        p = tmp_path / 'resent.jsonl'
+        p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        assert n3memory._read_previous_response(str(p), 'q2') == ''
+
+    def test_resent_prompt_after_partial_reply(self, tmp_path):
+        """The interrupted exchange has reply text: that text is returned."""
+        p = tmp_path / 'partial.jsonl'
+        p.write_text('\n'.join([
+            tline('user', 'q1'),
+            tline('assistant', [{'type': 'text', 'text': 'answer to q1'}]),
+            tline('user', 'q2'),
+            tline('assistant', [{'type': 'text', 'text': 'partial answer to q2'}]),
+            tline('user', [{'type': 'text', 'text': '[Request interrupted by user]'}]),
+            tline('user', 'q2'),
+        ]) + '\n', encoding='utf-8')
+        assert n3memory._read_previous_response(str(p), 'q2') == 'partial answer to q2'
+
     def run_hook(self, monkeypatch, payload, saved=None):
         monkeypatch.setattr(n3memory, 'ensure_server', lambda c: True)
 
@@ -1547,6 +1579,14 @@ class TestInit:
         assert 'Bash(n3mc --show-turn *)' in perms['allow']
         assert 'Bash(n3mc --recall-thread *)' in perms['allow']
 
+    def test_repository_settings_json_keeps_the_same_list(self):
+        """spec §4 ②: the repository's own .claude/settings.json keeps the
+        same list as --init (C-07: Free's file had 12 of its 14 rules)."""
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, '.claude', 'settings.json'), encoding='utf-8') as f:
+            allow = json.load(f)['permissions']['allow']
+        assert tuple(allow) == n3memory.PERMISSION_RULES
+
     def test_resolve_finds_scripts_folder_with_empty_path(self, tmp_path, monkeypatch):
         scripts = tmp_path / 'Py312' / 'Scripts'
         scripts.mkdir(parents=True)
@@ -1851,6 +1891,29 @@ class TestConfig(TestConfig):  # v1.6.0 additions
         c = n3memory._load_config()
         assert c['min_results'] == 0
         assert 'config_type' not in notices()
+
+    def test_search_result_limit_over_1365_ignored(self):
+        """C-06 (spec §3.5): k = 3 x limit must stay within sqlite-vec's 4096."""
+        write_cfg('{' + IDS + ', "search_result_limit": 1366}')
+        c = n3memory._load_config()
+        assert c['search_result_limit'] == 20
+        assert 'search_result_limit' in notices()['config_type']['message']
+
+    def test_search_result_limit_1365_accepted_and_k_works(self, tmp_path):
+        write_cfg('{' + IDS + ', "search_result_limit": 1365}')
+        c = n3memory._load_config()
+        assert c['search_result_limit'] == 1365
+        assert 'config_type' not in notices()
+        conn = db.get_connection(str(tmp_path / 'k.db'))
+        try:
+            db.init_db(conn)
+            vec = db.serialize_vector([0.0] * 768)
+            sql = 'SELECT rowid FROM memories_vec WHERE embedding MATCH ? AND k = ?'
+            conn.execute(sql, (vec, 3 * c['search_result_limit'])).fetchall()
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute(sql, (vec, 3 * 1366)).fetchall()
+        finally:
+            conn.close()
 
 # --------------------------------------------------------------------------- proxy (final review 2026-11-18, F16)
 class TestNoProxyToOwnServer:
