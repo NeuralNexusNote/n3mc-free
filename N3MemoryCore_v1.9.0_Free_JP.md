@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.8.1 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.9.0 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -121,7 +121,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.8.1_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.9.0_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -1408,7 +1408,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.8.1 Evidence Report]）
+## 6. 自律評価（[N3MC v1.9.0 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **実装完了の定義**: 以下のテスト 1〜7 を自律実施 → `n3mc --init` 実行（「次のセッションから保存できます。」が表示される）→ 満点（⭐⭐⭐⭐⭐）で報告するまでが「実装完了」。テスト 8〜10 はセッション中の実動作（`--search` 実行・フック発火・会話ターン）で自動的に確認される。3ステップすべてが完了して初めて実装完了とみなす。
