@@ -1,4 +1,10 @@
 # N3MemoryCore (N3MC)
+
+> **⚠️ How long memories are kept, and data size**
+>
+> - **Memories are not deleted.** Free has no feature that deletes old records; they stay after a year without changing any setting.
+> - **More data makes it slower.** The more records there are, the longer a search takes.
+
 > A NeuralNexusNote™ product
 
 🛡️ AI-Native Development Policy
