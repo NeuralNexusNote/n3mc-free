@@ -101,6 +101,8 @@ Claude Codeに「一生モノの資産」となる長期記憶を実装せよ。
 pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
 
+> 続けて、リポジトリのルートで `pip install -e . --no-deps` を自動実行せよ。コンソールスクリプト（`n3mc`・`n3mc-hook`・`n3mc-stop-hook`）はこれで作られる。省くと `n3mc --init`（§6 の実装完了の定義）が実行できず、フックは `python -m` 形式の登録にフォールバックする。
+
 > **⚠️ 初回ダウンロード**: `sentence-transformers` はサーバー初回起動時に `multilingual-e5-base` モデル（約 470 MB）をダウンロードする。回線速度によって **2〜10分** かかる場合がある。この間サーバーが無応答に見えるが正常動作。モデルがキャッシュされた後の起動は数秒で完了。
 
 > **重要：文字数制限（実装時の設計制約）**
@@ -454,7 +456,7 @@ PRAGMA wal_autocheckpoint = 1000;
 - **Local ID**: 初回起動時または `config.json` に未設定の場合、UUIDv4 を生成し固定保存する。N3MCインストール（またはエージェント）の識別子。全レコードに刻印せよ。マルチエージェント時は `/buffer` API の `local_id` パラメータでエージェント固有の UUIDv4 を指定可能（省略時は config.json の値を使用）。
   - **ユースケース**: 複数の Claude Code インスタンス（マシンやインストールごとに固有の `local_id`）、同一 N3MC DB を共有する異なるエージェント（Claude Code + CordX 等が各自のインスタンスで動作し固有の `local_id` を持つ）、エージェント種別やプロジェクト環境ごとの記憶分離。
   - **注意**: Free 版では `local_id` はレコードに記録されるが、ランキングには使用されない。同一環境の記憶を優先する `B_local` バイアス乗数は Pro 機能。
-- **Session ID**: 1 つのタスク／プロジェクト／会話に属する記憶をまとめるためのグルーピングキー。**解決順**: (1) `/buffer`・`/search` API 呼び出しでの明示的な `session_id` 引数（最優先 — 既にセッションを管理しているホストが使う。例：n3memory-lite はタスク番号を割り当てる、Ollama 風のチャット切替 UI はチャット ID を渡せる）; (2) `N3MC_SESSION_ID` 環境変数; (3) サーバー起動時に生成するプロセス単位の UUIDv4（ホスト由来のセッション ID を取得できない Claude Code 等のフォールバック）。全レコードに刻印するが、**`config.json` には永続化しない** — `session_id` は永続的なインストールではなく、一時的なタスク／プロジェクトを識別するためのもの。`b_session` ランキングバイアス（一致 1.0／不一致 0.6）を駆動し、現在のタスクの記憶を無関係な過去セッションより上位に浮上させる。
+- **Session ID**: 1 つのタスク／プロジェクト／会話に属する記憶をまとめるためのグルーピングキー。**解決順**: (1) `/buffer`・`/search` API 呼び出しでの明示的な `session_id` 引数（最優先 — 既にセッションを管理しているホストが使う。例：n3memory-lite はタスク番号を割り当てる、Ollama 風のチャット切替 UI はチャット ID を渡せる）; (2) `N3MC_SESSION_ID` 環境変数（CLI の `--buffer` / `--search` は、呼び出したプロセスにこの値があれば (1) の `session_id` として送る。常駐サーバーはふつうフックが起動するので、サーバー自身の環境には利用者が CLI 側で設定した値がない。送らないと、利用者の値は効かない。2026-11-20）; (3) サーバー起動時に生成するプロセス単位の UUIDv4（ホスト由来のセッション ID を取得できない Claude Code 等のフォールバック）。全レコードに刻印するが、**`config.json` には永続化しない** — `session_id` は永続的なインストールではなく、一時的なタスク／プロジェクトを識別するためのもの。`b_session` ランキングバイアス（一致 1.0／不一致 0.6）を駆動し、現在のタスクの記憶を無関係な過去セッションより上位に浮上させる。
 
 `config.json` の完全スキーマ（未設定項目は以下の規定値で自動初期化せよ）:
 
@@ -506,7 +508,7 @@ PRAGMA wal_autocheckpoint = 1000;
 
 > **DB 変更（応用）**: 現仕様は SQLite + sqlite-vec を前提としているが、チーム規模が大きい場合は PostgreSQL + pgvector への移行も技術的に可能である。スキーマ互換性・接続プール・マイグレーション手順については Claude Code に相談すること。
 
-- **主キー**: UUIDv7（時系列ソート可能。DB挿入時に生成）。外部ライブラリ `uuid7`（PyPI）を使用せよ。
+- **主キー**: UUIDv7（時系列ソート可能。DB挿入時に生成）。外部ライブラリ `uuid7`（PyPI）を使用せよ。インポートは `from uuid_extensions import uuid7` で、ID は `str(uuid7())` とする（配布名は `uuid7` だがモジュール名は `uuid_extensions` なので、`import uuid7` は `ModuleNotFoundError` になる）。
 
 ### ランキング式
 
@@ -532,6 +534,8 @@ SQLite FTS5 の `bm25()` は負値（より負 ＝ より関連度高）を返�
 $$keyword\_relevance = \frac{-bm25\_score}{\max(1.0,\ \max_{results}(-bm25\_score))}$$
 
 検索結果が0件の場合は `keyword_relevance = 0.0` とする。
+
+**例外: 記録が 2 件以下の DB（2026-11-20）**: FTS5 は記録が 1〜2 件だと IDF を約 `1e-6` に丸めるため、本物の一致でも生スコアが約 `-2e-6` になり、手順 1 で 0 になってキーワードの一致が消える（埋め込みを使えないと検索結果が 0 件になる）。`memories` が 2 件以下のときだけ、手順 1 を行わず、`keyword_relevance = -bm25_score ÷ 最大の(-bm25_score)`（最良の一致が 1.0）とする。3 件以上の DB では上の式のまま。
 
 2026-11-17 から、キーワード検索は 2 つの FTS5 の表（trigram と、下の CJK バイグラム）で行う。bm25 は**表ごとに、その表の**最大値で割る。両方で当たった記録は、高いほうの `keyword_relevance` を使う。
 
@@ -1271,7 +1275,7 @@ CLI は FastAPI サーバーへ HTTP リクエストを送信する。全エン�
 | メソッド | パス | 対応CLIコマンド | 説明 |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | （内部死活監視） | `{"status": "ok", "root", "code_version", "pid"}` を返す（§3「サーバーの名乗り」） |
-| `POST` | `/buffer` | `--buffer`、フック | 本文 `{"content": str, "agent_name": str?, "local_id": str?, "session_id": str?, "turn_id": str?}`（`local_id` 省略時 → `config.json`、`session_id` 省略時 → サーバーのセッション。§3「識別子」）。保存する |
+| `POST` | `/buffer` | `--buffer`、フック | 本文 `{"content": str, "agent_name": str?, "local_id": str?, "session_id": str?, "turn_id": str?}`（`local_id` 省略時 → `config.json`、`session_id` 省略時 → サーバーのセッション。§3「識別子」。CLI は `N3MC_SESSION_ID` があれば送る）。保存する |
 | `POST` | `/search` | `--search`、`--hook-submit` | 本文 `{"query": str, "session_id": str?, "since": str?, "until": str?}`。`since` / `until` は CLI と同じ規則で解釈する（§3.6）。読めない値には 400 を返す。結果を返す |
 | `POST` | `/repair` | `--repair`、`--hook-submit` | 本文は省略可: `{"max_records": int?}`（§3.5「マイグレーションのバッチ処理」）。未インデックスレコードを修復 |
 | `GET` | `/list` | （対応する CLI コマンドなし） | 全レコードの一覧を返す（各レコードに `agent_name` を含む）。API クライアントのために残している。`--list`・`--recall-thread`・`--show-turn` は DB を直接読み、これを呼ばない |

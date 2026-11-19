@@ -1,20 +1,29 @@
+"""DB layer: schema, CRUD, PRAGMAs, migrations, FTS5 helpers, KNN search.
+
+Durability first: every write is INSERT + COMMIT at the moment it happens.
+No write buffering, no async writes, no batched transactions.
+"""
+import os
+import re
 import sqlite3
 import struct
-import re
-import logging
-from typing import Optional, List
 
-logger = logging.getLogger(__name__)
+from .. import paths
 
-# spec §3: trigram tokenizer for Japanese substring matching
+BUSY_TIMEOUT_SECONDS = 10
+EMBED_DIM = 768
+
+# ---------------------------------------------------------------- FTS helpers
+
 _FTS_PUNCT_RE = re.compile(
     r'[「」『』【】（）()\[\]{}<>〈〉《》・、。,.!！?？;；:：\-―─…\'\"“”‘’]'
 )
-_FTS_MAX_TERMS = 40
+_FTS_MAX_TERMS = 40  # keeps FTS5 from freezing on huge inputs
 _FTS_CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')
-# CJK: hiragana, katakana, CJK ideographs, compatibility ideographs, hangul
-_CJK_CHAR_RE = re.compile(r'[぀-ヿ㐀-鿿豈-﫿가-힯]')
-_HIRAGANA_ONLY_RE = re.compile(r'^[぀-ゟー]+$')
+_CJK_CLASS = '぀-ヿ㐀-鿿豈-﫿가-힯'
+_CJK_CHAR_RE = re.compile('[' + _CJK_CLASS + ']')
+_CJK_RUN_RE = re.compile('[' + _CJK_CLASS + ']+|[^' + _CJK_CLASS + r'\s]+')
+_HIRAGANA_ONLY_RE = re.compile('^[぀-ゟー]+$')
 
 
 def strip_fts_punctuation(text: str) -> str:
@@ -22,32 +31,31 @@ def strip_fts_punctuation(text: str) -> str:
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 
-def _query_words(query: str) -> list:
-    """Control chars and punctuation → spaces, then split on whitespace."""
-    return _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or '')).split()
+def _quote_terms(terms):
+    return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
-def _quote_or(terms: list) -> str:
-    return ' OR '.join('"' + t.replace('"', '""') + '"' for t in terms)
+# Experimental (2026-11-20, eval P3; not in the spec): English function words dropped from the
+# keyword search when config "fts_stopwords" is true. Off by default.
+EN_STOPWORDS = frozenset("""
+a an the and or but if of to in on at by for with from as into onto about over under than then
+so too very just is are was were be been being am do does did done have has had having it its
+this that these those there here what which who whom whose when where why how i we you he she
+they me us our ours your yours my mine their theirs his her hers them not no can could should
+would will shall may might must also any some all each such only own same other more most
+get got please tell know let lets
+""".split())
 
 
-def _build_fts_query(query: str) -> str:
-    """spec §3 (2026-11-17): build a safe FTS5 MATCH string for the trigram
-    index.
+def _drop_stopwords(terms):
+    kept = [t for t in terms if t.lower() not in EN_STOPWORDS]
+    return kept or terms  # a query made only of function words is searched as typed
 
-    Control chars and punctuation → spaces → split on whitespace. A word of
-    more than 3 characters that contains CJK is split into its overlapping
-    3-character grams (Japanese has no spaces, so the whole sentence used to
-    be one term that matched only a record containing that exact sentence);
-    hiragana-only grams (してく, ください) are dropped. Other words of 3+
-    characters stay whole; shorter words are dropped (trigram can never
-    match them; the bigram index covers them). Duplicates removed, at most
-    40 terms, each quoted as an FTS5 string, joined with OR. Returns "" when
-    the keyword search should be skipped.
-    """
-    terms: list = []
-    seen: set = set()
-    for word in _query_words(query):
+
+def fts_terms(query: str, stopwords: bool = False) -> list:
+    """The trigram search terms of ``query`` (in order, de-duplicated, at most 40)."""
+    terms, seen = [], set()
+    for word in _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or '')).split():
         if len(word) > 3 and _CJK_CHAR_RE.search(word):
             grams = [word[i:i + 3] for i in range(len(word) - 2)]
             grams = [g for g in grams if not _HIRAGANA_ONLY_RE.match(g)]
@@ -59,295 +67,216 @@ def _build_fts_query(query: str) -> str:
             if g not in seen:
                 seen.add(g)
                 terms.append(g)
-    terms = terms[:_FTS_MAX_TERMS]
-    if not terms:
-        return ''                                 # → skip keyword search
-    return _quote_or(terms)
+    if stopwords:
+        terms = _drop_stopwords(terms)
+    return terms[:_FTS_MAX_TERMS]
 
 
-def _bigram_tokens(text: str) -> list:
-    """Tokens for memories_fts_bi: each CJK run becomes its overlapping
-    2-character grams (a 1-character run stays as it is); other runs (Latin
-    words, numbers) stay whole. Punctuation is stripped as on the trigram
-    side. Example: `N3MCの設定` → `N3MC の設 設定`."""
-    folded = _FTS_CTRL_RE.sub(' ', strip_fts_punctuation(text or ''))
-    out: list = []
-    for word in folded.split():
-        run, run_is_cjk = '', None
-        for ch in word + '\0':
-            is_cjk = ch != '\0' and bool(_CJK_CHAR_RE.match(ch))
-            if run and (ch == '\0' or is_cjk != run_is_cjk):
-                if run_is_cjk and len(run) > 1:
-                    out.extend(run[i:i + 2] for i in range(len(run) - 1))
-                else:
-                    out.append(run)
-                run = ''
-            if ch != '\0':
-                run += ch
-                run_is_cjk = is_cjk
+def _build_fts_query(query: str, stopwords: bool = False) -> str:
+    """trigram MATCH query: quoted terms joined by OR. '' means 'skip the search'."""
+    terms = fts_terms(query, stopwords)
+    return _quote_terms(terms) if terms else ""
+
+
+def _bigram_tokens(text: str):
+    """Tokens of ``text`` (already punctuation-stripped): CJK runs become overlapping
+    2-character pieces, everything else is kept whole."""
+    out = []
+    for tok in _CJK_RUN_RE.findall(text):
+        if _CJK_CHAR_RE.match(tok[0]) and len(tok) >= 2:
+            out.extend(tok[i:i + 2] for i in range(len(tok) - 1))
+        else:
+            out.append(tok)
     return out
 
 
-def bigram_text(text: str) -> str:
-    """The text stored in memories_fts_bi: tokens joined by spaces."""
-    return ' '.join(_bigram_tokens(text))
+def bigram_text(content: str) -> str:
+    """What goes into memories_fts_bi: ``N3MCの設定`` -> ``N3MC の設 設定``."""
+    return " ".join(_bigram_tokens(strip_fts_punctuation(content)))
 
 
-def build_bigram_query(query: str) -> str:
-    """spec §3 (2026-11-17): MATCH string for memories_fts_bi — the query's
-    bigram tokens, quoted and OR-ed. Hiragana-only tokens (して, ます) are
-    dropped when anything else is left; a 1-character non-CJK token is
-    dropped. Unlike the trigram side, 2-character words (記憶, PR) match.
-    Returns "" when there is nothing to search."""
-    terms: list = []
-    seen: set = set()
-    for t in _bigram_tokens(_FTS_PUNCT_RE.sub(' ', query or '')):
-        if t in seen:
+def bigram_terms(query: str, stopwords: bool = False) -> list:
+    """The bigram-table search terms of ``query`` (in order, de-duplicated, at most 40)."""
+    cleaned = _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or ''))
+    terms, seen = [], set()
+    for tok in _bigram_tokens(cleaned):
+        is_cjk = bool(_CJK_CHAR_RE.match(tok[0]))
+        if not is_cjk and len(tok) < 2:
             continue
-        seen.add(t)
-        if len(t) < 2 and not _CJK_CHAR_RE.match(t):
-            continue
-        terms.append(t)
-    content = [t for t in terms if not _HIRAGANA_ONLY_RE.match(t)]
-    terms = (content or terms)[:_FTS_MAX_TERMS]
-    if not terms:
-        return ''
-    return _quote_or(terms)
+        if tok not in seen:
+            seen.add(tok)
+            terms.append(tok)
+    non_hira = [t for t in terms if not _HIRAGANA_ONLY_RE.match(t)]
+    if non_hira:
+        terms = non_hira
+    if stopwords:
+        terms = _drop_stopwords(terms)
+    return terms[:_FTS_MAX_TERMS]
 
 
-# Public alias (pre-v1.4.0 draft name).
-build_fts_query = _build_fts_query
+def build_bigram_query(query: str, stopwords: bool = False) -> str:
+    terms = bigram_terms(query, stopwords)
+    return _quote_terms(terms) if terms else ""
 
 
-def serialize_vector(vec: list) -> bytes:
-    return struct.pack(f'{len(vec)}f', *vec)
+# ------------------------------------------------------------ vectors / conn
+
+def serialize_vector(vec) -> bytes:
+    values = [float(x) for x in vec]
+    return struct.pack(f"{len(values)}f", *values)
 
 
-def deserialize_vector(data: bytes) -> list:
-    n = len(data) // 4
-    return list(struct.unpack(f'{n}f', data))
+def deserialize_vector(blob) -> list:
+    return list(struct.unpack(f"{len(blob) // 4}f", bytes(blob)))
 
 
-def _load_vec_extension(conn: sqlite3.Connection) -> None:
-    # spec §5: idempotent — duplicate load is a no-op
+def _load_vec_extension(conn):
+    """Load sqlite-vec. Loading twice is harmless."""
+    try:
+        import sqlite_vec
+    except ImportError as e:
+        raise RuntimeError(f"sqlite-vec is not installed. Recovery: pip install sqlite-vec ({e})")
     try:
         conn.enable_load_extension(True)
-        try:
-            import sqlite_vec
-            sqlite_vec.load(conn)
-        except Exception as e1:
-            msg = str(e1).lower()
-            if 'already' in msg or 'duplicate' in msg:
-                return
-            try:
-                conn.load_extension('vec0')
-            except Exception as e2:
-                msg2 = str(e2).lower()
-                if 'already' in msg2 or 'duplicate' in msg2:
-                    return
-                raise e2
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
     except Exception as e:
         msg = str(e).lower()
-        if 'already' in msg or 'duplicate' in msg:
+        if "already" in msg or "duplicate" in msg:
             return
-        raise
+        raise RuntimeError(f"could not load sqlite-vec ({e}). Recovery: pip install sqlite-vec")
 
 
-BUSY_TIMEOUT_SECONDS = 10
-
-
-def get_connection(db_path: str) -> sqlite3.Connection:
-    # spec §3 (F11): an explicit busy timeout of 10 s (the default was
-    # 5 s); writers wait this long for another connection's write.
+def get_connection(db_path=None):
+    db_path = db_path or paths.DB_PATH
+    folder = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(folder, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_SECONDS)
     try:
-        _load_vec_extension(conn)
-    except Exception as e:
-        conn.close()
-        raise sqlite3.DatabaseError(
-            f"Failed to load sqlite-vec extension: {e}. "
-            "Recovery: pip install sqlite-vec"
-        ) from e
-    # spec §3: SQLite durability settings. A failure here (F13: e.g. "file is
-    # not a database") closes the connection first, so the file can be moved.
-    try:
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA wal_autocheckpoint = 1000")
-    except BaseException:
+    except Exception:
         conn.close()
         raise
-    conn.row_factory = sqlite3.Row
+    try:
+        _load_vec_extension(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id         TEXT PRIMARY KEY,
-            content    TEXT NOT NULL,
-            timestamp  TEXT NOT NULL,
-            owner_id   TEXT NOT NULL,
-            local_id   TEXT,
-            agent_name TEXT,
-            session_id TEXT,
-            turn_id    TEXT
-        )
-    """)
-    # spec §3: standalone FTS5 with trigram tokenizer
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-            content,
-            tokenize='trigram'
-        )
-    """)
-    # spec §3 (2026-11-17): CJK bigram index. trigram cannot match a
-    # 2-character word (記憶, PR); this table stores bigram_text(content)
-    # and unicode61 makes each gram one token. Rows share memories.rowid.
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts_bi USING fts5(
-            content,
-            tokenize='unicode61'
-        )
-    """)
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
-            embedding float[768]
-        )
-    """)
-    # spec §3.5 "Index metadata" (v1.8.0): how the indexes were built, kept
-    # inside the database so that a copied or restored DB carries it.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    )
+def _table_exists(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+    ).fetchone() is not None
+
+
+_MEMORIES_DDL = """
+CREATE TABLE IF NOT EXISTS memories (
+    id          TEXT PRIMARY KEY,
+    content     TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    owner_id    TEXT NOT NULL,
+    local_id    TEXT,
+    agent_name  TEXT,
+    session_id  TEXT,
+    turn_id     TEXT
+)
+"""
+
+
+def migrate_schema(conn):
+    """Idempotent: add missing columns / index, move FTS to the trigram tokenizer."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()}
-    if 'turn_id' in cols:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)"
-        )
+    for col in ("local_id", "agent_name", "session_id", "turn_id"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {col} TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)")
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'memories_fts'").fetchone()
+    if row and row[0] and "trigram" not in row[0].lower():
+        conn.execute("DROP TABLE memories_fts")
+        conn.execute("CREATE VIRTUAL TABLE memories_fts USING fts5(content, tokenize='trigram')")
+        for r in conn.execute("SELECT rowid, content FROM memories").fetchall():
+            conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+                         (r[0], strip_fts_punctuation(r[1])))
     conn.commit()
 
 
-def meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+def init_db(conn):
+    conn.execute(_MEMORIES_DDL)
+    migrate_schema(conn)
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts "
+                 "USING fts5(content, tokenize='trigram')")
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts_bi "
+                 "USING fts5(content, tokenize='unicode61')")
+    conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
+                 f"USING vec0(embedding float[{EMBED_DIM}])")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.commit()
+
+
+# ----------------------------------------------------------------- meta table
+
+def get_meta(conn, key, default=None):
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else None
+    return row[0] if row else default
 
 
-def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
-    """Caller commits."""
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, str(value)))
-
-
-def meta_delete(conn: sqlite3.Connection, key: str) -> None:
-    """Caller commits."""
-    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
-
-
-def vec_table_dim(conn: sqlite3.Connection) -> Optional[int]:
-    """Dimension of memories_vec from its CREATE statement."""
-    import re
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE name = 'memories_vec'").fetchone()
-    m = re.search(r"float\s*\[\s*(\d+)\s*\]", row[0] if row and row[0] else "")
-    return int(m.group(1)) if m else None
-
-
-def migrate_schema(conn: sqlite3.Connection) -> None:
-    cursor = conn.execute("PRAGMA table_info(memories)")
-    existing_cols = {row[1] for row in cursor.fetchall()}
-
-    for col, typedef in [
-        ("local_id",   "TEXT"),
-        ("agent_name", "TEXT"),
-        ("session_id", "TEXT"),
-        ("turn_id",    "TEXT"),
-    ]:
-        if col not in existing_cols:
-            try:
-                conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {typedef}")
-                conn.commit()
-            except Exception:
-                pass
-
-    cursor = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_turn_id'"
-    )
-    if not cursor.fetchone():
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)")
-        conn.commit()
-
-    # spec §3: migrate FTS tokenizer from porter unicode61 to trigram
-    cursor = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
-    )
-    row = cursor.fetchone()
-    if row and row[0]:
-        sql_lower = row[0].lower()
-        if 'trigram' not in sql_lower:
-            existing_fts = conn.execute(
-                "SELECT rowid, content FROM memories_fts"
-            ).fetchall()
-            conn.execute("DROP TABLE IF EXISTS memories_fts")
-            conn.execute("""
-                CREATE VIRTUAL TABLE memories_fts USING fts5(
-                    content,
-                    tokenize='trigram'
-                )
-            """)
-            for r in existing_fts:
-                stripped = strip_fts_punctuation(r[1])
-                conn.execute(
-                    "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
-                    (r[0], stripped)
-                )
-            conn.commit()
-            logger.info("Migrated FTS tokenizer to trigram")
-
-
-def insert_memory(
-    conn: sqlite3.Connection,
-    id: str,
-    content: str,
-    timestamp: str,
-    owner_id: str,
-    embedding: Optional[list] = None,
-    local_id: Optional[str] = None,
-    agent_name: Optional[str] = None,
-    session_id: Optional[str] = None,
-    turn_id: Optional[str] = None,
-) -> int:
-    conn.execute(
-        """INSERT INTO memories
-           (id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id),
-    )
-    rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    # spec §3: FTS stores punctuation-stripped text; memories stores original
-    stripped = strip_fts_punctuation(content)
-    conn.execute(
-        "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)", (rowid, stripped)
-    )
-    conn.execute(
-        "INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
-        (rowid, bigram_text(content)),
-    )
-    if embedding is not None:
-        conn.execute(
-            "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-            (rowid, serialize_vector(embedding)),
-        )
+def set_meta(conn, key, value):
+    conn.execute("INSERT INTO meta(key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
     conn.commit()
-    return rowid
 
 
-def insert_memory_once(conn: sqlite3.Connection, id: str, content: str, timestamp: str,
-                       owner_id: str, turn_id: Optional[str] = None, **kw) -> Optional[int]:
-    """spec §5.4 (R04): the exact-duplicate check again, inside the write.
+def delete_meta(conn, *keys):
+    for k in keys:
+        conn.execute("DELETE FROM meta WHERE key = ?", (k,))
+    conn.commit()
 
-    BEGIN IMMEDIATE lets one writer in at a time, so two saves of the same text
-    for the same turn that both passed the first check cannot both insert.
-    Returns the new rowid, or None for a duplicate (nothing written)."""
+
+# ----------------------------------------------------------------------- CRUD
+
+def insert_memory(conn, id, content, timestamp, owner_id, local_id=None, agent_name=None,
+                  session_id=None, embedding=None, *, turn_id=None):
+    """INSERT into memories + both FTS tables (+ vec when an embedding is given), then COMMIT."""
+    try:
+        cur = conn.execute(
+            "INSERT INTO memories(id, content, timestamp, owner_id, local_id, agent_name, "
+            "session_id, turn_id) VALUES (?,?,?,?,?,?,?,?)",
+            (id, content, timestamp, owner_id, local_id, agent_name, session_id, turn_id),
+        )
+        rowid = cur.lastrowid
+        conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+                     (rowid, strip_fts_punctuation(content)))
+        conn.execute("INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
+                     (rowid, bigram_text(content)))
+        if embedding is not None:
+            conn.execute("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                         (rowid, serialize_vector(embedding)))
+        conn.commit()
+        return rowid
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def check_exact_duplicate(conn, content, turn_id=None):
+    """Exact same text only. With a turn_id the comparison is within that turn."""
+    if turn_id:
+        row = conn.execute("SELECT 1 FROM memories WHERE content = ? AND turn_id = ? LIMIT 1",
+                           (content, turn_id)).fetchone()
+    else:
+        row = conn.execute("SELECT 1 FROM memories WHERE content = ? LIMIT 1",
+                           (content,)).fetchone()
+    return row is not None
+
+
+def insert_memory_once(conn, id, content, timestamp, owner_id, local_id=None, agent_name=None,
+                       session_id=None, embedding=None, *, turn_id=None):
+    """Re-check for a duplicate inside a write lock (R04). None means 'duplicate, not stored'."""
     if conn.in_transaction:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
@@ -355,267 +284,49 @@ def insert_memory_once(conn: sqlite3.Connection, id: str, content: str, timestam
         if check_exact_duplicate(conn, content, turn_id=turn_id):
             conn.rollback()
             return None
-        return insert_memory(conn, id, content, timestamp, owner_id, turn_id=turn_id, **kw)
-    except BaseException:
-        if conn.in_transaction:
-            conn.rollback()
+    except Exception:
+        conn.rollback()
         raise
+    return insert_memory(conn, id, content, timestamp, owner_id, local_id, agent_name,
+                         session_id, embedding, turn_id=turn_id)
 
 
-def search_vector(
-    conn: sqlite3.Connection, embedding: list, k: int = 50
-) -> List[sqlite3.Row]:
-    vec_bytes = serialize_vector(embedding)
-    try:
-        cursor = conn.execute(
-            """SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
-                      m.agent_name, m.session_id, m.turn_id, mv.distance, m.rowid
-               FROM memories_vec mv
-               JOIN memories m ON mv.rowid = m.rowid
-               WHERE mv.embedding MATCH ?
-                 AND k = ?
-               ORDER BY mv.distance""",
-            (vec_bytes, k),
-        )
-        return cursor.fetchall()
-    except Exception as e:
-        logger.warning(f"Vector search failed: {e}")
-        return []
+def count_memories(conn):
+    return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
 
 
-_MEMORY_COLS = ("m.id, m.content, m.timestamp, m.owner_id, m.local_id, "
-                "m.agent_name, m.session_id, m.turn_id")
-
-
-def _time_filter(since: Optional[str], until: Optional[str]):
-    clauses, params = [], []
+def _time_where(since, until, column="timestamp"):
+    parts, params = [], []
     if since:
-        clauses.append("timestamp >= ?")
+        parts.append(f"{column} >= ?")
         params.append(since)
     if until:
-        clauses.append("timestamp <= ?")
+        parts.append(f"{column} <= ?")
         params.append(until)
-    return " AND ".join(clauses), params
+    return " AND ".join(parts), params
 
 
-def _rows_with_distance(conn, dist_rows) -> List[dict]:
-    """Join (rowid, distance) pairs back to memories, keeping distance order."""
-    if not dist_rows:
-        return []
-    rowids = [r[0] for r in dist_rows]
-    placeholders = ','.join('?' * len(rowids))
-    rows = conn.execute(
-        f"SELECT {_MEMORY_COLS}, m.rowid AS rowid FROM memories m "
-        f"WHERE m.rowid IN ({placeholders})",
-        rowids,
-    ).fetchall()
-    by_rowid = {r['rowid']: r for r in rows}
-    out = []
-    for rowid, dist in dist_rows:
-        r = by_rowid.get(rowid)
-        if r is None:
-            continue
-        d = dict(r)
-        d['distance'] = dist
-        out.append(d)
-    return out
+def get_all_memories(conn, since=None, until=None):
+    where, params = _time_where(since, until)
+    sql = "SELECT rowid AS rowid, * FROM memories"
+    if where:
+        sql += " WHERE " + where
+    sql += " ORDER BY rowid"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
-def _search_vector_exact(
-    conn: sqlite3.Connection,
-    embedding: list,
-    k: int = 50,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> List[dict]:
-    """spec §3 (v1.4.0) fallback when KNN with `rowid IN (subquery)` raises
-    OperationalError (older sqlite-vec): compute vec_distance_l2 for every
-    filtered row and sort by distance."""
-    where, tparams = _time_filter(since, until)
-    sub = f"SELECT rowid FROM memories WHERE {where}" if where else "SELECT rowid FROM memories"
-    dist_rows = conn.execute(
-        f"""SELECT mv.rowid, vec_distance_l2(mv.embedding, ?) AS distance
-            FROM memories_vec mv
-            WHERE mv.rowid IN ({sub})
-            ORDER BY distance
-            LIMIT ?""",
-        [serialize_vector(embedding)] + tparams + [k],
-    ).fetchall()
-    return _rows_with_distance(conn, [(r[0], r[1]) for r in dist_rows])
+def get_memories_by_turn_id(conn, turn_id):
+    """All rows of one Q-A exchange: [user] first, then [claude]; rowid order inside a role."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT rowid AS rowid, * FROM memories WHERE turn_id = ? ORDER BY rowid", (turn_id,)
+    ).fetchall()]
+    rows.sort(key=lambda r: (0 if r["content"].startswith("[user") else 1, r["rowid"]))
+    return rows
 
 
-def search_vector_with_filter(
-    conn: sqlite3.Connection,
-    embedding: list,
-    k: int = 50,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> List[dict]:
-    """spec §3 (v1.4.0): KNN restricted to the filtered rowids.
-
-    vec0 picks the global top-k first, so filtering afterwards drops almost
-    every in-range record. Two stages: memories_vec (rowid IN subquery) →
-    memories. Falls back to exact vec_distance_l2 on OperationalError.
-    """
-    where, tparams = _time_filter(since, until)
-    if not where:
-        return [dict(r) for r in search_vector(conn, embedding, k=k)]
-    vec_bytes = serialize_vector(embedding)
-    try:
-        dist_rows = conn.execute(
-            f"""SELECT rowid, distance FROM memories_vec
-                WHERE embedding MATCH ? AND k = ?
-                  AND rowid IN (SELECT rowid FROM memories WHERE {where})""",
-            [vec_bytes, k] + tparams,
-        ).fetchall()
-        return _rows_with_distance(conn, [(r[0], r[1]) for r in dist_rows])
-    except sqlite3.OperationalError as e:
-        logger.warning(f"Filtered KNN unavailable ({e}); using exact search")
-        try:
-            return _search_vector_exact(conn, embedding, k=k, since=since, until=until)
-        except Exception as e2:
-            logger.warning(f"Vector search (filtered) failed: {e2}")
-            return []
-
-
-def get_vector(conn: sqlite3.Connection, rowid: int) -> Optional[list]:
-    row = conn.execute(
-        "SELECT embedding FROM memories_vec WHERE rowid = ?", (rowid,)
-    ).fetchone()
-    if not row or row[0] is None:
-        return None
-    return deserialize_vector(row[0])
-
-
-def search_fts(
-    conn: sqlite3.Connection,
-    query: str,
-    limit: int = 50,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> List[sqlite3.Row]:
-    # spec §3 (v1.5.0): punctuation → spaces, terms ≥ 3 chars, quoted, OR
-    fts_query = _build_fts_query(query)
-    if not fts_query:
-        return []
-
-    time_clauses = []
-    params: list = [fts_query]
-    if since:
-        time_clauses.append("m.timestamp >= ?")
-        params.append(since)
-    if until:
-        time_clauses.append("m.timestamp <= ?")
-        params.append(until)
-    time_sql = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
-    params.append(limit)
-
-    try:
-        cursor = conn.execute(
-            f"""SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
-                      m.agent_name, m.session_id, m.turn_id,
-                      bm25(memories_fts) AS bm25_score, m.rowid
-               FROM memories_fts
-               JOIN memories m ON memories_fts.rowid = m.rowid
-               WHERE memories_fts MATCH ?{time_sql}
-               ORDER BY bm25_score
-               LIMIT ?""",
-            params,
-        )
-        return cursor.fetchall()
-    except Exception as e:
-        logger.warning(f"FTS search failed: {e}")
-        return []
-
-
-def search_fts_bigram(
-    conn: sqlite3.Connection,
-    query: str,
-    limit: int = 50,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> List[sqlite3.Row]:
-    """spec §3 (2026-11-17): same rows and columns as search_fts, from the
-    bigram index. Exceptions are left to the caller (hybrid_search keeps
-    the trigram results when this fails)."""
-    fts_query = build_bigram_query(query)
-    if not fts_query:
-        return []
-    time_clauses = []
-    params: list = [fts_query]
-    if since:
-        time_clauses.append("m.timestamp >= ?")
-        params.append(since)
-    if until:
-        time_clauses.append("m.timestamp <= ?")
-        params.append(until)
-    time_sql = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
-    params.append(limit)
-    return conn.execute(
-        f"""SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
-                  m.agent_name, m.session_id, m.turn_id,
-                  bm25(memories_fts_bi) AS bm25_score, m.rowid
-           FROM memories_fts_bi
-           JOIN memories m ON memories_fts_bi.rowid = m.rowid
-           WHERE memories_fts_bi MATCH ?{time_sql}
-           ORDER BY bm25_score
-           LIMIT ?""",
-        params,
-    ).fetchall()
-
-
-def fill_bigram_index(conn: sqlite3.Connection, batch_size: int = 500) -> int:
-    """spec §3 (2026-11-17): add the memories_fts_bi rows that are missing
-    (records saved before the table existed). Idempotent."""
-    total = 0
-    while True:
-        rows = conn.execute(
-            "SELECT m.rowid, m.content FROM memories m "
-            "WHERE NOT EXISTS (SELECT 1 FROM memories_fts_bi b "
-            "WHERE b.rowid = m.rowid) LIMIT ?",
-            (batch_size,),
-        ).fetchall()
-        if not rows:
-            break
-        conn.executemany(
-            "INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
-            [(r[0], bigram_text(r[1])) for r in rows],
-        )
-        conn.commit()
-        total += len(rows)
-    return total
-
-
-def get_all_memories(
-    conn: sqlite3.Connection,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> List[sqlite3.Row]:
-    clauses = []
-    params: list = []
-    if since:
-        clauses.append("timestamp >= ?")
-        params.append(since)
-    if until:
-        clauses.append("timestamp <= ?")
-        params.append(until)
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    cursor = conn.execute(
-        f"""SELECT id, content, timestamp, owner_id, local_id, agent_name,
-                  session_id, turn_id, rowid
-           FROM memories {where}
-           ORDER BY rowid""",
-        params,
-    )
-    return cursor.fetchall()
-
-
-def delete_memory(conn: sqlite3.Connection, memory_id: str) -> bool:
-    # spec §5: load vec extension first, then transactional 3-table DELETE
+def delete_memory(conn, memory_id):
     _load_vec_extension(conn)
-    row = conn.execute(
-        "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
-    ).fetchone()
+    row = conn.execute("SELECT rowid FROM memories WHERE id = ?", (memory_id,)).fetchone()
     if not row:
         return False
     rowid = row[0]
@@ -623,7 +334,7 @@ def delete_memory(conn: sqlite3.Connection, memory_id: str) -> bool:
         conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (rowid,))
         conn.execute("DELETE FROM memories_fts_bi WHERE rowid = ?", (rowid,))
         conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (rowid,))
-        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        conn.execute("DELETE FROM memories WHERE rowid = ?", (rowid,))
         conn.commit()
         return True
     except Exception:
@@ -631,116 +342,100 @@ def delete_memory(conn: sqlite3.Connection, memory_id: str) -> bool:
         raise
 
 
-def count_memories(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-
-
-def check_exact_duplicate(
-    conn: sqlite3.Connection, content: str, turn_id: Optional[str] = None
-) -> bool:
-    """spec §5.4 (v1.4.0): exact-text duplicate only.
-
-    With turn_id: compare within the same turn only (a re-made setting whose
-    unchanged chunks equal the old version's must still be saved).
-    Without turn_id (manual --buffer): compare globally.
-    """
-    if turn_id:
-        row = conn.execute(
-            "SELECT 1 FROM memories WHERE content = ? AND turn_id = ? LIMIT 1",
-            (content, turn_id),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT 1 FROM memories WHERE content = ? LIMIT 1", (content,)
-        ).fetchone()
-    return row is not None
-
-
-def find_unindexed_memories(
-    conn: sqlite3.Connection, limit: int = 200, offset: int = 0
-) -> List[sqlite3.Row]:
-    # spec §3.5: OFFSET should always be 0 in repair loops — repaired records
-    # disappear from this result set automatically, so incrementing OFFSET
-    # skips remaining unrepaired records.
-    cursor = conn.execute(
-        """SELECT m.id, m.content, m.timestamp, m.owner_id, m.local_id,
-                  m.agent_name, m.session_id, m.turn_id, m.rowid,
-                  mv.rowid AS vec_rowid,
-                  mf.rowid AS fts_rowid
-           FROM memories m
-           LEFT JOIN memories_vec mv ON m.rowid = mv.rowid
-           LEFT JOIN memories_fts mf ON m.rowid = mf.rowid
-           WHERE mv.rowid IS NULL OR mf.rowid IS NULL
-           LIMIT ? OFFSET ?""",
-        (limit, offset),
-    )
-    return cursor.fetchall()
-
-
-def get_memories_by_turn_id(
-    conn: sqlite3.Connection, turn_id: str
-) -> List[sqlite3.Row]:
-    cursor = conn.execute(
-        """SELECT id, content, timestamp, owner_id, local_id, agent_name,
-                  session_id, turn_id, rowid
-           FROM memories
-           WHERE turn_id = ?
-           ORDER BY
-               CASE WHEN content LIKE '[user%' THEN 0 ELSE 1 END,
-               rowid""",
-        (turn_id,),
-    )
-    return cursor.fetchall()
-
-
-def get_thread_context(
-    conn: sqlite3.Connection,
-    turn_id: str,
-    before: int = 2,
-    after: int = 2,
-) -> List[sqlite3.Row]:
-    """Return records for turn_id plus N surrounding turns (before/after)."""
-    target_rows = conn.execute(
-        "SELECT MIN(rowid) AS min_r, MAX(rowid) AS max_r FROM memories WHERE turn_id = ?",
-        (turn_id,),
-    ).fetchone()
-    if not target_rows or target_rows['min_r'] is None:
-        return []
-
-    min_r = target_rows['min_r']
-    max_r = target_rows['max_r']
-
-    before_turns_rows = conn.execute(
-        """SELECT DISTINCT turn_id FROM memories
-           WHERE rowid < ? AND turn_id IS NOT NULL AND turn_id != ?
-           GROUP BY turn_id
-           ORDER BY MAX(rowid) DESC
-           LIMIT ?""",
-        (min_r, turn_id, before),
+def find_unindexed_memories(conn, limit=200):
+    """Rows missing from memories_vec or memories_fts (double LEFT JOIN)."""
+    rows = conn.execute(
+        "SELECT m.rowid AS rowid, m.id, m.content, m.timestamp, m.owner_id, m.turn_id, "
+        "       (mv.rowid IS NOT NULL) AS has_vec, (mf.rowid IS NOT NULL) AS has_fts "
+        "FROM memories m "
+        "LEFT JOIN memories_vec mv ON mv.rowid = m.rowid "
+        "LEFT JOIN memories_fts mf ON mf.rowid = m.rowid "
+        "WHERE mv.rowid IS NULL OR mf.rowid IS NULL "
+        "ORDER BY m.rowid LIMIT ?", (limit,)
     ).fetchall()
-    before_turn_ids = [r[0] for r in before_turns_rows]
+    return [dict(r) for r in rows]
 
-    after_turns_rows = conn.execute(
-        """SELECT DISTINCT turn_id FROM memories
-           WHERE rowid > ? AND turn_id IS NOT NULL AND turn_id != ?
-           GROUP BY turn_id
-           ORDER BY MIN(rowid) ASC
-           LIMIT ?""",
-        (max_r, turn_id, after),
-    ).fetchall()
-    after_turn_ids = [r[0] for r in after_turns_rows]
 
-    all_turn_ids = before_turn_ids + [turn_id] + after_turn_ids
-    if not all_turn_ids:
+# --------------------------------------------------------------------- search
+
+def _rows_by_rowid(conn, rowids):
+    out = {}
+    rowids = list(rowids)
+    for i in range(0, len(rowids), 500):
+        chunk = rowids[i:i + 500]
+        q = ",".join("?" * len(chunk))
+        for r in conn.execute(f"SELECT rowid AS rowid, * FROM memories WHERE rowid IN ({q})", chunk):
+            out[r["rowid"]] = dict(r)
+    return out
+
+
+def _search_vector_exact(conn, vec, k, since=None, until=None):
+    """Brute force over the filtered rows (used when rowid IN (...) is unsupported)."""
+    where, params = _time_where(since, until, "m.timestamp")
+    sql = ("SELECT m.rowid AS rowid, vec_distance_l2(v.embedding, ?) AS distance "
+           "FROM memories_vec v JOIN memories m ON m.rowid = v.rowid")
+    if where:
+        sql += " WHERE " + where
+    sql += " ORDER BY distance LIMIT ?"
+    return conn.execute(sql, [serialize_vector(vec), *params, k]).fetchall()
+
+
+def search_vector(conn, vec, k=60, since=None, until=None):
+    """KNN. With a time range the KNN runs over the filtered rowids only (two steps)."""
+    blob = serialize_vector(vec)
+    where, params = _time_where(since, until)
+    try:
+        if where:
+            hits = conn.execute(
+                "SELECT rowid, distance FROM memories_vec WHERE embedding MATCH ? AND k = ? "
+                f"AND rowid IN (SELECT rowid FROM memories WHERE {where})",
+                [blob, k, *params]).fetchall()
+        else:
+            hits = conn.execute(
+                "SELECT rowid, distance FROM memories_vec WHERE embedding MATCH ? AND k = ?",
+                [blob, k]).fetchall()
+    except sqlite3.OperationalError:
+        if not where:
+            raise
+        hits = _search_vector_exact(conn, vec, k, since, until)
+    mem = _rows_by_rowid(conn, [h[0] for h in hits])
+    out = []
+    for h in sorted(hits, key=lambda h: h[1]):
+        m = mem.get(h[0])
+        if m:
+            m["distance"] = float(h[1])
+            out.append(m)
+    return out
+
+
+def _search_fts_table(conn, table, match, limit, since, until):
+    if not match:
         return []
+    where, params = _time_where(since, until, "m.timestamp")
+    sql = (f"SELECT m.rowid AS rowid, bm25({table}) AS bm25 FROM {table} "
+           f"JOIN memories m ON m.rowid = {table}.rowid WHERE {table} MATCH ?")
+    args = [match]
+    if where:
+        sql += " AND " + where
+        args += params
+    sql += " ORDER BY bm25 LIMIT ?"
+    args.append(limit)
+    hits = conn.execute(sql, args).fetchall()
+    mem = _rows_by_rowid(conn, [h[0] for h in hits])
+    out = []
+    for h in hits:
+        m = mem.get(h[0])
+        if m:
+            m["bm25"] = float(h[1])
+            out.append(m)
+    return out
 
-    placeholders = ','.join('?' * len(all_turn_ids))
-    cursor = conn.execute(
-        f"""SELECT id, content, timestamp, owner_id, local_id, agent_name,
-                  session_id, turn_id, rowid
-            FROM memories
-            WHERE turn_id IN ({placeholders})
-            ORDER BY rowid""",
-        all_turn_ids,
-    )
-    return cursor.fetchall()
+
+def search_fts(conn, query, limit=60, since=None, until=None, stopwords=False):
+    return _search_fts_table(conn, "memories_fts", _build_fts_query(query, stopwords), limit,
+                             since, until)
+
+
+def search_fts_bigram(conn, query, limit=60, since=None, until=None, stopwords=False):
+    return _search_fts_table(conn, "memories_fts_bi", build_bigram_query(query, stopwords), limit,
+                             since, until)

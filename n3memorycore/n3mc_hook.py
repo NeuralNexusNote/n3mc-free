@@ -1,11 +1,16 @@
+"""UserPromptSubmit hook entry point (console script ``n3mc-hook``).
+
+Step 0: append the raw hook input to audit.log (before anything can fail).
+Then run ``n3mc --hook-submit`` synchronously; its stdout goes to Claude's context.
+"""
 import sys
 
-# spec §3: reconfigure streams to UTF-8 at module top — before any stdin read
-for _s_name in ("stdin", "stdout", "stderr"):
-    _s = getattr(sys, _s_name, None)
-    if _s is not None and hasattr(_s, 'reconfigure'):
+# Must run before the first stdin read, or non-ASCII input is mangled on Windows (cp932).
+for _stream_name in ("stdin", "stdout", "stderr"):
+    _s = getattr(sys, _stream_name, None)
+    if _s is not None and hasattr(_s, "reconfigure"):
         try:
-            _s.reconfigure(encoding='utf-8')
+            _s.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
@@ -14,46 +19,37 @@ import os
 import subprocess
 from datetime import datetime, timezone
 
-from .paths import MEMORY_DIR, AUDIT_LOG
+from .paths import AUDIT_LOG
 
 
-def _write_audit(hook: str, raw: str, payload: dict) -> None:
-    # spec §5.4: audit.log write failures go to stderr and never stop a hook
+def _write_audit(hook, raw):
     try:
-        from .core.processor import sanitize_surrogates
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = {"raw": raw}
+        record = {"ts": datetime.now(timezone.utc).isoformat(), "hook": hook,
+                  "raw": raw[:4096], "payload": payload}
         os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
-        record = json.dumps({
-            'ts':      datetime.now(timezone.utc).isoformat(),
-            'hook':    hook,
-            'raw':     sanitize_surrogates(raw[:4096]),
-            'payload': sanitize_surrogates(payload),
-        }, ensure_ascii=False)
-        with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
-            f.write(record + '\n')
+        try:
+            data = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        except (UnicodeEncodeError, ValueError):
+            data = (json.dumps(record, ensure_ascii=True) + "\n").encode("utf-8")
+        with open(AUDIT_LOG, "ab") as f:
+            f.write(data)
     except Exception as e:
-        print(f"Warning: audit log write failed: {e}", file=sys.stderr)
+        print(f"N3MC: audit.log write failed: {e}", file=sys.stderr)
 
 
 def main():
     raw = sys.stdin.read()
-
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        payload = {'raw': raw}
-
-    # spec §5: Step 0 — audit log written before any other processing
-    _write_audit('UserPromptSubmit', raw, payload)
-
-    # spec §5: synchronous subprocess — must complete before Claude gets control
+    _write_audit("UserPromptSubmit", raw)
     proc = subprocess.run(
-        [sys.executable, '-m', 'n3memorycore.n3memory', '--hook-submit'],
-        input=raw,
-        encoding='utf-8',
-        capture_output=False,
+        [sys.executable, "-m", "n3memorycore.n3memory", "--hook-submit"],
+        input=raw, text=True, encoding="utf-8", errors="replace",
     )
-    sys.exit(proc.returncode)
+    return proc.returncode
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
