@@ -98,7 +98,7 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 > **📦 Auto-install**: Run the following `pip install` automatically as part of setup. Do not ask the user to run it manually.
 
 ```bash
-pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7 psutil
+pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
 
 > **⚠️ First-run download**: `sentence-transformers` downloads the `multilingual-e5-base` model (~470 MB) on first server start. This can take **2–10 minutes** — the server will appear unresponsive during this time, which is expected. Subsequent startups complete in seconds once cached.
@@ -107,7 +107,7 @@ pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7 psutil
 > - Hook auto-save: **Complete preservation guaranteed**. Long content is chunked via `core.processor.chunk_text(max_chars=400, overlap=40)` (paragraph → sentence → hard window) and saved as multiple records (`[claude 1/N]`..`[claude N/N]` / `[user 1/N]`..`[user N/N]`). No truncation.
 > - Search query: **2,000 characters** (configurable via `search_query_max_chars` in config.json)
 > - Vector search: Only the first **~2,000 characters** of any record are semantically searchable (embedding model limit: 512 tokens). Text beyond this is stored in the DB and searchable via FTS keyword search, but invisible to vector similarity search.
-> - FTS query: Limited to **30 terms** to prevent slow scans
+> - FTS query: Limited to **40 terms** to prevent slow scans (§3.6; 30 up to v1.6.x)
 > - For best results, save records as **small chunks (~50–200 characters each, one fact per record)**.
 > - **Large text handling**: When a user pastes a long text (spec, article, log, etc.), the hooks save the full text as chunks; Claude does **not** call `--buffer` for it (§5.3 and the rules file say "do not call `--buffer` manually"). If Claude summarizes the key facts in its reply, that reply is saved by the Stop hook as well, which gives search a second, denser entry point.
 
@@ -169,7 +169,7 @@ n3mc-free/                       # Repository root
     ├── vec_model.txt               # v1.7.0 and earlier: model marker; read once to fill meta.embed_model (§3.5), never written
     ├── fts_punct_cleaned           # v1.7.0 and earlier: marker file; no longer read (meta table, §3.5)
     ├── fts_bigram_v1               # v1.7.0 and earlier: marker file; no longer read (meta table, §3.5)
-    └── vec_e5v2_migrated           # one-time vector-reindex migration marker (touched by --repair)
+    └── vec_e5v2_migrated           # marker file of an earlier version; the current code neither reads nor writes it (2026-11-19: earlier text said "touched by --repair" — do not create it)
 ```
 
 ### Console scripts (installed by `pip install`)
@@ -178,6 +178,69 @@ n3mc-free/                       # Repository root
 | `n3mc` | `n3memorycore.n3memory:main` | Primary CLI for humans and Claude Code |
 | `n3mc-hook` | `n3memorycore.n3mc_hook:main` | UserPromptSubmit hook (registered in `~/.claude/settings.json` by `n3mc --init`) |
 | `n3mc-stop-hook` | `n3memorycore.n3mc_stop_hook:main` | Stop hook (registered in `~/.claude/settings.json` by `n3mc --init`) |
+
+### pyproject.toml (2026-11-19, written down from the repository)
+
+Write `pyproject.toml` exactly as below. The distribution name `n3memorycore-free` is the name on PyPI and the name the setup check of this document looks for; the lower bounds of the dependencies are the versions the code was tested against; `pydantic` is a direct dependency (the request bodies of the server).
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "n3memorycore-free"
+version = "1.9.0"
+description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "N3MemoryCore contributors" },
+]
+keywords = ["claude", "claude-code", "memory", "rag", "embedding", "sqlite-vec"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.0",
+    "sentence-transformers>=2.5",
+    "sqlite-vec>=0.1.6",
+    "uuid7>=0.1.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+n3mc           = "n3memorycore.n3memory:main"
+n3mc-hook      = "n3memorycore.n3mc_hook:main"
+n3mc-stop-hook = "n3memorycore.n3mc_stop_hook:main"
+
+[project.urls]
+Homepage = "https://github.com/NeuralNexusNote/n3mc-free"
+Issues   = "https://github.com/NeuralNexusNote/n3mc-free/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["n3memorycore*"]
+exclude = ["tests*"]
+```
 
 ## 3. Technical Specifications (No Modifications Allowed)
 
@@ -242,7 +305,7 @@ Examples a user might configure:
 
 **Upgrade procedure (same-dimension model swap)**:
 1. Edit `~/.n3mc/config.json` → set `embed_model` to the new model name.
-2. Restart the server (kill the PID file's process, or just let the next CLI call relaunch it).
+2. Restart the server (stop it the way `_stop_stale_server` does — §3; never by the bare number in the PID file — or just let the next CLI call relaunch it).
 3. The next `/repair` detects the model mismatch (`meta.embed_model`, §3.5 "Index metadata") and shows the notice `embed_model_mismatch`. The stored vectors are still from the OLD model, so search quality is degraded until they are re-made.
 4. Run `n3mc --reembed`: it re-embeds every record with the new model (resumable; §3.5). Deleting a marker and running `n3mc --repair` does **not** re-make vectors: `--repair` only adds missing ones.
 
@@ -812,6 +875,7 @@ python -m n3memorycore.n3memory --search "keyword" --since 2026-01-01 --until 20
 - AND-combines `WHERE timestamp >= ? AND timestamp <= ?` against the existing `timestamp` column. No schema additions.
 - **Parsing (`_parse_time_bound`, v1.5.0)**: accept a date (`2026-11-13`) or an ISO 8601 datetime with `T` or a space between date and time (`2026-11-13T09:00`, `2026-11-13 09:00:00`), with or without an offset (`+09:00`, `Z`). A date-only `since` means 00:00:00 and a date-only `until` means 23:59:59.999999.
 - **Time zone**: a value without an offset (including every date-only value) is read in the **local time zone** of the machine — the same clock as `saved=` in the output — and converted to UTC. A value with an offset is converted to UTC as given. The converted bound is formatted exactly like the stored `timestamp` values (the format `insert_memory` writes, UTC) so the string comparison in SQL is correct.
+- **Format of the stored `timestamp` (2026-11-19, written down from the code)**: every record is saved with `datetime.now(timezone.utc).isoformat()` — for example `2026-11-13T01:34:56.123456+00:00` (microseconds, offset `+00:00`, never `Z`). The bounds of `--since` / `--until` are produced with `dt.astimezone(timezone.utc).isoformat()`. SQL compares these values as strings, so another format (a `Z` suffix, no microseconds) would compare wrongly against the rows of an existing DB. A stored value without an offset is read as UTC by `time_decay`; a value that cannot be parsed gives `time_decay` = 1.0.
 - **Unreadable values**: if a bound cannot be parsed (`yesterday`, `2026-13-01`), print one line to stderr (`--since: cannot read 'yesterday' (use 2026-11-13 or 2026-11-13T09:00)`) and exit with status 2 without searching. If `since` is later than `until`, do the same with `--since is later than --until`.
 - Either bound may be specified alone (open-ended range).
 
@@ -826,7 +890,9 @@ python -m n3memorycore.n3memory --recall-thread <turn_id> [--before N] [--after 
 - Returns the target `turn_id` plus the N preceding and N following turns, in chronological order.
 - Defaults: `--before 2`, `--after 2`.
 - Uses the existing `idx_memories_turn_id` index. No new index required.
-- Output format matches `--list` (tab-separated; `--format jsonl` supported).
+- Output format matches `--list` (tab-separated; `--format jsonl` supported), ending with `Total: N records`.
+- **Which rows (2026-11-19, written down from the code)**: take the smallest and the largest `rowid` of the target turn. The N preceding turns are the N distinct `turn_id`s (not NULL, not the target) with the largest `MAX(rowid)` below the target's smallest rowid; the N following turns are those with the smallest `MIN(rowid)` above the target's largest rowid. Rows whose `turn_id` is NULL are never counted as a turn. Print every row of the selected turns in `rowid` order. When there is no DB file, print `No DB found at <path>` to stderr.
+- **`--format jsonl` keys**: `--list` prints one object per record with the keys `id, timestamp, agent_name, content`; `--recall-thread` prints `id, timestamp, agent_name, turn_id, content` (`ensure_ascii=False`).
 - **Operational rule**: When the snippet returned by `--search` is insufficient, Claude SHOULD pass the hit's `turn_id` to `--recall-thread` to retrieve surrounding context. End users do not need to invoke this command directly.
 
 ---
@@ -1138,6 +1204,64 @@ File handling:
 - **Whenever the template changes, bump the marker version and add the hash of the previous template to `_KNOWN_BEHAVIOR_MD_HASHES`.**
 - **Old notice key**: the v1.4.0 key `behavior_md_edited` (without a path hash) can no longer be cleared by the rule above, so `_ensure_behavior_md` removes it whenever it runs.
 - **One notice per file (v1.5.0)**: notices live in one `notices.json` per PC, but rules files are per project, so the key includes a hash of the path and the message names the file. v1.4.0 used one key without the path: the message did not say which project's file was meant, and it kept appearing once a day after the user had merged the template, because nothing cleared it.
+- **`notices.json` (2026-11-19, written down from the code)**: one JSON object `{<key>: {"message": <text>, "last_shown": <epoch seconds or null>}}`. `_notify` stores the message with `last_shown: null` unless the same key already holds the same message (then nothing changes, and nothing is appended to `audit.log`). A notice is shown when `last_shown` is null or at least 86,400 seconds old; showing it sets `last_shown` to now. The interval is per key.
+- **Template text (2026-11-19, written down from the code)**: `_BEHAVIOR_MD_CONTENT` is exactly the text below, with a line feed after the last line. Write it as it is; do not rephrase it. The section list above is a summary of it. When this text changes, the marker version goes up and the hash of this text joins `_KNOWN_BEHAVIOR_MD_HASHES` (rule above), so the text itself has to be reproducible.
+
+````markdown
+<!-- n3mc-behavior v3 -->
+# N3MemoryCore Behavioral Guidelines
+
+These guidelines apply to every Claude Code session in this project. They are
+loaded automatically from `.claude/rules/` at session start.
+
+## Fully Automatic Saving
+All conversations are saved by hooks (UserPromptSubmit + Stop). Do NOT call
+`--buffer` manually. Every non-empty user message and Claude response is
+recorded character-for-character; there is no length filter and no skip-pattern
+filter. Make NO acknowledgement when a save succeeds — silence is correct.
+
+## Recalled Memory Context
+Every turn, the UserPromptSubmit hook adds a `# Recalled Memory Context` block
+to your context. Read `## Top matches` first; use
+`## Previous matching Q-A exchanges` as supporting context. When several
+versions of the same content appear, the one with the newest `saved` time is
+the current one. If the block contains a `> ⚠️ N3MC notice:` line, tell the
+user what it says.
+
+## Weak Matches
+Records under `## Possibly related (weak matches — may be unrelated)` did not
+pass the relevance floors and are often unrelated. Use one only when it is
+actually relevant to the question; if it is not, ignore it and do not mention
+it.
+
+## Active RAG
+When prior context would help, run a search proactively. **Always invoke via
+`python -m n3memorycore.n3memory --search "<keywords>"`**, NOT the bare `n3mc`
+console script. Claude Code spawns a bash subprocess whose `PATH` does not
+reliably include the Python `Scripts/` directory where the `n3mc` entry-point
+lives, so `n3mc --search ...` works in interactive shells but fails in
+production with `command not found`. `python -m` resolves through the Python
+interpreter (which is on `PATH`) and is portable across venvs and platforms.
+Both invocation forms are auto-allowed via `permissions.allow`.
+
+## Cut Exchanges
+A Q-A exchange may end with a line like
+`_(N more chunk(s) of this exchange omitted. Full text: ...)_`. If the omitted
+part is needed for your answer, run the command shown there
+(`python -m n3memorycore.n3memory --show-turn <turn_id>`) and read the full
+text before answering.
+
+## Recall Acknowledgment
+When recalled memory actually shapes your reply (you are recalling something
+saved earlier), open the reply with a short acknowledgment in the user's
+language — e.g. "Pulling this from earlier memory in this session." or
+「前回の回答がメモリに保存されています。」 If no relevant memory was found,
+or it did not influence your answer, do NOT announce anything.
+
+## Fatal-Failure Warning
+If a save fails physically, surface the warning prominently:
+> ⚠️ Physical save failed. Current memories may be lost.
+````
 
 ---
 
@@ -1316,8 +1440,15 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   - **The reason for not comparing across all records** is that unchanged chunks of recreated settings are exactly identical to the old version, so comparing across all records would leave holes in the new version's exchange.
   - On HTTP POST failure to the embedding server (server stopped, timeout, or non-2xx): the write falls back to `_buffer_direct()`, which inserts the record directly into SQLite without an embedding vector. The missing vec-index entry is repaired on the next `--repair` call. **Silent drops are forbidden**: every failure path either succeeds via `_buffer_direct` or emits a message to stderr. Combined with the Step 0 audit log, this guarantees that no user message, and no Claude response that reaches a hook, is lost. A Claude response reaches a hook through the Stop hook or, when Stop did not run, through the next prompt's transcript lookup (§4.5); a response after which neither hook runs (e.g. the last reply before Claude Code is closed while Stop is skipped) is not saved.
 - **[Implementation Specs] HTTP timeout**: `_post()` uses a 30-second timeout for HTTP requests to the server. This accommodates CPU-based embedding inference which can take 4–5 seconds under load.
+- **[Implementation Specs] Other waits (2026-11-19, written down from the code)**: `/health` and `/shutdown` requests time out after 5 seconds. After asking a server to stop, wait until its port is free for at most 15 seconds, polling every 0.3 seconds; a process that must be ended is `terminate()`d, waited for 5 seconds, then `kill()`ed. `/shutdown` answers first and ends the process 0.3 seconds later. The PID file is removed only when it still holds the number of the process that was stopped. uvicorn runs with `log_level='error'`.
+- **[Implementation Specs] `turn_id_<session>.txt` file name**: `<session>` is the hook's `session_id` with every character outside `[a-zA-Z0-9_-]` replaced by `_`, cut to the first 64 characters. The value comes from the hook's JSON, so it must never reach the file system unchanged (a path separator in it would leave `.memory/`).
+- **[Implementation Specs] audit.log `raw`**: in `{"ts", "hook", "raw", "payload"}`, `raw` is only the **first 4,096 characters** of stdin; `payload` is the parsed JSON in full. When stdin is not JSON, `payload` is `{"raw": <the whole stdin>}`. Writing the whole input into `raw` as well would make the log grow about twice as fast.
+- **[Implementation Specs] Reading a config.json that was just created**: exclusive creation makes the file first and writes it a moment later, so a second hook that starts at the same time can read an empty file. `_read_config_file()` therefore reads again, every 0.05 seconds and at most 20 times, **only while the file's modification time is less than 2 seconds old**; an older file that does not parse fails at once (`config_unreadable`). Without this, the second hook of the very first turn reports `config_unreadable` and saves that turn under a temporary ID.
+- **[Implementation Specs] Exit status of the hook entry points**: `n3mc_hook.py` exits with the exit status of `--hook-submit`; `n3mc_stop_hook.py` exits with the exit status of `--save-claude-turn` (the result of `--stop` is not used).
+- **[Implementation Specs] `/buffer` answering 200 with an error**: when the record count did not grow after the INSERT, `/buffer` returns `{"status": "error", "message": "record count did not change after INSERT"}` with HTTP 200. The CLI treats a `status` of `error` like an HTTP failure and falls back to `_buffer_direct`.
+- **[Implementation Specs] Fields of a `/search` result row**: besides the keys shown in the response example (`id, content, score, timestamp, turn_id, weak`), every row carries `agent_name`, `session_id`, `filter_score`, `cos_sim` and `keyword_relevance`. The rendering reads `agent_name`; a row without it is shown with the agent `-`. Rows with equal `score` are ordered by `(score, timestamp, id)` descending.
 - **[Implementation Specs] ensure_server() concurrent startup wait**: **Only when the process with the PID-file number is verified to be this folder's server (another process is starting it)**, wait up to 60 seconds (120 × 0.5s). If it is still starting after that (first-run model download takes 2–10 minutes), this command proceeds without the server and does not start a second one. If that process is dead or is a different process, start the server without waiting (§3 "PID file handling").
-- **[Implementation Specs] audit.log size and contents (v1.5.0)**: `audit.log` holds the raw hook input — every prompt and reply in full, **including code blocks and anything pasted** (it is not purified). Treat it as private data. When it exceeds 50 MB, `--stop` renames it to `audit.log.1` (replacing an older `audit.log.1`) and the next hook starts a new file, so at most about 100 MB is kept. Write failures of `audit.log` go to stderr and never stop a hook.
+- **[Implementation Specs] audit.log size and contents (v1.5.0)**: `audit.log` holds the raw hook input — every prompt and reply in full, **including code blocks and anything pasted** (it is not purified). The full text is in `payload`; `raw` is cut to 4,096 characters (below). Treat it as private data. When it exceeds 50 MB, `--stop` renames it to `audit.log.1` (replacing an older `audit.log.1`) and the next hook starts a new file, so at most about 100 MB is kept. Write failures of `audit.log` go to stderr and never stop a hook.
 - **[Implementation Specs] _load_vec_extension idempotency**: Loading the sqlite-vec extension twice on the same connection is a no-op — if the extension is already loaded, the load call raises an exception containing "already" or "duplicate" in its message. Catch such exceptions and continue; re-raise all others.
 - **[Implementation Specs] delete_memory transactional**: `delete_memory` calls `_load_vec_extension(conn)` first, then wraps the four DELETEs (memories_fts, memories_fts_bi, memories_vec, memories) in a try/except with `conn.rollback()` on failure. All four tables succeed or all roll back together.
 - **[Implementation Specs] lifespan startup**: Use FastAPI's `@asynccontextmanager` lifespan pattern (`async def lifespan(app: FastAPI)` with `yield`, passed to `FastAPI(lifespan=lifespan)`) instead of the deprecated `@app.on_event("startup")`.
