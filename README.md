@@ -44,6 +44,8 @@ There are two free N3MemoryCore builds. **If this is your first time, start with
 - **Choose Free** if you use Claude Code and want it to remember your conversations without extra software.
 - **Choose Lite** if you use another MCP client (Claude Desktop, Cursor, …), or you want memory that forgets by itself after a short project, and you are comfortable starting Docker and editing MCP settings.
 
+> The Lite column describes the published Lite 1.x. **Lite v2.0.0** (specified, not released yet) changes it: in Claude Code it saves every message and reply through hooks, like Free, and other applications such as the Claude desktop app keep using MCP; it still needs Docker (Redis Stack) and forgets after 7 days.
+
 ---
 
 ## Features
