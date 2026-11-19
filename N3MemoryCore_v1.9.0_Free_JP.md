@@ -98,7 +98,7 @@ Claude Codeに「一生モノの資産」となる長期記憶を実装せよ。
 > **📦 自動インストール**: 以下の `pip install` はセットアップの一部として自動実行せよ。ユーザーに手動実行を求めてはならない。
 
 ```bash
-pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7 psutil
+pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
 
 > **⚠️ 初回ダウンロード**: `sentence-transformers` はサーバー初回起動時に `multilingual-e5-base` モデル（約 470 MB）をダウンロードする。回線速度によって **2〜10分** かかる場合がある。この間サーバーが無応答に見えるが正常動作。モデルがキャッシュされた後の起動は数秒で完了。
@@ -107,7 +107,7 @@ pip install fastapi uvicorn sqlite-vec sentence-transformers uuid7 psutil
 > - Hook 自動保存：**完全保存を保証**。長文は `core.processor.chunk_text(max_chars=400, overlap=40)` により段落 → 文 → ハードウィンドウの順で分割され、全文が複数レコード（`[claude 1/N]`〜`[claude N/N]` / `[user 1/N]`〜`[user N/N]`）として保存される。切り捨ては行われない
 > - 検索クエリ：最大 **2,000 文字**（config.json の `search_query_max_chars` で変更可能）
 > - ベクトル検索：1レコードの先頭 **約 2,000 文字** のみが意味検索の対象（embedding モデル上限：512 トークン）。超過分は DB と FTS キーワード検索には保存されますが、ベクトル類似度検索では検出されません。
-> - FTS クエリ：スキャン防止のため **30 語** に制限
+> - FTS クエリ：スキャン防止のため **40 語** に制限（§3.6。v1.6.x までは 30 語）
 > - 最適な結果を得るには、**1レコード約 50〜200 文字（1事実ずつ）** で保存してください。
 > - **長文の処理**: ユーザーが長文（仕様書、記事、ログ等）を貼り付けた場合、フックが全文をチャンクに分けて保存する。Claude はそのために `--buffer` を呼ば**ない**（§5.3 と rules ファイルに「`--buffer` を手動で呼ばない」とある）。Claude が返答で要点をまとめれば、その返答も Stop フックで保存され、検索にとってより密度の高い入口がもう 1 つ増える。
 
@@ -169,7 +169,7 @@ n3mc-free/                       # リポジトリルート
     ├── vec_model.txt               # v1.7.0 以前：モデルの印。meta.embed_model を埋めるために一度だけ読む（§3.5）。書き込まない
     ├── fts_punct_cleaned           # v1.7.0 以前：印のファイル。もう読まない（meta 表、§3.5）
     ├── fts_bigram_v1               # v1.7.0 以前：印のファイル。もう読まない（meta 表、§3.5）
-    └── vec_e5v2_migrated           # ベクトル再インデックスの一回限りマイグレーションマーカー（--repair が touch）
+    └── vec_e5v2_migrated           # 以前の版が置いた目印のファイル。今のコードは読みも書きもしない（2026-11-19: 以前の文は「--repair が touch」としていた。作らないこと）
 ```
 
 ### コンソールスクリプト（`pip install` でインストール）
@@ -178,6 +178,69 @@ n3mc-free/                       # リポジトリルート
 | `n3mc` | `n3memorycore.n3memory:main` | 人間と Claude Code 用の主 CLI |
 | `n3mc-hook` | `n3memorycore.n3mc_hook:main` | UserPromptSubmit フック（`n3mc --init` が `~/.claude/settings.json` に登録） |
 | `n3mc-stop-hook` | `n3memorycore.n3mc_stop_hook:main` | Stop フック（`n3mc --init` が `~/.claude/settings.json` に登録） |
+
+### pyproject.toml（2026-11-19、リポジトリから書き起こした）
+
+`pyproject.toml` は、下のとおりに書くこと。配布名 `n3memorycore-free` は、PyPI での名前であり、この文書のセットアップの確認が探す名前である。依存の下限は、コードを確かめた版である。`pydantic` は直接の依存である（サーバーのリクエスト本文に使う）。
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "n3memorycore-free"
+version = "1.9.0"
+description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "N3MemoryCore contributors" },
+]
+keywords = ["claude", "claude-code", "memory", "rag", "embedding", "sqlite-vec"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.0",
+    "sentence-transformers>=2.5",
+    "sqlite-vec>=0.1.6",
+    "uuid7>=0.1.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+n3mc           = "n3memorycore.n3memory:main"
+n3mc-hook      = "n3memorycore.n3mc_hook:main"
+n3mc-stop-hook = "n3memorycore.n3mc_stop_hook:main"
+
+[project.urls]
+Homepage = "https://github.com/NeuralNexusNote/n3mc-free"
+Issues   = "https://github.com/NeuralNexusNote/n3mc-free/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["n3memorycore*"]
+exclude = ["tests*"]
+```
 
 ## 3. 技術仕様（一切の変更禁止）
 
@@ -242,7 +305,7 @@ text_to_embed = "query: " + keyword
 
 **アップグレード手順（同一次元のモデル切り替え）**:
 1. `~/.n3mc/config.json` を編集 → `embed_model` を新モデル名に変更。
-2. サーバー再起動（PID ファイルのプロセスを kill するか、次回 CLI 呼び出しで自動的に再起動される）。
+2. サーバー再起動（`_stop_stale_server` と同じやり方で止める — §3。PID ファイルの番号だけを頼りに止めない — か、次回 CLI 呼び出しで自動的に再起動される）。
 3. 次回の `/repair` がモデルの食い違いを見つけ（`meta.embed_model`、§3.5「索引の情報」）、通知 `embed_model_mismatch` を出す。保存されたベクトルは旧モデルのままなので、作り直すまで検索品質は劣化する。
 4. `n3mc --reembed` を実行する：すべての記録を新しいモデルで埋め込み直す（途中から再開できる。§3.5）。印を消して `n3mc --repair` を実行しても、ベクトルは作り直され**ない**：`--repair` は欠けたベクトルを足すだけである。
 
@@ -810,6 +873,7 @@ python -m n3memorycore.n3memory --search "キーワード" --since 2026-01-01 --
 - 既存の `timestamp` 列に対し `WHERE timestamp >= ? AND timestamp <= ?` を AND 結合する。新規スキーマ追加なし。
 - **解釈（`_parse_time_bound`、v1.5.0）**: 日付（`2026-11-13`）、または日付と時刻の間が `T` か空白の ISO 8601 の日時（`2026-11-13T09:00`、`2026-11-13 09:00:00`）を受け付ける。オフセット（`+09:00`、`Z`）はあってもなくてもよい。日付だけの `since` は 00:00:00、日付だけの `until` は 23:59:59.999999 とする。
 - **タイムゾーン**: オフセットのない値（日付だけの値はすべてこれ）は、そのマシンの**ローカルタイムゾーン** — 出力の `saved=` と同じ時計 — で読み、UTC に変換する。オフセットのある値は、そのオフセットのまま UTC に変換する。変換した境界は、保存されている `timestamp` の値（`insert_memory` が書く形式、UTC）とまったく同じ形式にそろえるので、SQL の文字列比較が正しくなる。
+- **保存する `timestamp` の書式（2026-11-19、コードから書き起こした）**: すべての記録は `datetime.now(timezone.utc).isoformat()` で保存する。例: `2026-11-13T01:34:56.123456+00:00`（マイクロ秒つき、オフセットは `+00:00`。`Z` にはしない）。`--since` / `--until` の境界は `dt.astimezone(timezone.utc).isoformat()` で作る。SQL はこれらを文字列として比べるので、別の書式（`Z` で終わる、マイクロ秒がない）にすると、既存の DB の行との比較が狂う。保存された値にオフセットがなければ、`time_decay` は UTC として読む。読めない値では、`time_decay` は 1.0 になる。
 - **読めない値**: 境界を解釈できない場合（`yesterday`、`2026-13-01`）は、stderr に 1 行（`--since: cannot read 'yesterday' (use 2026-11-13 or 2026-11-13T09:00)`）出し、検索せずに終了ステータス 2 で終わる。`since` が `until` より後のときも、`--since is later than --until` で同じようにする。
 - 片方のみの指定（範囲を片開きにする）も可能。
 
@@ -824,7 +888,9 @@ python -m n3memorycore.n3memory --recall-thread <turn_id> [--before N] [--after 
 - 指定 `turn_id` のターンと、それ以前 N 件・それ以後 N 件のターンを時系列で返す。
 - `--before` / `--after` のデフォルトは各 2。
 - 既存 `idx_memories_turn_id` インデックスを使用。新規インデックス不要。
-- 出力は `--list` と同じタブ区切り（`--format jsonl` も対応）。
+- 出力は `--list` と同じタブ区切り（`--format jsonl` も対応）で、最後に `Total: N records` を出す。
+- **どの行を出すか（2026-11-19、コードから書き起こした）**: 対象のターンの、最小の `rowid` と最大の `rowid` を取る。前の N ターンは、`MAX(rowid)` が対象の最小の rowid より小さい `turn_id`（NULL でなく、対象でもないもの）のうち、`MAX(rowid)` が大きいものから N 個である。後の N ターンは、`MIN(rowid)` が対象の最大の rowid より大きい `turn_id` のうち、`MIN(rowid)` が小さいものから N 個である。`turn_id` が NULL の行は、ターンとして数えない。選んだターンのすべての行を、`rowid` の順に出す。DB のファイルがないときは、stderr に `No DB found at <path>` を出す。
+- **`--format jsonl` のキー**: `--list` は、記録ごとに 1 つのオブジェクトを出し、キーは `id, timestamp, agent_name, content` である。`--recall-thread` は `id, timestamp, agent_name, turn_id, content` である（`ensure_ascii=False`）。
 - **運用**: Claude は `--search` のスニペットで文脈不足と判断した場合、ヒットの `turn_id` を `--recall-thread` に渡して周辺会話を取得すること。ユーザーがこのコマンドを直接叩く必要はない。
 
 ---
@@ -1136,6 +1202,64 @@ v1.3.x までは、`--search` の結果を `~/.n3mc/.memory/memory_context.md` �
 - **ひな形を変えたら、目印の版を上げ、変える前のひな形のハッシュを `_KNOWN_BEHAVIOR_MD_HASHES` に足すこと。**
 - **古い知らせのキー**: v1.4.0 のキー `behavior_md_edited`（パスのハッシュなし）は上の決まりでは消えないので、`_ensure_behavior_md` が動くたびに消す。
 - **ファイルごとに 1 つの知らせ（v1.5.0）**: 知らせは PC に 1 つの `notices.json` に入るが、rules ファイルはプロジェクトごとにあるので、キーにパスのハッシュを含め、メッセージにファイル名を出す。v1.4.0 はパスを含まない 1 つのキーを使っていた。メッセージはどのプロジェクトのファイルのことかを示さず、ユーザーがひな形を取り込んだあとも、消すものがなかったので 1 日 1 回出続けていた。
+- **`notices.json` の形（2026-11-19、コードから書き起こした）**: 1 つの JSON オブジェクト `{<key>: {"message": <文>, "last_shown": <エポック秒 か null>}}`。`_notify` は、同じキーに同じ文がすでに入っていなければ、`last_shown: null` で文を入れる（同じ文なら何も変えず、`audit.log` にも書き足さない）。知らせは、`last_shown` が null か、86,400 秒以上前のときに出す。出したら `last_shown` を今の時刻にする。この間隔はキーごとに数える。
+- **ひな形の本文（2026-11-19、コードから書き起こした）**: `_BEHAVIOR_MD_CONTENT` は、下の文そのままで、最後の行のあとに改行を 1 つ付けたものである。そのまま書くこと。言い換えない（ひな形は英語のまま配る）。上の節の一覧は、この本文の要約である。本文を変えるときは、目印の版を上げ、この本文のハッシュを `_KNOWN_BEHAVIOR_MD_HASHES` に足す（上の決まり）ので、本文そのものを再現できる必要がある。
+
+````markdown
+<!-- n3mc-behavior v3 -->
+# N3MemoryCore Behavioral Guidelines
+
+These guidelines apply to every Claude Code session in this project. They are
+loaded automatically from `.claude/rules/` at session start.
+
+## Fully Automatic Saving
+All conversations are saved by hooks (UserPromptSubmit + Stop). Do NOT call
+`--buffer` manually. Every non-empty user message and Claude response is
+recorded character-for-character; there is no length filter and no skip-pattern
+filter. Make NO acknowledgement when a save succeeds — silence is correct.
+
+## Recalled Memory Context
+Every turn, the UserPromptSubmit hook adds a `# Recalled Memory Context` block
+to your context. Read `## Top matches` first; use
+`## Previous matching Q-A exchanges` as supporting context. When several
+versions of the same content appear, the one with the newest `saved` time is
+the current one. If the block contains a `> ⚠️ N3MC notice:` line, tell the
+user what it says.
+
+## Weak Matches
+Records under `## Possibly related (weak matches — may be unrelated)` did not
+pass the relevance floors and are often unrelated. Use one only when it is
+actually relevant to the question; if it is not, ignore it and do not mention
+it.
+
+## Active RAG
+When prior context would help, run a search proactively. **Always invoke via
+`python -m n3memorycore.n3memory --search "<keywords>"`**, NOT the bare `n3mc`
+console script. Claude Code spawns a bash subprocess whose `PATH` does not
+reliably include the Python `Scripts/` directory where the `n3mc` entry-point
+lives, so `n3mc --search ...` works in interactive shells but fails in
+production with `command not found`. `python -m` resolves through the Python
+interpreter (which is on `PATH`) and is portable across venvs and platforms.
+Both invocation forms are auto-allowed via `permissions.allow`.
+
+## Cut Exchanges
+A Q-A exchange may end with a line like
+`_(N more chunk(s) of this exchange omitted. Full text: ...)_`. If the omitted
+part is needed for your answer, run the command shown there
+(`python -m n3memorycore.n3memory --show-turn <turn_id>`) and read the full
+text before answering.
+
+## Recall Acknowledgment
+When recalled memory actually shapes your reply (you are recalling something
+saved earlier), open the reply with a short acknowledgment in the user's
+language — e.g. "Pulling this from earlier memory in this session." or
+「前回の回答がメモリに保存されています。」 If no relevant memory was found,
+or it did not influence your answer, do NOT announce anything.
+
+## Fatal-Failure Warning
+If a save fails physically, surface the warning prominently:
+> ⚠️ Physical save failed. Current memories may be lost.
+````
 
 ---
 
@@ -1314,6 +1438,13 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   - **全体で比べないのは**、作り直した設定のうち変えていない分割が旧版と全く同じ文になり、全体で比べると新しい版の往復が欠けるため。
   - 埋め込みサーバーへの HTTP POST 失敗時（サーバー停止・タイムアウト・非 2xx）: 書き込みは `_buffer_direct()` にフォールバックし、埋め込みベクトルなしで直接 SQLite に INSERT する。欠損した vec インデックスエントリは次回の `--repair` で修復される。**無言のドロップは禁止**：すべての失敗経路は `_buffer_direct` で成功するか、stderr へメッセージを出力する。Step 0 の監査ログと組み合わせて、ユーザー発言と、フックに届いた Claude の回答が失われないことを保証する。Claude の回答は Stop フックで、Stop が動かなかったときは次の質問でのトランスクリプトの読み取り（§4.5）でフックに届く。どちらのフックも動かない回答（例: Stop が飛ばされたまま Claude Code を閉じる前の最後の返答）は保存されない。
 - **【実装仕様】HTTP タイムアウト**: `_post()` はサーバーへの HTTP リクエストに 30 秒のタイムアウトを使用する。CPU での埋め込み推論が高負荷時に 4〜5 秒かかる場合に対応するため。
+- **【実装仕様】そのほかの待ち時間（2026-11-19、コードから書き起こした）**: `/health` と `/shutdown` のリクエストは 5 秒でタイムアウトする。サーバーに停止を頼んだあとは、ポートが空くまで最大 15 秒、0.3 秒おきに確かめる。終わらせる必要のあるプロセスは `terminate()` し、5 秒待ってから `kill()` する。`/shutdown` は先に応答を返し、0.3 秒後にプロセスを終える。PID ファイルは、止めたプロセスの番号がまだ入っているときにだけ消す。uvicorn は `log_level='error'` で動かす。
+- **【実装仕様】`turn_id_<session>.txt` のファイル名**: `<session>` は、フックの `session_id` のうち `[a-zA-Z0-9_-]` 以外の文字をすべて `_` に替え、先頭 64 文字に切ったものである。この値はフックの JSON から来るので、そのままファイルシステムに渡してはならない（パスの区切りが入っていると `.memory/` の外に出る）。
+- **【実装仕様】audit.log の `raw`**: `{"ts", "hook", "raw", "payload"}` のうち、`raw` は stdin の**先頭 4,096 文字だけ**である。`payload` は、読み取った JSON の全体である（下の「audit.log の大きさと中身」が言う全文は、`payload` に入る）。stdin が JSON でないときは、`payload` を `{"raw": <stdin の全体>}` にする。`raw` にも全体を書くと、ログがほぼ 2 倍の速さで増える。
+- **【実装仕様】作られた直後の config.json の読み方**: 排他的な作成は、先にファイルを作り、少しあとで中身を書く。そのため、同時に始まった 2 つ目のフックが、空のファイルを読むことがある。`_read_config_file()` は、**ファイルの更新時刻が 2 秒以内のときに限り**、0.05 秒おきに最大 20 回読み直す。それより古いファイルが読めなければ、すぐに失敗にする（`config_unreadable`）。これがないと、最初のターンの 2 つ目のフックが `config_unreadable` を知らせ、そのターンを一時的な ID で保存する。
+- **【実装仕様】フックの入口の終了ステータス**: `n3mc_hook.py` は `--hook-submit` の終了ステータスで終わる。`n3mc_stop_hook.py` は `--save-claude-turn` の終了ステータスで終わる（`--stop` の結果は使わない）。
+- **【実装仕様】`/buffer` が 200 でエラーを返すとき**: INSERT のあとで記録の件数が増えていなければ、`/buffer` は HTTP 200 で `{"status": "error", "message": "record count did not change after INSERT"}` を返す。CLI は、`status` が `error` の応答を HTTP の失敗と同じに扱い、`_buffer_direct` に切り替える。
+- **【実装仕様】`/search` の結果の行が持つ項目**: 応答例にあるキー（`id, content, score, timestamp, turn_id, weak`）のほかに、どの行も `agent_name`、`session_id`、`filter_score`、`cos_sim`、`keyword_relevance` を持つ。表示は `agent_name` を読む。これがない行は、エージェントが `-` と表示される。`score` が同じ行は、`(score, timestamp, id)` の降順で並べる。
 - **【実装仕様】ensure_server() 競合起動待機**: PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（別プロセスが起動中）だけ**、最大 60 秒（120 × 0.5 秒）待機する。それでもまだ起動中なら（初回のモデルダウンロードは 2〜10 分かかる）、このコマンドはサーバーなしで進め、2 つ目のサーバーは起動しない。番号のプロセスが死んでいる・別のプロセスであるときは待たずに起動する（§3「PID ファイルの扱い」）。
 - **【実装仕様】audit.log の大きさと中身（v1.5.0）**: `audit.log` はフックの生の入力 — すべての質問と返答の全文。**コードブロックや貼り付けたものも含む**（purify しない）— を持つ。個人的なデータとして扱うこと。50 MB を超えたら `--stop` が `audit.log.1` に名前を変え（古い `audit.log.1` は置き換える）、次のフックが新しいファイルを始めるので、残るのは最大で約 100 MB。`audit.log` の書き込みの失敗は stderr に出し、フックを止めることはない。
 - **【実装仕様】_load_vec_extension 冪等性**: 同一コネクションで sqlite-vec 拡張を2回ロードしても副作用はない。拡張がすでにロード済みの場合、ロード呼び出しは "already" または "duplicate" を含む例外を発生させる。そのような例外はキャッチして続行し、それ以外の例外は再スローする。
