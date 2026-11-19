@@ -1,96 +1,150 @@
-import sys
-import os
+"""N3MemoryCore Free: main CLI module plus the resident FastAPI server.
 
-# spec §3: reconfigure all streams to UTF-8 before any I/O (Windows cp932 guard)
-for _s_name in ("stdin", "stdout", "stderr"):
-    _s = getattr(sys, _s_name, None)
-    if _s is not None and hasattr(_s, 'reconfigure'):
-        try:
-            _s.reconfigure(encoding='utf-8')
-        except Exception:
-            pass
-
+Commands: --init --buffer --search --list --recall-thread --show-turn --stop --repair
+--reembed --hook-submit --save-claude-turn --run-server
+"""
 import argparse
+import atexit
 import hashlib
 import json
-import logging
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
-import sysconfig
+import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timezone
 
-from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE, claude_paths
-from .paths import TURN_ID_FILE, CONTEXT_FILE, CONTEXT_RETIRED_MARKER
-from .paths import SERVER_LOG, SERVER_START_FAILED_MARKER
+from . import __version__
+from .paths import (
+    AUDIT_LOG, CONFIG_FILE, CONTEXT_FILE, CONTEXT_RETIRED, DB_PATH, HOME_DIR, MEMORY_DIR,
+    NOTICES_FILE, PID_FILE, SERVER_LOG, SERVER_START_FAILED, TURN_ID_FILE, VEC_MODEL_FILE,
+    claude_paths,
+)
 from .core.database import (
-    get_connection, init_db, migrate_schema, insert_memory, insert_memory_once,
-    check_exact_duplicate, search_vector, find_unindexed_memories,
-    strip_fts_punctuation, serialize_vector,
+    EMBED_DIM, bigram_text, check_exact_duplicate, count_memories, delete_meta,
+    find_unindexed_memories, get_all_memories, get_connection, get_memories_by_turn_id,
+    get_meta, init_db, insert_memory_once, serialize_vector, set_meta, strip_fts_punctuation,
 )
 from .core.processor import (
-    embed_passage, cosine_sim_from_l2, hybrid_search,
-    chunk_text, add_chunk_prefixes, purify_text, render_memory_context,
+    _fmt_saved, add_chunk_prefixes, chunk_text, embed_passage, get_model, hybrid_search,
+    purify_text, render_memory_context, sanitize_surrogates,
 )
 
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
-
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_CODE_FILES = (
-    os.path.join(_PKG_DIR, 'n3memory.py'),
-    os.path.join(_PKG_DIR, 'core', 'database.py'),
-    os.path.join(_PKG_DIR, 'core', 'processor.py'),
-)
-
-# Set by ensure_server() when the port answers with another folder's server
-# (spec §3 "When the port belongs to another folder's server"). None = not foreign.
-_FOREIGN_SERVER_ROOT: Optional[str] = None
-
-# spec §4.5: inputs that are not typed by the user — no search, no save,
-# no new turn_id.
-_SYSTEM_PROMPT_PREFIXES = (
-    '<task-notification>',
-    '<agent-message from=',     # a subagent's report (2026-11-17)
-    '<system-reminder>',        # an app notice (2026-11-17)
-)
-
-_HEADING = "# Recalled Memory Context"
-
-# spec §3 Session ID fallback for direct (non-HTTP) writes from this CLI
-# process: N3MC_SESSION_ID, else a per-process UUIDv4.
-_CLI_SESSION_ID = os.environ.get('N3MC_SESSION_ID') or str(uuid.uuid4())
-
-_FATAL_SAVE_MSG = "⚠️ Physical save failed. Current memories may be lost."
-_SAVE_FAILED_MSG = ("A record could not be saved ({error}). Current memories may be lost; "
-                    "if it happens again, check that no other program holds the memory database.")
+try:
+    from uuid_extensions import uuid7 as _uuid7
+except ImportError:  # pragma: no cover
+    _uuid7 = None
 
 
-def _norm(path: str) -> str:
-    return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+def _new_id():
+    return str(_uuid7()) if _uuid7 else str(uuid.uuid4())
 
 
-def _atomic_write_text(path: str, text: str) -> None:
-    """spec §3.5 (v1.5.0): write a temporary file in the same folder, then
-    os.replace it over the target — an interrupted write never leaves a
-    truncated file."""
+# ===================================================================== constants
+
+SESSION_ID = os.environ.get("N3MC_SESSION_ID") or str(uuid.uuid4())
+
+DEFAULT_CONFIG = {
+    "owner_id": None,
+    "local_id": None,
+    "bind_host": "127.0.0.1",
+    "server_port": 18520,
+    "embed_model": "intfloat/multilingual-e5-base",
+    "half_life_days": 90,
+    "bm25_min_threshold": 0.1,
+    "search_result_limit": 20,
+    "min_score": 0.2,
+    "search_query_max_chars": 2000,
+    "vector_min_cos": 0.85,
+    "relative_min_score_ratio": 0.6,
+    "min_results": 3,
+    "pair_top_n": 3,
+    "pair_max_chars": 3000,
+    "version_order_enabled": True,
+    "version_sim_threshold": 0.98,
+    "version_min_chars": 100,
+    "reply_sim_rerank_enabled": False,
+    "reply_sim_alpha": 0.3,
+    "reply_sim_floor": 0.80,
+    "reply_sim_span": 0.15,
+}
+_INT_RANGES = {
+    "server_port": (1, 65535), "search_result_limit": (1, 1365), "pair_top_n": (1, None),
+    "pair_max_chars": (1, None), "search_query_max_chars": (1, None),
+    "version_min_chars": (1, None), "min_results": (0, None),
+}
+_NUM_RULES = {  # key -> (low, high, low_inclusive)
+    "half_life_days": (0, None, False), "bm25_min_threshold": (0, None, True),
+    "min_score": (0, 1, True), "vector_min_cos": (0, 1, True),
+    "relative_min_score_ratio": (0, 1, True), "version_sim_threshold": (0, 1, True),
+    "reply_sim_alpha": (0, 1, True), "reply_sim_floor": (0, 1, True),
+    "reply_sim_span": (0, None, False),
+}
+
+AUDIT_MAX_BYTES = 50 * 1024 * 1024
+_SYSTEM_PROMPT_PREFIXES = ("<task-notification>", "<agent-message from=", "<system-reminder>")
+PERMISSION_RULES = [
+    "Bash(python -m n3memorycore.n3memory --search *)",
+    "Bash(python -m n3memorycore.n3memory --buffer *)",
+    "Bash(python -m n3memorycore.n3memory --list*)",
+    "Bash(python -m n3memorycore.n3memory --repair*)",
+    "Bash(python -m n3memorycore.n3memory --stop*)",
+    "Bash(python -m n3memorycore.n3memory --show-turn *)",
+    "Bash(python -m n3memorycore.n3memory --recall-thread *)",
+    "Bash(n3mc --search *)",
+    "Bash(n3mc --buffer *)",
+    "Bash(n3mc --list*)",
+    "Bash(n3mc --repair*)",
+    "Bash(n3mc --stop*)",
+    "Bash(n3mc --show-turn *)",
+    "Bash(n3mc --recall-thread *)",
+]
+
+_PORT = DEFAULT_CONFIG["server_port"]
+_FOREIGN_SERVER_ROOT = None
+_SERVER_STARTING = False
+_QUICK_CHECK_DONE = False
+_SERVER_CODE_VERSION = None
+_EPHEMERAL_IDS = {}
+_SAVE_FAILED_CLEARED = False
+
+
+def _utf8():
+    for name in ("stdin", "stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is not None and hasattr(s, "reconfigure"):
+            try:
+                s.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _err(msg):
+    print(msg, file=sys.stderr)
+
+
+# ============================================================ atomic JSON + audit
+
+def _write_json_atomic(path, obj):
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=folder, prefix='.' + os.path.basename(path) + '.')
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix="." + os.path.basename(path) + ".")
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
-    except BaseException:
+    except Exception:
         try:
             os.remove(tmp)
         except OSError:
@@ -98,1750 +152,1446 @@ def _atomic_write_text(path: str, text: str) -> None:
         raise
 
 
-# ---------------------------------------------------------------------------
-# Audit log + notices (spec §3 "Notices")
-# ---------------------------------------------------------------------------
-
-def _append_audit(record: dict) -> None:
+def _audit(record):
+    """Append one JSONL line to audit.log. Never raises."""
     try:
         os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
-        rec = {'ts': datetime.now(timezone.utc).isoformat()}
-        rec.update(record)
-        with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        try:
+            line = json.dumps(record, ensure_ascii=False)
+            data = (line + "\n").encode("utf-8")
+        except (UnicodeEncodeError, ValueError):
+            data = (json.dumps(record, ensure_ascii=True) + "\n").encode("utf-8")
+        with open(AUDIT_LOG, "ab") as f:
+            f.write(data)
     except Exception as e:
-        print(f"Warning: audit log write failed: {e}", file=sys.stderr)
+        _err(f"N3MC: audit.log write failed: {e}")
 
 
-def _load_notices() -> dict:
+# ====================================================================== notices
+
+def _read_notices():
     try:
-        with open(NOTICES_FILE, 'r', encoding='utf-8') as f:
+        with open(NOTICES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def _save_notices(notices: dict) -> None:
+def _notify(key, message):
+    """Raise a notice for a human. Printed to stderr, kept in notices.json, shown once a day."""
     try:
-        os.makedirs(os.path.dirname(NOTICES_FILE), exist_ok=True)
-        if not notices:
-            if os.path.exists(NOTICES_FILE):
-                os.remove(NOTICES_FILE)
+        notices = _read_notices()
+        cur = notices.get(key)
+        if isinstance(cur, dict) and cur.get("message") == message:
             return
-        # spec §3 "Notices" (v1.5.0): atomic, like config.json
-        _atomic_write_text(NOTICES_FILE, json.dumps(notices, ensure_ascii=False, indent=2))
+        notices[key] = {"message": message, "last_shown": None}
+        _write_json_atomic(NOTICES_FILE, notices)
+        _err(f"N3MC notice: {message}")
+        _audit({"ts": _now_iso(), "hook": "notice", "key": key, "message": message})
     except Exception as e:
-        print(f"Warning: notices write failed: {e}", file=sys.stderr)
+        _err(f"N3MC: could not record notice {key}: {e}")
 
 
-def _notify(key: str, message: str) -> None:
-    """A notice that needs a human: stderr + audit.log (once per text) +
-    notices.json (shown at the top of search output once a day)."""
-    print(f"N3MC: {message}", file=sys.stderr)
-    notices = _load_notices()
-    prev = notices.get(key)
-    if prev and prev.get('message') == message:
-        return
-    _append_audit({'hook': 'notice', 'key': key, 'message': message})
-    notices[key] = {'message': message, 'last_shown': None}
-    _save_notices(notices)
+def _clear_notice(key):
+    try:
+        notices = _read_notices()
+        if key in notices:
+            del notices[key]
+            _write_json_atomic(NOTICES_FILE, notices)
+    except Exception:
+        pass
 
 
-def _clear_notice(key: str) -> None:
-    notices = _load_notices()
-    if key in notices:
-        del notices[key]
-        _save_notices(notices)
+def _take_notices():
+    """Messages due for display (first time, or last shown >= 24 h ago). Marks them shown."""
+    out = []
+    try:
+        notices = _read_notices()
+        now = time.time()
+        changed = False
+        for key, v in notices.items():
+            if not isinstance(v, dict) or "message" not in v:
+                continue
+            last = v.get("last_shown")
+            if last is None or now - float(last) >= 86400:
+                out.append(v["message"])
+                v["last_shown"] = now
+                changed = True
+        if changed:
+            _write_json_atomic(NOTICES_FILE, notices)
+    except Exception:
+        pass
+    return out
 
 
-def _take_notices() -> list:
-    """Notices due for display (not shown in the last 24 h)."""
-    notices = _load_notices()
-    if not notices:
-        return []
-    now = time.time()
-    due = []
-    for v in notices.values():
-        last = v.get('last_shown')
-        if not last or now - float(last) >= 86400:
-            due.append(v.get('message', ''))
-            v['last_shown'] = now
-    if due:
-        _save_notices(notices)
-    return due
+# ======================================================================== config
 
-
-def _status_md(body: str) -> str:
-    """Heading + due notices + body (used for every non-result output).
-
-    Without notices this is exactly "# Recalled Memory Context\\n\\n<body>\\n"
-    (spec §5.4 degraded-state placeholders)."""
-    parts = [_HEADING, ""]
-    for n in _take_notices():
-        parts += [f"> ⚠️ N3MC notice: {n}", ""]
-    parts.append(body)
-    return "\n".join(parts) + "\n"
-
-
-def _emit(text: str) -> None:
-    """Write search output to stdout as-is (stdout only; no file)."""
-    sys.stdout.write(text if text.endswith("\n") else text + "\n")
-    sys.stdout.flush()
-
-
-# ---------------------------------------------------------------------------
-# Config (spec §3 identifiers, §3.5)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_CONFIG: dict = {
-    "owner_id":                 None,
-    "local_id":                 None,
-    "bind_host":                "127.0.0.1",  # keep 127.0.0.1: the API has no auth
-    "server_port":              18520,
-    "embed_model":              "intfloat/multilingual-e5-base",
-    "half_life_days":           90,
-    "bm25_min_threshold":       0.1,
-    "search_result_limit":      20,
-    "min_score":                0.2,
-    "search_query_max_chars":   2000,
-    "vector_min_cos":           0.85,   # measured with multilingual-e5-base
-    "relative_min_score_ratio": 0.6,
-    "min_results":              3,      # weak-match fill, spec §5 step 7 (v1.6.0)
-    "pair_top_n":               3,
-    "pair_max_chars":           3000,
-    "version_order_enabled":    True,
-    "version_sim_threshold":    0.98,   # measured with multilingual-e5-base
-    "version_min_chars":        100,
-    "reply_sim_rerank_enabled": False,  # spec §5 step 1b (2026-11-17)
-    "reply_sim_alpha":          0.3,
-    "reply_sim_floor":          0.80,   # measured with multilingual-e5-base
-    "reply_sim_span":           0.15,   # measured with multilingual-e5-base
-}
-
-
-# spec §3.5 "Allowed values" (v1.5.0): (kind, min, max, min_exclusive)
-# kind 'int' = JSON integer only (2000.0 is rejected); 'num' = int or float.
-_CONFIG_RULES: dict = {
-    'server_port':              ('int', 1, 65535, False),
-    # C-06: the vector search uses k = 3 x limit; sqlite-vec refuses k > 4096.
-    'search_result_limit':      ('int', 1, 1365, False),
-    'pair_top_n':               ('int', 1, None, False),
-    'pair_max_chars':           ('int', 1, None, False),
-    'search_query_max_chars':   ('int', 1, None, False),
-    'version_min_chars':        ('int', 1, None, False),
-    'min_results':              ('int', 0, None, False),
-    'half_life_days':           ('num', 0, None, True),
-    'bm25_min_threshold':       ('num', 0, None, False),
-    'min_score':                ('num', 0, 1, False),
-    'vector_min_cos':           ('num', 0, 1, False),
-    'relative_min_score_ratio': ('num', 0, 1, False),
-    'version_sim_threshold':    ('num', 0, 1, False),
-    'reply_sim_alpha':          ('num', 0, 1, False),
-    'reply_sim_floor':          ('num', 0, 1, False),
-    'reply_sim_span':           ('num', 0, None, True),
-}
-
-
-def _config_value_ok(key: str, value) -> bool:
-    """spec §3.5 (v1.5.0): type and range check of one config.json value."""
-    if key not in _DEFAULT_CONFIG:
-        return True
-    default = _DEFAULT_CONFIG[key]
-    if default is None:
+def _config_value_ok(key, value):
+    default = DEFAULT_CONFIG.get(key)
+    if key not in DEFAULT_CONFIG or default is None:
         return True
     if isinstance(default, bool):
         return isinstance(value, bool)
     if isinstance(default, str):
         return isinstance(value, str)
-    if isinstance(default, (int, float)):
-        if isinstance(value, bool):
-            return False                      # booleans are never numbers
-        rule = _CONFIG_RULES.get(key)
-        if rule is None:
-            return isinstance(value, (int, float))
-        kind, lo, hi, lo_exclusive = rule
-        if kind == 'int':
-            if not isinstance(value, int):
-                return False
-        elif not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if key in _INT_RANGES:
+        if not isinstance(value, int):
             return False
-        if value != value:                    # NaN
+        lo, hi = _INT_RANGES[key]
+        return (lo is None or value >= lo) and (hi is None or value <= hi)
+    if key in _NUM_RULES:
+        lo, hi, lo_incl = _NUM_RULES[key]
+        if lo is not None and (value < lo if lo_incl else value <= lo):
             return False
-        if lo is not None and (value <= lo if lo_exclusive else value < lo):
-            return False
-        if hi is not None and value > hi:
-            return False
-        return True
+        return hi is None or value <= hi
     return True
 
 
-def _recover_ids_from_db(cfg: dict) -> None:
-    """spec §3.5: recover owner_id / local_id from the most frequent DB value."""
+def _ids_from_db():
+    """Most frequent owner_id / local_id already stored in the DB (or None, None)."""
     try:
-        import sqlite3
         if not os.path.exists(DB_PATH):
-            return
-        conn = sqlite3.connect(DB_PATH)
+            return None, None
+        conn = sqlite3.connect(DB_PATH, timeout=5)
         try:
-            for col in ('owner_id', 'local_id'):
-                if cfg.get(col):
-                    continue
-                row = conn.execute(
-                    f"SELECT {col} FROM memories WHERE {col} IS NOT NULL "
-                    f"GROUP BY {col} ORDER BY COUNT(*) DESC LIMIT 1"
-                ).fetchone()
-                if row and row[0]:
-                    cfg[col] = row[0]
+            owner = conn.execute("SELECT owner_id FROM memories GROUP BY owner_id "
+                                 "ORDER BY COUNT(*) DESC LIMIT 1").fetchone()
+            local = conn.execute("SELECT local_id FROM memories WHERE local_id IS NOT NULL "
+                                 "GROUP BY local_id ORDER BY COUNT(*) DESC LIMIT 1").fetchone()
         finally:
             conn.close()
+        return (owner[0] if owner else None), (local[0] if local else None)
     except Exception:
-        pass
-
-
-def _fill_ids(cfg: dict) -> None:
-    _recover_ids_from_db(cfg)
-    for col in ('owner_id', 'local_id'):
-        if not cfg.get(col):
-            cfg[col] = str(uuid.uuid4())
+        return None, None
 
 
 def _read_config_file():
-    """Parse config.json. A file that another process has just created may
-    still be empty for a moment (exclusive creation, then write), so a
-    very young file that does not parse is read again briefly."""
-    for attempt in range(20):
+    """(dict, raw) or (None, raw) when unreadable. A just-created file is re-read for a moment."""
+    raw = b""
+    for attempt in range(21):
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("the top level is not a JSON object")
-            return data
+            with open(CONFIG_FILE, "rb") as f:
+                raw = f.read()
+            data = json.loads(raw.decode("utf-8"))
+            if isinstance(data, dict):
+                return data, raw
+        except FileNotFoundError:
+            return None, raw
         except Exception:
-            try:
-                young = time.time() - os.path.getmtime(CONFIG_FILE) < 2.0
-            except OSError:
-                young = False
-            if not young or attempt == 19:
-                raise
-            time.sleep(0.05)
+            pass
+        try:
+            fresh = time.time() - os.path.getmtime(CONFIG_FILE) <= 2
+        except OSError:
+            fresh = False
+        if not fresh or attempt == 20:
+            break
+        time.sleep(0.05)
+    return None, raw
 
 
-def _create_config(cfg: dict) -> bool:
-    """spec §3.5 (v1.5.0): create a missing config.json exclusively.
-    False when another process created it first (read that file instead)."""
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    try:
-        f = open(CONFIG_FILE, 'x', encoding='utf-8')
-    except FileExistsError:
-        return False
-    with f:
-        f.write(json.dumps(cfg, indent=2, ensure_ascii=False))
-        f.flush()
-        os.fsync(f.fileno())
-    return True
-
-
-def _load_config() -> dict:
-    """spec §3.5: never overwrite a config.json the user mistyped; create a
-    missing one exclusively; update an existing one atomically."""
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    cfg = dict(_DEFAULT_CONFIG)
-
+def load_config():
+    """Read config.json (creating / completing it safely) and return the effective config."""
+    os.makedirs(HOME_DIR, exist_ok=True)
     if not os.path.exists(CONFIG_FILE):
-        _fill_ids(cfg)
-        if _create_config(cfg):
-            return cfg
-        cfg = dict(_DEFAULT_CONFIG)   # another process won: use its file
-
-    try:
-        data = _read_config_file()
-    except Exception as e:
-        _notify(
-            'config_unreadable',
-            f"config.json cannot be read ({e}). N3MC runs with default "
-            f"settings until it is fixed; the file was NOT modified: {CONFIG_FILE}",
-        )
-        _fill_ids(cfg)   # this run only — not saved
+        db_owner, db_local = _ids_from_db()
+        data = dict(DEFAULT_CONFIG)
+        data["owner_id"] = db_owner or str(uuid.uuid4())
+        data["local_id"] = db_local or str(uuid.uuid4())
+        try:
+            with open(CONFIG_FILE, "x", encoding="utf-8") as f:
+                f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            return data
+        except FileExistsError:
+            pass  # another process created it first; read theirs
+    data, _raw = _read_config_file()
+    if data is None:
+        _notify("config_unreadable",
+                f"{CONFIG_FILE} could not be read as JSON, so it was left untouched and default "
+                "settings are in use. Fix the file; this notice clears itself.")
+        cfg = dict(DEFAULT_CONFIG)
+        db_owner, db_local = _ids_from_db()
+        if "owner_id" not in _EPHEMERAL_IDS:
+            _EPHEMERAL_IDS["owner_id"] = db_owner or str(uuid.uuid4())
+            _EPHEMERAL_IDS["local_id"] = db_local or str(uuid.uuid4())
+        cfg["owner_id"], cfg["local_id"] = _EPHEMERAL_IDS["owner_id"], _EPHEMERAL_IDS["local_id"]
         return cfg
-    _clear_notice('config_unreadable')
-
+    _clear_notice("config_unreadable")
+    cfg = dict(DEFAULT_CONFIG)
     bad = []
     for k, v in data.items():
-        if _config_value_ok(k, v):
-            cfg[k] = v
-        else:
+        if k in DEFAULT_CONFIG and not _config_value_ok(k, v):
             bad.append(k)
-    if bad:
-        _notify(
-            'config_type',
-            "config.json: these items have the wrong type or are out of range "
-            f"and are ignored (defaults are used): {', '.join(sorted(bad))}. "
-            "Write numbers without quotes, e.g. \"vector_min_cos\": 0.83, and "
-            "counts as whole numbers without a decimal point, e.g. 2000.",
-        )
-    else:
-        _clear_notice('config_type')
-
-    for col in ('owner_id', 'local_id'):
-        if not cfg.get(col):
-            cfg[col] = None
-    if not cfg.get('owner_id') or not cfg.get('local_id'):
-        _fill_ids(cfg)
-
-    missing = [k for k in _DEFAULT_CONFIG
-               if k not in data or (data.get(k) is None and cfg.get(k) is not None)]
-    if missing and not bad:
-        merged = dict(data)
-        for k in missing:
+            continue
+        cfg[k] = v
+    changed = False
+    merged = dict(data)
+    db_owner = db_local = None
+    for idk in ("owner_id", "local_id"):
+        if not isinstance(cfg.get(idk), str) or not cfg[idk]:
+            if db_owner is None and db_local is None:
+                db_owner, db_local = _ids_from_db()
+            cfg[idk] = (db_owner if idk == "owner_id" else db_local) or str(uuid.uuid4())
+            merged[idk] = cfg[idk]
+            changed = True
+    for k, v in DEFAULT_CONFIG.items():
+        if k not in merged:
             merged[k] = cfg[k]
-        _save_config(merged)
+            changed = True
+    if bad:
+        _notify("config_type",
+                "config.json has invalid value(s) for: " + ", ".join(sorted(bad)) +
+                ". Those settings are ignored (defaults are used). Fix the file; "
+                "this notice clears itself.")
+    else:
+        _clear_notice("config_type")
+        if changed:
+            try:
+                _write_json_atomic(CONFIG_FILE, merged)
+            except Exception as e:
+                _err(f"N3MC: could not update config.json: {e}")
     return cfg
 
 
-def _save_config(cfg: dict) -> None:
-    """spec §3.5 (v1.5.0): temporary file in the same folder + os.replace."""
-    _atomic_write_text(CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
+def _set_port(cfg):
+    global _PORT
+    _PORT = cfg["server_port"]
 
 
-def _code_version() -> str:
-    """spec §3: hash of the server code + config.json content (key order and
-    whitespace do not matter)."""
+def _code_version():
     h = hashlib.sha256()
-    for path in _CODE_FILES:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, "n3memory.py"), os.path.join(here, "core", "database.py"),
+              os.path.join(here, "core", "processor.py")):
         try:
-            with open(path, 'rb') as f:
+            with open(p, "rb") as f:
                 h.update(f.read())
-        except Exception:
-            h.update(path.encode('utf-8'))
+        except OSError:
+            pass
     try:
-        with open(CONFIG_FILE, 'rb') as f:
+        with open(CONFIG_FILE, "rb") as f:
             raw = f.read()
-    except Exception:
-        raw = b''
+    except OSError:
+        raw = b""
     try:
-        obj = json.loads(raw.decode('utf-8'))
-        h.update(json.dumps(obj, sort_keys=True).encode('utf-8'))
+        h.update(json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True).encode("utf-8"))
     except Exception:
         h.update(raw)
     return h.hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
+# ======================================================================= DB access
 
-def _local_open(req, timeout):
-    """Open a request to this PC's own server, never through a proxy (spec §3 Communication, F16).
-
-    urllib's default opener follows HTTP_PROXY / the system proxy settings; with a proxy and no
-    NO_PROXY entry for 127.0.0.1 the request went to the proxy and the server looked down."""
-    import urllib.request
-    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
-
-
-def _post(cfg: dict, path: str, payload: dict, timeout: int = 30) -> dict:
-    import urllib.request
-    url = f"http://127.0.0.1:{cfg['server_port']}{path}"
-    data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(
-        url, data=data,
-        headers={'Content-Type': 'application/json',
-                 'Host': f"127.0.0.1:{cfg['server_port']}"},   # spec §3 Host check
-        method='POST',
-    )
-    with _local_open(req, timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-
-
-def _get(cfg: dict, path: str, timeout: int = 30) -> dict:
-    import urllib.request
-    url = f"http://127.0.0.1:{cfg['server_port']}{path}"
-    req = urllib.request.Request(
-        url, headers={'Host': f"127.0.0.1:{cfg['server_port']}"}, method='GET')
-    with _local_open(req, timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-
-
-def _get_health(cfg: dict) -> Optional[dict]:
-    try:
-        r = _get(cfg, '/health', timeout=5)
-        return r if isinstance(r, dict) and r.get('status') == 'ok' else None
-    except Exception:
-        return None
-
-
-def _health_check(cfg: dict) -> bool:
-    return _get_health(cfg) is not None
-
-
-def _health_decision(health: Optional[dict]) -> str:
-    """spec §3: 'none' | 'ok' | 'stale' | 'foreign' | 'legacy'."""
-    if not health:
-        return 'none'
-    root = health.get('root')
-    if not root:
-        return 'legacy'
-    if _norm(root) != _norm(HOME_DIR):
-        return 'foreign'
-    if health.get('code_version') != _code_version():
-        return 'stale'
-    return 'ok'
-
-
-# ---------------------------------------------------------------------------
-# Server management (spec §3 "Server check and replacement (ensure_server)")
-# ---------------------------------------------------------------------------
-
-def _process_alive(pid: int) -> bool:
-    try:
-        if sys.platform == 'win32':
-            import ctypes
-            SYNCHRONIZE = 0x100000
-            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-            if not handle:
-                return False
-            ret = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return ret == 0x102  # WAIT_TIMEOUT → still alive
-        else:
-            os.kill(pid, 0)
-            return True
-    except Exception:
-        return False
-
-
-def _is_own_server_process(pid: int) -> bool:
-    """True only if psutil confirms pid is `n3memorycore.n3memory --run-server`
-    whose data folder (N3MC_HOME) is ours."""
-    try:
-        import psutil
-    except ImportError:
-        return False
-    if not pid:
-        return False
-    try:
-        p = psutil.Process(int(pid))
-        cmdline = ' '.join(p.cmdline())
-        # spec §3: command line contains both markers
-        if 'n3memorycore.n3memory' not in cmdline or '--run-server' not in cmdline:
-            return False
-        env = p.environ()
-        home = env.get('N3MC_HOME')
-        if home:
-            their_home = home
-        else:
-            user_home = env.get('USERPROFILE') or env.get('HOME') or os.path.expanduser('~')
-            their_home = os.path.join(user_home, '.n3mc')
-        return _norm(their_home) == _norm(HOME_DIR)
-    except Exception:
-        # psutil missing / access denied / process gone → cannot verify
-        return False
-
-
-def _server_pid(cfg: dict, health: Optional[dict]) -> Optional[int]:
-    """PID from /health's `pid`, else the process listening on the port."""
-    pid = (health or {}).get('pid')
-    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-        return pid
-    return _listener_pid(cfg.get('server_port', 18520))
-
-
-def _listener_pid(port: int) -> Optional[int]:
-    try:
-        import psutil
-        for c in psutil.net_connections(kind='tcp'):
-            if c.laddr and c.laddr.port == port and c.status == 'LISTEN' and c.pid:
-                return c.pid
-    except Exception:
-        pass
-    return None
-
-
-def _request_shutdown(cfg: dict) -> bool:
-    try:
-        r = _post(cfg, '/shutdown', {'root': HOME_DIR}, timeout=5)
-        return isinstance(r, dict) and r.get('status') == 'ok'
-    except Exception:
-        return False
-
-
-def _wait_port_free(cfg: dict, max_wait: float = 15) -> bool:
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        if not _health_check(cfg):
-            return True
-        time.sleep(0.3)
-    return False
-
-
-def _stop_stale_server(cfg: dict, health: dict) -> bool:
-    """Ask /shutdown first; for servers without it (v1.3.x) terminate only a
-    process psutil confirms as ours. Never use the PID file's number."""
-    if _request_shutdown(cfg):
-        return _wait_port_free(cfg)
-
-    pid = _server_pid(cfg, health)
-    if pid and _is_own_server_process(pid):
-        try:
-            import psutil
-            proc = psutil.Process(pid)
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-        except Exception:
-            pass
-        # Remove the PID file only if it names the process we just stopped.
-        try:
-            with open(PID_FILE, 'r', encoding='utf-8') as f:
-                same = f.read().strip() == str(pid)
-            if same:
-                os.remove(PID_FILE)
-        except Exception:
-            pass
-        return _wait_port_free(cfg)
-
-    _notify('stale_server', _STALE_SERVER_MSG)
-    return False
-
-
-_STALE_SERVER_MSG = (
-    "Cannot stop the old server. Another N3MC folder may be using the same "
-    "`server_port`. Check `server_port` in each folder's `config.json` and "
-    "restart manually."
-)
-
-
-def _wait_for_server(cfg: dict, max_wait: int = 60, proc=None) -> bool:
-    """Poll /health every 0.5 s. With `proc`, stop at once when the child
-    process exits (spec §3 "Starting the server", step 2)."""
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        if _health_decision(_get_health(cfg)) == 'ok':
-            return True
-        if proc is not None and proc.poll() is not None:
-            return False
-        time.sleep(0.5)
-    return False
-
-
-# Why this command runs without the server (None = it may use the server).
-# _do_buffer then saves directly and _do_search prints the reason.
-_NO_SERVER_REASON: Optional[str] = None
-
-_STILL_STARTING = 'the memory server is still starting'
-_START_FAILED = 'the memory server could not start'
-
-# spec §3 (v1.5.0)
-_START_FAILED_BACKOFF_SECONDS = 300
-_SERVER_LOG_MAX_BYTES = 1024 * 1024
-_PID_FILE_GRACE_SECONDS = 60
-
-
-def _server_answered() -> bool:
-    """spec §3: once our own server responds, clear the server notices and
-    the start-failure marker."""
-    global _NO_SERVER_REASON
-    _NO_SERVER_REASON = None
-    _clear_notice('stale_server')
-    _clear_notice('port_conflict')
-    _clear_notice('server_start_failed')
-    try:
-        os.remove(SERVER_START_FAILED_MARKER)
-    except OSError:
-        pass
-    return True
-
-
-def _start_failed_recently() -> bool:
-    """spec §3 step 4: a start failed less than 5 minutes ago."""
-    if not os.path.exists(SERVER_START_FAILED_MARKER):
-        return False
-    try:
-        with open(SERVER_START_FAILED_MARKER, 'r', encoding='utf-8') as f:
-            t = float(f.read().strip())
-    except Exception:
-        try:
-            t = os.path.getmtime(SERVER_START_FAILED_MARKER)
-        except OSError:
-            return False
-    return time.time() - t < _START_FAILED_BACKOFF_SECONDS
-
-
-def _open_server_log():
-    """spec §3 step 1: stderr of the server -> .memory/server.log (append),
-    truncated first when it is larger than 1 MB."""
-    os.makedirs(os.path.dirname(SERVER_LOG), exist_ok=True)
-    try:
-        if os.path.getsize(SERVER_LOG) > _SERVER_LOG_MAX_BYTES:
-            open(SERVER_LOG, 'wb').close()
-    except OSError:
-        pass
-    return open(SERVER_LOG, 'ab')
-
-
-def _detach_kwargs() -> dict:
-    """spec §3 Clean CLI (v1.5.0): keep the server alive after the hook exits."""
-    if os.name == 'nt':
-        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP
-                                 | subprocess.CREATE_NO_WINDOW}
-    return {'start_new_session': True}
-
-
-def _spawn_server():
-    log = _open_server_log()
-    try:
-        return subprocess.Popen(
-            [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
-            stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-            **_detach_kwargs(),
-        )
-    finally:
-        log.close()   # the child keeps its own handle
-
-
-def _record_start_failure(code) -> None:
-    _notify(
-        'server_start_failed',
-        f"The N3MC memory server could not start (exit code {code}). "
-        f"See {SERVER_LOG} for the reason.",
-    )
-    try:
-        _atomic_write_text(SERVER_START_FAILED_MARKER, str(time.time()))
-    except Exception as e:
-        print(f"Warning: could not write {SERVER_START_FAILED_MARKER}: {e}",
-              file=sys.stderr)
-
-
-def _start_server(cfg: dict) -> bool:
-    """spec §3 "Starting the server (_start_server, v1.5.0)"."""
-    global _NO_SERVER_REASON
-    if _start_failed_recently():
-        _NO_SERVER_REASON = _START_FAILED + f" (see {SERVER_LOG})"
-        return False
-    # spec §3: atomic exclusive-create of the PID file prevents two CLIs from
-    # launching two servers at the same time.
-    try:
-        pid_fh = open(PID_FILE, 'x', encoding='utf-8')
-    except FileExistsError:
-        # Another process is starting the server right now - wait for it.
-        if _wait_for_server(cfg, max_wait=60):
-            return _server_answered()
-        _NO_SERVER_REASON = _STILL_STARTING
-        return False
-    try:
-        proc = _spawn_server()
-        pid_fh.write(str(proc.pid))
-    except Exception as e:
-        pid_fh.close()
-        try:
-            os.remove(PID_FILE)
-        except Exception:
-            pass
-        # Never let a failed launch stop the hook: run without the server.
-        print(f"Warning: could not launch the N3MC server: {e}", file=sys.stderr)
-        _NO_SERVER_REASON = _START_FAILED + f" ({e})"
-        return False
-    pid_fh.close()
-    if _wait_for_server(cfg, max_wait=60, proc=proc):
-        return _server_answered()
-    code = proc.poll()
-    if code is not None:
-        # Exited during startup: port held by another program, missing
-        # dependency, DB cannot be opened, ...
-        _record_start_failure(code)
-        try:
-            with open(PID_FILE, 'r', encoding='utf-8') as f:
-                same = f.read().strip() == str(proc.pid)
-            if same:
-                os.remove(PID_FILE)
-        except Exception:
-            pass
-        _NO_SERVER_REASON = _START_FAILED + f" (see {SERVER_LOG})"
-        return False
-    # Still alive after 60 s: the first start downloads the model. Leave it.
-    _NO_SERVER_REASON = _STILL_STARTING
-    return False
-
-
-_LEGACY_FOREIGN_ROOT = '(unknown: the server did not report its folder)'
-
-
-def _notify_port_conflict(cfg: dict, root: str) -> None:
-    port = cfg.get('server_port', 18520)
-    _notify(
-        'port_conflict',
-        f"Port {port} is used by the N3MC server of another folder ({root}). "
-        "This folder saves directly to its own DB and skips memory search "
-        f"until `server_port` in {CONFIG_FILE} is changed to a free port.",
-    )
-
-
-def _psutil_available() -> bool:
-    try:
-        import psutil  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _pid_file_process_starting(pid: Optional[int]) -> bool:
-    """spec §3 "PID file handling": is the PID-file process this folder's
-    server that is still starting? Without psutil (broken install), every
-    PID-file process counts as starting for 60 s after the file's mtime."""
-    if not _psutil_available():
-        try:
-            age = time.time() - os.path.getmtime(PID_FILE)
-        except OSError:
-            return False
-        return age < _PID_FILE_GRACE_SECONDS
-    return bool(pid) and _process_alive(pid) and _is_own_server_process(pid)
-
-
-def ensure_server(cfg: dict) -> bool:
-    """Return True when a server of this folder with the current code answers.
-
-    False with _FOREIGN_SERVER_ROOT set: the port belongs to another folder's
-    server (save directly, do not search). False with _NO_SERVER_REASON set:
-    no server for this command (still starting / failed to start).
-    """
-    global _FOREIGN_SERVER_ROOT, _NO_SERVER_REASON
-    _FOREIGN_SERVER_ROOT = None
-    _NO_SERVER_REASON = None
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-
-    health = _get_health(cfg)
-    decision = _health_decision(health)
-    if decision == 'ok':
-        return _server_answered()
-    if decision == 'foreign':
-        # Another folder's server: do not stop it, do not use it.
-        _FOREIGN_SERVER_ROOT = health.get('root')
-        _notify_port_conflict(cfg, _FOREIGN_SERVER_ROOT)
-        return False
-    if decision == 'legacy':
-        # No `root` (v1.3.x or older): stop it only if psutil confirms it is
-        # ours; otherwise treat it as another folder's server.
-        if not _is_own_server_process(_server_pid(cfg, health)):
-            _FOREIGN_SERVER_ROOT = _LEGACY_FOREIGN_ROOT
-            _notify_port_conflict(cfg, _LEGACY_FOREIGN_ROOT)
-            return False
-        if not _stop_stale_server(cfg, health):
-            _FOREIGN_SERVER_ROOT = _LEGACY_FOREIGN_ROOT
-            return False
-    elif decision == 'stale':
-        # Same root, different code_version: stop it and restart.
-        if not _stop_stale_server(cfg, health):
-            # Could not stop it (notice `stale_server` emitted). It serves our
-            # own DB, so keep using it until a human restarts it.
-            return True
-
-    # No server answers. spec §3 "PID file handling"
-    if os.path.exists(PID_FILE):
-        pid = None
-        try:
-            with open(PID_FILE, 'r', encoding='utf-8') as f:
-                pid = int(f.read().strip())
-        except Exception:
-            pid = None
-        if _pid_file_process_starting(pid):
-            # This folder's server is starting up: keep the PID file and wait.
-            if _wait_for_server(cfg, max_wait=60):
-                return _server_answered()
-            # Still starting after 60 s: no second server, keep the PID file.
-            _NO_SERVER_REASON = _STILL_STARTING
-            return False
-        # Dead / reused PID: delete without waiting.
-        try:
-            os.remove(PID_FILE)
-        except Exception:
-            pass
-
-    return _start_server(cfg)
-
-
-# ---------------------------------------------------------------------------
-# Direct buffer fallback (no embedding — used when server is down/foreign)
-# ---------------------------------------------------------------------------
-
-def _is_corruption_error(e: BaseException) -> bool:
-    """spec §3.5 (F13): the DatabaseError of a damaged file — "file is not a
-    database" or "database disk image is malformed". Not OperationalError
-    (e.g. "database is locked") and not the sqlite-vec load failure."""
+def _is_corruption_error(e):
     if not isinstance(e, sqlite3.DatabaseError) or isinstance(e, sqlite3.OperationalError):
         return False
     msg = str(e).lower()
-    return 'file is not a database' in msg or 'malformed' in msg
+    return "file is not a database" in msg or "malformed" in msg
 
 
-def _connect_checked(pragma: Optional[str]):
-    """spec §3.5: open DB_PATH and run `PRAGMA <pragma>` (quick_check /
-    integrity_check; None = no check). A DB that fails the check — a result
-    other than 'ok', or (F13) a corruption error raised by opening it or by
-    the check itself — is set aside (_handle_corrupt_db) and a new empty DB
-    is opened. Any other error is raised unchanged."""
-    try:
-        conn = get_connection(DB_PATH)
-    except sqlite3.DatabaseError as e:
-        if not _is_corruption_error(e):
-            raise
-        _handle_corrupt_db()
-        return get_connection(DB_PATH)
-    if pragma is None:
-        return conn
-    try:
-        result = conn.execute(f"PRAGMA {pragma}").fetchone()
-    except sqlite3.DatabaseError as e:
-        conn.close()
-        if not _is_corruption_error(e):
-            raise
-        _handle_corrupt_db()
-        return get_connection(DB_PATH)
-    if result and result[0] != 'ok':
-        conn.close()
-        _handle_corrupt_db()
-        return get_connection(DB_PATH)
-    return conn
-
-
-def _quick_check_once():
-    """spec §3.5 (v1.5.0): PRAGMA quick_check at most once per process
-    (the direct-save path). Returns an open connection."""
-    global _QUICK_CHECK_DONE
-    pragma = None if _QUICK_CHECK_DONE else 'quick_check'
-    _QUICK_CHECK_DONE = True
-    return _connect_checked(pragma)
-
-
-# Set once quick_check has run in this process (spec §3.5, v1.5.0).
-_QUICK_CHECK_DONE = False
-
-
-def _buffer_direct(
-    content: str,
-    cfg: dict,
-    agent_name: Optional[str] = None,
-    session_id: Optional[str] = None,
-    turn_id: Optional[str] = None,
-) -> None:
-    from .core.database import count_memories
-    from uuid_extensions import uuid7
-
-    content = purify_text(content) if content else content
-    if not content or not content.strip():
-        return
-
-    # spec §3.5: quick_check in the fallback path (lighter than
-    # integrity_check), once per process
-    conn = _quick_check_once()
-    try:
-        init_db(conn)
-        migrate_schema(conn)
-        # spec §5.4: exact text only (same turn_id when given) — same rule as /buffer
-        if check_exact_duplicate(conn, content, turn_id=turn_id):
-            return
-
-        before = count_memories(conn)
-        ts = datetime.now(timezone.utc).isoformat()
-        rowid = insert_memory_once(
-            conn, str(uuid7()), content, ts,
-            owner_id=cfg['owner_id'],
-            local_id=cfg.get('local_id'),
-            agent_name=agent_name,
-            session_id=session_id or _CLI_SESSION_ID,
-            turn_id=turn_id,
-        )
-        if rowid is None:
-            return                      # spec §5.4 (R04): saved meanwhile
-        if count_memories(conn) == before:
-            raise RuntimeError("record count did not change after INSERT")
-    finally:
-        conn.close()
-
-
-def _corrupt_backup_path() -> str:
-    """n3memory.db.corrupt-<YYYYmmddHHMMSS>.bak (local time). A second
-    corruption within the same second gets a -<n> suffix before .bak."""
-    stamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    path = f"{DB_PATH}.corrupt-{stamp}.bak"
-    n = 1
-    while any(os.path.exists(path + sfx) for sfx in ('', '-wal', '-shm')):
+def _quarantine_db():
+    """Set a failed DB aside (with its -wal / -shm) and let a new empty one be created."""
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    base = f"{DB_PATH}.corrupt-{stamp}"
+    dest, n = base + ".bak", 1
+    while os.path.exists(dest):
         n += 1
-        path = f"{DB_PATH}.corrupt-{stamp}-{n}.bak"
-    return path
-
-
-def _handle_corrupt_db() -> str:
-    """spec §3.5 (v1.5.0): set the DB aside under a timestamped name and
-    MOVE its -wal / -shm next to it (never delete them), then notify."""
-    corrupt = _corrupt_backup_path()
-    for src, dst in ((DB_PATH, corrupt),
-                     (DB_PATH + '-wal', corrupt + '-wal'),
-                     (DB_PATH + '-shm', corrupt + '-shm')):
-        if os.path.exists(src):
-            try:
-                shutil.move(src, dst)
-            except Exception as e:
-                print(f"Warning: could not move {src} to {dst}: {e}", file=sys.stderr)
-    print(
-        f"Warning: DB corruption detected. Set aside as {corrupt} (with its "
-        "-wal / -shm). A new empty DB will be created. Recovery: rename the "
-        "sidecars back to <name>-wal / <name>-shm if needed, then "
-        f"`sqlite3 {corrupt} .recover | sqlite3 recovered.db`.",
-        file=sys.stderr,
-    )
-    _notify(
-        'db_corrupt',
-        f"The memory DB failed its integrity check and was set aside as {corrupt}. "
-        "A new empty DB is in use. To recover records: "
-        f"sqlite3 {corrupt} .recover | sqlite3 recovered.db",
-    )
-    return corrupt
-
-
-# ---------------------------------------------------------------------------
-# Time bounds for --since / --until (spec §3.6, v1.5.0)
-# ---------------------------------------------------------------------------
-
-# None = the machine's local time zone. Tests set a fixed tzinfo.
-_LOCAL_TZ = None
-
-_DATE_ONLY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
-_DATETIME_RE = re.compile(
-    r'^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)'
-    r'(Z|z|[+-]\d{2}:?\d{2})?$'
-)
-
-
-class TimeBoundError(ValueError):
-    pass
-
-
-def _local_aware(dt: datetime) -> datetime:
-    if _LOCAL_TZ is not None:
-        return dt.replace(tzinfo=_LOCAL_TZ)
-    return dt.astimezone()     # naive → the machine's local time (DST aware)
-
-
-def _parse_time_bound(value: Optional[str], is_until: bool = False,
-                      name: Optional[str] = None) -> Optional[str]:
-    """spec §3.6 (v1.5.0): date or ISO datetime (T or space, optional
-    offset/Z) → UTC string formatted like the stored timestamps.
-    Offset-less values are local time; a date-only until is 23:59:59.999999.
-    Raises TimeBoundError on unreadable input."""
-    if value is None:
+        dest = f"{base}-{n}.bak"
+    try:
+        shutil.move(DB_PATH, dest)
+    except FileNotFoundError:
         return None
-    v = str(value).strip()
-    if not v:
-        return None
-    label = name or ('--until' if is_until else '--since')
-    try:
-        if _DATE_ONLY_RE.match(v):
-            d = datetime.strptime(v, '%Y-%m-%d')
-            if is_until:
-                d = d.replace(hour=23, minute=59, second=59, microsecond=999999)
-            dt = _local_aware(d)
-        else:
-            m = _DATETIME_RE.match(v)
-            if not m:
-                raise ValueError(v)
-            date_part, time_part, off = m.groups()
-            text = f"{date_part}T{time_part}"
-            if off:
-                if off in ('Z', 'z'):
-                    off = '+00:00'
-                elif ':' not in off:
-                    off = off[:3] + ':' + off[3:]
-                text += off
-            dt = datetime.fromisoformat(text)
-            dt = _local_aware(dt) if dt.tzinfo is None else dt
-    except Exception:
-        raise TimeBoundError(
-            f"{label}: cannot read '{value}' (use 2026-11-13 or 2026-11-13T09:00)"
-        ) from None
-    return dt.astimezone(timezone.utc).isoformat()
-
-
-def _parse_time_range(since: Optional[str], until: Optional[str]):
-    """Both bounds; TimeBoundError when unreadable or since > until."""
-    s = _parse_time_bound(since, is_until=False)
-    u = _parse_time_bound(until, is_until=True)
-    if s and u and datetime.fromisoformat(s) > datetime.fromisoformat(u):
-        raise TimeBoundError('--since is later than --until')
-    return s, u
-
-
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-
-def _exit_server_process() -> None:
-    try:
-        with open(PID_FILE, 'r') as f:
-            if f.read().strip() == str(os.getpid()):
-                f.close()
-                os.remove(PID_FILE)
-    except Exception:
-        pass
-    os._exit(0)
-
-
-def _check_host(host: Optional[str]) -> bool:
-    """spec §3 (v1.5.0): only Host 127.0.0.1:<port> or localhost:<port>."""
-    port = (_srv_cfg or {}).get('server_port') or _DEFAULT_CONFIG['server_port']
-    h = (host or '').strip().lower()
-    return h in (f'127.0.0.1:{port}', f'localhost:{port}')
-
-
-# Looked up at request time so tests can replace the check (TestClient sends
-# Host: testserver).
-_host_ok = _check_host
-
-# Global server state (populated in lifespan)
-_srv_cfg: dict = {}
-_srv_session: str = ""
-_srv_code_version: str = ""
-
-# spec §3.5 (v1.5.0): one /repair batch per --hook-submit turn
-_HOOK_REPAIR_MAX_RECORDS = 200
-
-
-_EMBED_MISMATCH_MSG = (
-    "The stored vectors were made with {recorded}, but config.json sets embed_model to "
-    "{configured}. Search quality is degraded until they are re-made: run n3mc --reembed "
-    "(it re-embeds all {n} records with {configured}), or set embed_model back to {recorded}."
-)
-
-
-def _record_embed_model(conn, model: str) -> None:
-    from .core.database import meta_set, vec_table_dim
-    meta_set(conn, 'embed_model', model)
-    meta_set(conn, 'embed_dim', str(vec_table_dim(conn) or ''))
-    meta_set(conn, 'embed_model_at', datetime.now(timezone.utc).isoformat(timespec='seconds'))
-
-
-def _check_embed_model(conn, current_model: str) -> None:
-    """spec §3.5: fill meta.embed_model once, then compare it with the configured model."""
-    from .core.database import meta_get
-    recorded = meta_get(conn, 'embed_model')
-    if recorded is None:
-        has_vectors = conn.execute("SELECT 1 FROM memories_vec LIMIT 1").fetchone() is not None
-        recorded = current_model
-        legacy = os.path.join(MEMORY_DIR, 'vec_model.txt')
-        if has_vectors and os.path.exists(legacy):
+    for suffix in ("-wal", "-shm"):
+        side = DB_PATH + suffix
+        if os.path.exists(side):
             try:
-                with open(legacy, 'r', encoding='utf-8') as f:
-                    recorded = f.read().strip() or current_model
-            except OSError:
-                recorded = current_model
-        _record_embed_model(conn, recorded)
-        conn.commit()
-    if recorded != current_model:
-        n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        _notify('embed_model_mismatch', _EMBED_MISMATCH_MSG.format(
-            recorded=recorded, configured=current_model, n=n))
-    else:
-        _clear_notice('embed_model_mismatch')
+                shutil.move(side, dest + suffix)
+            except OSError as e:
+                _err(f"N3MC: could not move {side}: {e}")
+    _err(f"N3MC WARNING: the memory DB failed its integrity check and was set aside as {dest}. "
+         f"A new empty DB is in use. To recover records: sqlite3 {dest} .recover | sqlite3 recovered.db")
+    _notify("db_corrupt",
+            f"The memory DB failed its integrity check and was set aside as {dest}. A new empty "
+            f"DB is in use. To recover records: sqlite3 {dest} .recover | sqlite3 recovered.db")
+    return dest
 
 
-def cmd_reembed(cfg: dict) -> int:
-    """spec §3.5 `--reembed`: re-embed every record with the configured model, in this
-    process, in resumable batches of 200. Returns the exit status."""
-    from .core.database import (get_connection, init_db, migrate_schema, meta_get, meta_set,
-                                meta_delete, serialize_vector, vec_table_dim)
-    from .core.processor import get_model
-    model_name = cfg.get('embed_model') or _DEFAULT_CONFIG['embed_model']
-    _request_shutdown(cfg)          # this folder's server only; restarted by the next CLI call
-    try:
-        model = get_model(model_name)
-        probe = model.encode("passage: probe", normalize_embeddings=True)
-    except Exception as e:
-        print(f"N3MC: --reembed: the model {model_name} could not be loaded: {e}", file=sys.stderr)
-        return 1
+def _connect_checked(pragma=None):
+    """Open DB_PATH and (optionally) run PRAGMA <pragma>; quarantine the file when it is corrupt."""
+    for attempt in (1, 2):
+        conn = None
+        try:
+            conn = get_connection(DB_PATH)
+            if pragma:
+                row = conn.execute(f"PRAGMA {pragma}").fetchone()
+                if row is None or str(row[0]).lower() != "ok":
+                    conn.close()
+                    conn = None
+                    _quarantine_db()
+                    if attempt == 1:
+                        continue
+                    raise sqlite3.DatabaseError("integrity check failed after recovery")
+            return conn
+        except sqlite3.DatabaseError as e:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if attempt == 1 and _is_corruption_error(e):
+                _quarantine_db()
+                continue
+            raise
+    raise sqlite3.DatabaseError("could not open DB")  # pragma: no cover
+
+
+def _db():
+    """A per-call connection with the schema in place."""
     conn = get_connection(DB_PATH)
     try:
         init_db(conn)
-        migrate_schema(conn)
-        table_dim = vec_table_dim(conn)
-        if table_dim is not None and len(probe) != table_dim:
-            print(f"N3MC: --reembed: {model_name} makes {len(probe)}-dimensional vectors but "
-                  f"memories_vec has {table_dim}; a different dimension needs the manual procedure "
-                  "in \u00a73 \"Embeddings\".", file=sys.stderr)
-            return 1
-        cursor = -1
-        if meta_get(conn, 'reembed_model') == model_name:
-            try:
-                cursor = int(meta_get(conn, 'reembed_cursor') or -1)
-            except ValueError:
-                cursor = -1
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+# ===================================================================== HTTP client
+
+def _http(method, path, body=None, timeout=30):
+    url = f"http://127.0.0.1:{_PORT}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    # No proxy: HTTP_PROXY must never capture traffic to our own loopback server.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _post(path, body, timeout=30):
+    return _http("POST", path, body, timeout)
+
+
+def _get(path, timeout=30):
+    return _http("GET", path, None, timeout)
+
+
+def _request_shutdown(root):
+    _post("/shutdown", {"root": root}, timeout=5)
+
+
+def _health():
+    try:
+        h = _get("/health", timeout=5)
+        return h if isinstance(h, dict) and h.get("status") == "ok" else None
+    except Exception:
+        return None
+
+
+def _norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+def _health_decision(health):
+    if not health:
+        return "none"
+    if "root" not in health:
+        return "legacy"
+    if _norm(health["root"]) != _norm(HOME_DIR):
+        return "foreign"
+    if health.get("code_version") != _code_version():
+        return "stale"
+    return "ok"
+
+
+# ================================================================ server lifecycle
+
+def _cmd_is_server(cmd):
+    return any("n3memorycore.n3memory" in c for c in cmd) and "--run-server" in cmd
+
+
+def _process_home(proc):
+    env = proc.environ()
+    home = env.get("N3MC_HOME")
+    return _norm(os.path.expanduser(home)) if home else _norm(os.path.join(os.path.expanduser("~"), ".n3mc"))
+
+
+def _pid_is_own_server(pid):
+    """True when ``pid`` is a live N3MC server for THIS data folder."""
+    try:
+        import psutil
+    except ImportError:  # broken install: trust a PID file younger than 60 s
+        try:
+            return time.time() - os.path.getmtime(PID_FILE) < 60
+        except OSError:
+            return False
+    try:
+        proc = psutil.Process(pid)
+        return _cmd_is_server(proc.cmdline()) and _process_home(proc) == _norm(HOME_DIR)
+    except Exception:
+        return False
+
+
+def _is_own_server_process(health):
+    pid = (health or {}).get("pid")
+    if not pid:
+        try:
+            import psutil
+            for c in psutil.net_connections(kind="tcp"):
+                if c.status == "LISTEN" and c.laddr and c.laddr.port == _PORT:
+                    pid = c.pid
+                    break
+        except Exception:
+            return False
+    return bool(pid) and _pid_is_own_server(int(pid))
+
+
+def _terminate(pid):
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        p.terminate()
+        try:
+            p.wait(5)
+        except psutil.TimeoutExpired:
+            p.kill()
+        return True
+    except Exception:
+        return False
+
+
+def _read_pid_file():
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _remove_pid_file_if(pid):
+    if _read_pid_file() == pid:
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+
+def _stop_stale_server(health, quiet=False):
+    """Ask the server to stop; fall back to killing it only when verified to be ours."""
+    stopped_pid = health.get("pid")
+    try:
+        _request_shutdown(HOME_DIR)
+        asked = True
+    except Exception:
+        asked = False
+    if not asked:
+        if _is_own_server_process(health) and stopped_pid and _terminate(int(stopped_pid)):
+            pass
         else:
-            meta_set(conn, 'reembed_model', model_name)
-            meta_delete(conn, 'reembed_cursor')
+            if not quiet:
+                _notify("stale_server",
+                        "An old N3MC server could not be stopped. Another N3MC folder may be using "
+                        "the same server_port. Check server_port in each folder's config.json "
+                        "and restart manually.")
+            return False
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if _health() is None:
+            break
+        time.sleep(0.3)
+    else:
+        if not quiet:
+            _notify("stale_server",
+                    "An old N3MC server could not be stopped. Another N3MC folder may be using "
+                    "the same server_port. Check server_port in each folder's config.json "
+                    "and restart manually.")
+        return False
+    if stopped_pid:
+        _remove_pid_file_if(int(stopped_pid))
+    return True
+
+
+def _clear_server_notices():
+    for k in ("stale_server", "port_conflict", "server_start_failed"):
+        _clear_notice(k)
+    try:
+        os.remove(SERVER_START_FAILED)
+    except OSError:
+        pass
+
+
+def _start_server():
+    """Launch the server detached and wait for /health. False when it did not come up."""
+    global _SERVER_STARTING
+    try:
+        if time.time() - os.path.getmtime(SERVER_START_FAILED) < 300:
+            return False
+    except OSError:
+        pass
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    try:
+        if os.path.getsize(SERVER_LOG) > 1024 * 1024:
+            open(SERVER_LOG, "wb").close()
+    except OSError:
+        pass
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        log = open(SERVER_LOG, "ab")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "n3memorycore.n3memory", "--run-server"],
+            stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kwargs)
+    except Exception as e:
+        _err(f"N3MC: could not start the memory server: {e}")
+        return False
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if _health() is not None:
+            _clear_server_notices()
+            return True
+        rc = proc.poll()
+        if rc not in (None, 0):
+            _notify("server_start_failed",
+                    f"The N3MC memory server could not start (exit code {rc}). "
+                    f"See {SERVER_LOG} for the reason.")
+            try:
+                with open(SERVER_START_FAILED, "w", encoding="utf-8") as f:
+                    f.write(_now_iso())
+            except OSError:
+                pass
+            _remove_pid_file_if(proc.pid)
+            return False
+        time.sleep(0.5)
+    _SERVER_STARTING = True
+    return False
+
+
+def _ensure_when_no_response():
+    global _SERVER_STARTING
+    pid = _read_pid_file() if os.path.exists(PID_FILE) else None
+    if os.path.exists(PID_FILE):
+        if pid and _pid_is_own_server(pid):
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if _health() is not None:
+                    return ensure_server()
+                time.sleep(0.5)
+            _SERVER_STARTING = True
+            return False
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+    return _start_server()
+
+
+def ensure_server():
+    """True when a server for this data folder is usable; False -> work without one."""
+    global _FOREIGN_SERVER_ROOT, _SERVER_STARTING
+    _FOREIGN_SERVER_ROOT = None
+    _SERVER_STARTING = False
+    health = _health()
+    if health is None:
+        return _ensure_when_no_response()
+    decision = _health_decision(health)
+    if decision == "ok":
+        _clear_server_notices()
+        return True
+    if decision == "stale":
+        if _stop_stale_server(health):
+            return _ensure_when_no_response()
+        return True  # same DB, keep using the old server
+    if decision == "legacy":
+        if _is_own_server_process(health) and _stop_stale_server(health, quiet=True):
+            return _ensure_when_no_response()
+        _FOREIGN_SERVER_ROOT = "(unknown: the server did not report its folder)"
+    else:
+        _FOREIGN_SERVER_ROOT = health.get("root")
+    _notify("port_conflict",
+            f"Another program's server (data folder: {_FOREIGN_SERVER_ROOT}) is using port "
+            f"{_PORT}. Memories are saved directly and search is unavailable. Give each N3MC "
+            "folder its own server_port in config.json.")
+    return False
+
+
+# ================================================================ record handling
+
+def _do_buffer(conn, cfg, content, agent_name=None, local_id=None, session_id=None,
+               turn_id=None, embed=True):
+    """Store one record. Shared by POST /buffer and the direct (server-less) path."""
+    content = purify_text(content or "")
+    if not content.strip():
+        return {"status": "skipped", "count": 0, "reason": "empty"}
+    if check_exact_duplicate(conn, content, turn_id=turn_id):
+        return {"status": "skipped", "count": 0, "reason": "exact_duplicate"}
+    vec = None
+    if embed:
+        try:
+            vec = embed_passage(content, cfg["embed_model"])
+            if len(vec) != EMBED_DIM:
+                _err(f"N3MC: embedding has {len(vec)} dims, expected {EMBED_DIM}; stored without vector")
+                vec = None
+        except Exception as e:
+            _err(f"N3MC: embedding failed ({e}); stored without vector (run n3mc --repair later)")
+            vec = None
+    before = count_memories(conn)
+    rowid = insert_memory_once(
+        conn, _new_id(), content, _now_iso(), cfg["owner_id"], local_id or cfg["local_id"],
+        agent_name, session_id or SESSION_ID, vec, turn_id=turn_id)
+    if rowid is None:
+        return {"status": "skipped", "count": 0, "reason": "exact_duplicate"}
+    if count_memories(conn) <= before:
+        return {"status": "error", "message": "record count did not change after INSERT"}
+    return {"status": "ok", "count": 1}
+
+
+def _buffer_direct(cfg, content, agent_name=None, session_id=None, turn_id=None, local_id=None):
+    """Save without the server (and without a vector; --repair adds it later)."""
+    global _QUICK_CHECK_DONE
+    try:
+        pragma = None if _QUICK_CHECK_DONE else "quick_check"
+        conn = _connect_checked(pragma)
+        _QUICK_CHECK_DONE = True
+        try:
+            init_db(conn)
+            result = _do_buffer(conn, cfg, content, agent_name, local_id, session_id, turn_id,
+                                embed=False)
+        finally:
+            conn.close()
+        if result.get("status") == "error":
+            raise RuntimeError(result.get("message", "save failed"))
+        return result
+    except Exception as e:
+        _err("⚠️ Physical save failed. Current memories may be lost.")
+        _err("⚠️ 物理保存に失敗。現在の記憶は失われる可能性があります。")
+        _err(f"N3MC: {type(e).__name__}: {e}")
+        _notify("save_failed",
+                f"A record could not be saved ({type(e).__name__}: {e}). Current memories may be "
+                "lost; if it happens again, check that no other program holds the memory database.")
+        return {"status": "error", "message": str(e)}
+
+
+def _save_record(cfg, server_ok, content, agent_name=None, session_id=None, turn_id=None):
+    global _SAVE_FAILED_CLEARED
+    result = None
+    if server_ok:
+        try:
+            r = _post("/buffer", {"content": content, "agent_name": agent_name,
+                                  "session_id": session_id, "turn_id": turn_id})
+            if isinstance(r, dict) and r.get("status") != "error":
+                result = r
+        except Exception as e:
+            _err(f"N3MC: server save failed ({e}); saving directly")
+    if result is None:
+        result = _buffer_direct(cfg, content, agent_name, session_id, turn_id)
+    if result.get("status") == "ok" and not _SAVE_FAILED_CLEARED:
+        _SAVE_FAILED_CLEARED = True
+        _clear_notice("save_failed")
+    return result
+
+
+def _save_chunks(cfg, server_ok, text, role, turn_id, session_id, agent_name="claude-code"):
+    """Whole-message purify first, then chunk, then save every chunk in order."""
+    text = purify_text(sanitize_surrogates(text or ""))
+    chunks = chunk_text(text, max_chars=400, overlap=40)
+    for rec in add_chunk_prefixes(chunks, role) if chunks else []:
+        _save_record(cfg, server_ok, rec, agent_name, session_id, turn_id)
+
+
+# ============================================================ repair / reembed
+
+def _embed_failure_note(e):
+    _err(f"N3MC: could not embed ({e})")
+
+
+def _check_model_mismatch(conn, cfg):
+    recorded = get_meta(conn, "embed_model")
+    if recorded is None:
+        has_vec = conn.execute("SELECT 1 FROM memories_vec LIMIT 1").fetchone() is not None
+        recorded = cfg["embed_model"]
+        if has_vec:
+            try:
+                with open(VEC_MODEL_FILE, "r", encoding="utf-8") as f:
+                    legacy = f.read().strip()
+                if legacy:
+                    recorded = legacy
+            except OSError:
+                pass
+        set_meta(conn, "embed_model", recorded)
+        set_meta(conn, "embed_dim", EMBED_DIM)
+        set_meta(conn, "embed_model_at", _now_iso())
+    if recorded != cfg["embed_model"]:
+        total = count_memories(conn)
+        _notify("embed_model_mismatch",
+                f"The stored vectors were made with {recorded}, but config.json sets embed_model "
+                f"to {cfg['embed_model']}. Search quality is degraded until they are re-made: run "
+                f"n3mc --reembed (it re-embeds all {total} records with {cfg['embed_model']}), "
+                f"or set embed_model back to {recorded}.")
+    else:
+        _clear_notice("embed_model_mismatch")
+
+
+def repair_records(cfg, max_records=None):
+    """Fill missing vec / FTS / bigram rows. Returns the number of records actually changed."""
+    conn = _db()
+    changed = 0
+    try:
+        # (1) one-time FTS punctuation clean-up (keyset batches; marker only when finished)
+        if get_meta(conn, "fts_punct_cleaned") is None:
+            last, done = 0, True
+            while True:
+                rows = conn.execute("SELECT rowid, content FROM memories_fts WHERE rowid > ? "
+                                    "ORDER BY rowid LIMIT 200", (last,)).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    last = r[0]
+                    clean = strip_fts_punctuation(r[1])
+                    if clean != r[1]:
+                        conn.execute("UPDATE memories_fts SET content = ? WHERE rowid = ?",
+                                     (clean, r[0]))
+                        changed += 1
+                conn.commit()
+                if max_records is not None and changed >= max_records:
+                    done = False
+                    break
+            if done:
+                set_meta(conn, "fts_punct_cleaned", 1)
+        # (2) one-time bigram index for rows saved before the table existed
+        if get_meta(conn, "fts_bigram") is None:
+            while True:
+                rows = conn.execute(
+                    "SELECT m.rowid, m.content FROM memories m LEFT JOIN memories_fts_bi b "
+                    "ON b.rowid = m.rowid WHERE b.rowid IS NULL ORDER BY m.rowid LIMIT 200"
+                ).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    conn.execute("INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
+                                 (r[0], bigram_text(r[1])))
+                    changed += 1
+                conn.commit()
+            set_meta(conn, "fts_bigram", 1)
+        # (3) rows missing from memories_vec or memories_fts. OFFSET stays 0: repaired rows drop out.
+        while max_records is None or changed < max_records:
+            batch = 200 if max_records is None else min(200, max_records - changed)
+            rows = find_unindexed_memories(conn, batch)
+            if not rows:
+                break
+            vectors = {}
+            for r in rows:  # embeddings first, outside any write transaction
+                if not r["has_vec"]:
+                    try:
+                        vectors[r["rowid"]] = embed_passage(r["content"], cfg["embed_model"])
+                    except Exception as e:
+                        _embed_failure_note(e)
+                        break
+            repaired = 0
+            for r in rows:
+                did = False
+                if not r["has_fts"]:
+                    conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+                                 (r["rowid"], strip_fts_punctuation(r["content"])))
+                    if conn.execute("SELECT 1 FROM memories_fts_bi WHERE rowid = ?",
+                                    (r["rowid"],)).fetchone() is None:
+                        conn.execute("INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
+                                     (r["rowid"], bigram_text(r["content"])))
+                    did = True
+                if not r["has_vec"] and r["rowid"] in vectors and len(vectors[r["rowid"]]) == EMBED_DIM:
+                    conn.execute("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                                 (r["rowid"], serialize_vector(vectors[r["rowid"]])))
+                    did = True
+                repaired += did
             conn.commit()
-        total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            changed += repaired
+            if repaired == 0:
+                break
+        _check_model_mismatch(conn, cfg)
+    finally:
+        conn.close()
+    return changed
+
+
+def cmd_reembed():
+    cfg = load_config()
+    _set_port(cfg)
+    if not os.path.exists(DB_PATH):
+        _err(f"No DB found at {DB_PATH}")
+        return 1
+    health = _health()
+    if health is not None and "root" in health and _norm(health["root"]) == _norm(HOME_DIR):
+        try:
+            _request_shutdown(HOME_DIR)
+            for _ in range(50):
+                if _health() is None:
+                    break
+                time.sleep(0.3)
+        except Exception:
+            pass
+    model = cfg["embed_model"]
+    try:
+        probe = embed_passage("N3MC dimension probe", model)
+    except Exception as e:
+        _err(f"N3MC: --reembed: could not load {model}: {e}")
+        return 1
+    conn = _db()
+    try:
+        dim = int(get_meta(conn, "embed_dim", EMBED_DIM))
+        if len(probe) != dim:
+            _err(f"N3MC: --reembed: {model} makes {len(probe)}-dimensional vectors but memories_vec "
+                 f"has {dim}; a different dimension needs the manual procedure in §3 \"Embeddings\".")
+            return 1
+        cursor = 0
+        if get_meta(conn, "reembed_model") == model:
+            cursor = int(get_meta(conn, "reembed_cursor", 0))
+        else:
+            set_meta(conn, "reembed_model", model)
+            set_meta(conn, "reembed_cursor", 0)
+        total = count_memories(conn)
         done = conn.execute("SELECT COUNT(*) FROM memories WHERE rowid <= ?", (cursor,)).fetchone()[0]
         while True:
             rows = conn.execute("SELECT rowid, content FROM memories WHERE rowid > ? "
                                 "ORDER BY rowid LIMIT 200", (cursor,)).fetchall()
             if not rows:
                 break
-            vecs = model.encode(["passage: " + r[1] for r in rows], normalize_embeddings=True)
-            ids = [r[0] for r in rows]
-            conn.executemany("DELETE FROM memories_vec WHERE rowid = ?", [(i,) for i in ids])
-            conn.executemany("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                             [(i, serialize_vector(list(v))) for i, v in zip(ids, vecs)])
-            cursor = ids[-1]
-            meta_set(conn, 'reembed_cursor', str(cursor))
-            conn.commit()
+            vecs = [(r[0], embed_passage(r[1], model)) for r in rows]  # before the write txn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for rowid, vec in vecs:
+                    conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (rowid,))
+                    conn.execute("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                                 (rowid, serialize_vector(vec)))
+                cursor = rows[-1][0]
+                conn.execute("INSERT INTO meta(key, value) VALUES ('reembed_cursor', ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(cursor),))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
             done += len(rows)
-            print(f"Re-embedded {done} / {total}", file=sys.stderr)
-        _record_embed_model(conn, model_name)
-        meta_delete(conn, 'reembed_model')
-        meta_delete(conn, 'reembed_cursor')
-        conn.commit()
+            _err(f"Re-embedded {done} / {total}")
+        set_meta(conn, "embed_model", model)
+        set_meta(conn, "embed_dim", dim)
+        set_meta(conn, "embed_model_at", _now_iso())
+        delete_meta(conn, "reembed_model", "reembed_cursor")
+        _clear_notice("embed_model_mismatch")
+        print(f"Re-embedded {total} record(s) with {model}.")
+        return 0
     finally:
         conn.close()
-    _clear_notice('embed_model_mismatch')
-    print(f"Re-embedded {done} record(s) with {model_name}.", file=sys.stderr)
-    return 0
 
 
-def _repair_db(max_records: Optional[int] = None) -> int:
-    """Body of /repair. max_records limits the records changed in this call
-    (FTS punctuation cleaning and index repair); None = everything."""
-    from .core.database import (
-        get_connection, find_unindexed_memories, serialize_vector,
-        strip_fts_punctuation, bigram_text, fill_bigram_index,
-        init_db, meta_get, meta_set, vec_table_dim,
-    )
-    from .core.processor import embed_passage
+# ===================================================================== FastAPI app
 
-    budget = max_records if (isinstance(max_records, int) and max_records > 0) else None
-
-    def left() -> Optional[int]:
-        return None if budget is None else budget - repaired
-
-    conn = get_connection(DB_PATH)
-    repaired = 0
+def _parse_time_bound(value, is_until=False):
+    """CLI/API time bound -> UTC ISO string in the stored timestamp format. ValueError if unreadable."""
+    s = (value or "").strip()
+    if not s:
+        raise ValueError("empty")
+    date_only = re.fullmatch(r"\d{4}-\d{2}-\d{2}", s) is not None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
     try:
-        init_db(conn)   # spec §3.5 (v1.8.0): the meta table of an older DB
-        # spec §3: FTS punct cleaning — one-time migration; key in the meta
-        # table (v1.8.0: was the file .memory/fts_punct_cleaned)
-        if meta_get(conn, 'fts_punct_cleaned') != '1':
-            last_rowid = -1
-            cleaned_count = 0
-            finished = False
-            while True:
-                if left() is not None and left() <= 0:
-                    break
-                # Batches of 200 without OFFSET: cleaned rows stay in
-                # memories_fts, so page by rowid (keyset) instead.
-                rows = conn.execute(
-                    "SELECT rowid, content FROM memories_fts WHERE rowid > ? "
-                    "ORDER BY rowid LIMIT 200",
-                    (last_rowid,)
-                ).fetchall()
-                if not rows:
-                    finished = True
-                    break
-                stopped = False
-                for row in rows:
-                    if left() is not None and left() <= 0:
-                        stopped = True
-                        break
-                    last_rowid = row[0]
-                    clean = strip_fts_punctuation(row[1])
-                    if clean != row[1]:
-                        conn.execute(
-                            "UPDATE memories_fts SET content = ? WHERE rowid = ?",
-                            (clean, row[0])
-                        )
-                        cleaned_count += 1
-                        repaired += 1
-                conn.commit()
-                if stopped:
-                    break
-                if len(rows) < 200:
-                    finished = True
-                    break
-            # The key is written only when the migration has finished.
-            if finished:
-                meta_set(conn, 'fts_punct_cleaned', '1')
-                conn.commit()
-            if cleaned_count > 0:
-                print(f"FTS punctuation cleaned: {cleaned_count} record(s).", file=sys.stderr)
-
-        # spec §3 (2026-11-17): one-time CJK bigram index of the records
-        # saved before memories_fts_bi existed. New records are indexed by
-        # insert_memory, so later calls skip this. Not limited by
-        # max_records: it embeds nothing (about 5 s for 18,000 records).
-        if meta_get(conn, 'fts_bigram') != '1':
-            n_bi = fill_bigram_index(conn)
-            meta_set(conn, 'fts_bigram', '1')
-            conn.commit()
-            if n_bi > 0:
-                print(f"FTS bigram index: {n_bi} record(s).", file=sys.stderr)
-
-        # spec §3.5 "Index metadata" (v1.8.0): the model that made the
-        # stored vectors, recorded in the DB; a mismatch is a notice.
-        current_model = (_srv_cfg or {}).get('embed_model', 'intfloat/multilingual-e5-base')
-        _check_embed_model(conn, current_model)
-
-        # spec §3.5: batch 200 at a time; OFFSET always 0 (repaired records
-        # disappear from WHERE clause automatically)
-        while True:
-            remaining = left()
-            if remaining is not None and remaining <= 0:
-                break
-            batch = 200 if remaining is None else min(200, remaining)
-            rows = find_unindexed_memories(conn, limit=batch)  # OFFSET=0 always
-            if not rows:
-                break
-            batch_repaired = 0
-            # spec §3.5 (F11): every embedding of the batch is computed first,
-            # outside any transaction; only then are the rows written and
-            # committed. Until then the first INSERT opened the write
-            # transaction and it stayed open while the rest of the batch was
-            # embedded, so a /buffer that came meanwhile waited for the busy
-            # timeout and failed with "database is locked".
-            if conn.in_transaction:
-                conn.commit()
-            vecs = {}
-            for row in rows:
-                if row['vec_rowid'] is None:
-                    try:
-                        vecs[row['rowid']] = embed_passage(row['content'])
-                    except Exception as e:
-                        logger.warning(f"Repair embed rowid={row['rowid']}: {e}")
-            for row in rows:
-                rowid    = row['rowid']
-                content  = row['content']
-                has_fts  = row['fts_rowid'] is not None
-                changed  = False
-
-                if rowid in vecs:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                        (rowid, serialize_vector(vecs[rowid]))
-                    )
-                    batch_repaired += 1
-                    changed = True
-
-                if not has_fts:
-                    stripped = strip_fts_punctuation(content)
-                    conn.execute(
-                        "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
-                        (rowid, stripped)
-                    )
-                    if not conn.execute(
-                        "SELECT 1 FROM memories_fts_bi WHERE rowid = ?", (rowid,)
-                    ).fetchone():
-                        conn.execute(
-                            "INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
-                            (rowid, bigram_text(content))
-                        )
-                    batch_repaired += 1
-                    changed = True
-
-                # spec §4 (2026-11-16): count only records this call changed
-                if changed:
-                    repaired += 1
-
-            conn.commit()
-            # spec §3.5: exit if no progress (e.g. embed model unavailable)
-            if batch_repaired == 0:
-                break
-            if len(rows) < batch:
-                break
-    finally:
-        conn.close()
-
-    if repaired > 0:
-        print(f"Repaired {repaired} record(s).", file=sys.stderr)
-    return repaired
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(value)
+    if date_only:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999) if is_until else dt
+    return dt.astimezone(timezone.utc).isoformat()  # naive values are read as local time
 
 
-try:
+def _time_range(since, until):
+    s = _parse_time_bound(since, False) if since else None
+    u = _parse_time_bound(until, True) if until else None
+    if s and u and s > u:
+        raise ValueError("--since is later than --until")
+    return s, u
+
+
+def create_app():
+    from contextlib import asynccontextmanager
+    from typing import Optional
+
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 
-    class BufferRequest(BaseModel):
+    class BufferReq(BaseModel):
         content: str
         agent_name: Optional[str] = None
         local_id: Optional[str] = None
         session_id: Optional[str] = None
         turn_id: Optional[str] = None
 
-    class SearchRequest(BaseModel):
+    class SearchReq(BaseModel):
         query: str
         session_id: Optional[str] = None
         since: Optional[str] = None
         until: Optional[str] = None
 
-    class RepairRequest(BaseModel):
+    class RepairReq(BaseModel):
         max_records: Optional[int] = None
 
-    class ShutdownRequest(BaseModel):
+    class ShutdownReq(BaseModel):
         root: str
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        global _srv_cfg, _srv_session, _srv_code_version
-        _srv_cfg = _load_config()
-        _srv_code_version = _code_version()  # after _load_config may rewrite it
-        _srv_session = os.environ.get('N3MC_SESSION_ID') or str(uuid.uuid4())
-        os.makedirs(MEMORY_DIR, exist_ok=True)
-
-        from .core.database import get_connection, init_db, migrate_schema
-
-        # spec §3.5: integrity_check on startup (once, not in fallback path)
-        conn = _connect_checked('integrity_check')
+    async def lifespan(app):
+        conn = _connect_checked("integrity_check")
         try:
             init_db(conn)
-            migrate_schema(conn)
         finally:
             conn.close()
-
-        # Preload embedding model (covers first-time download wait)
-        try:
-            from .core.processor import get_model
-            get_model(_srv_cfg.get('embed_model'))
-        except Exception as e:
-            logger.warning(f"Model preload failed: {e}")
-
         yield
 
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan, title="N3MemoryCore Free")
 
-    @app.middleware('http')
-    async def _host_guard(request: Request, call_next):
-        # spec §3 (v1.5.0): DNS-rebinding guard on every endpoint
-        if not _host_ok(request.headers.get('host')):
-            return JSONResponse({'detail': 'Host not allowed'}, status_code=403)
+    @app.middleware("http")
+    async def local_only(request: Request, call_next):
+        port = load_config()["server_port"]
+        if "origin" in request.headers:
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
+        if request.headers.get("host") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
         return await call_next(request)
 
-    @app.get('/health')
-    async def ep_health():
-        return {
-            'status':       'ok',
-            'root':         os.path.abspath(HOME_DIR),
-            'code_version': _srv_code_version or _code_version(),
-            'pid':          os.getpid(),
-        }
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "root": HOME_DIR,
+                "code_version": _SERVER_CODE_VERSION or _code_version(), "pid": os.getpid()}
 
-    @app.post('/shutdown')
-    async def ep_shutdown(req: ShutdownRequest):
-        if _norm(req.root) != _norm(HOME_DIR):
-            raise HTTPException(status_code=403, detail='root mismatch')
-        threading.Timer(0.3, _exit_server_process).start()
-        return {'status': 'ok'}
-
-    # spec §3 (v1.5.0): endpoints that embed or touch the DB are plain `def`
-    # (run in the thread pool, /health stays responsive); one SQLite
-    # connection per request.
-    @app.post('/buffer')
-    def ep_buffer(req: BufferRequest):
-        # Looked up at call time so tests can patch processor.embed_passage.
-        from .core.database import (
-            get_connection, check_exact_duplicate, insert_memory, insert_memory_once, count_memories,
-        )
-        from .core.processor import embed_passage, purify_text
-        from uuid_extensions import uuid7
-
-        content = purify_text(req.content) if req.content else ''
-        if not content.strip():
-            return {'status': 'skipped', 'count': 0, 'reason': 'empty'}
-
-        local = req.local_id   or _srv_cfg.get('local_id')
-        sess  = req.session_id or _srv_session
-        tid   = req.turn_id
-        agent = req.agent_name
-
-        conn = get_connection(DB_PATH)
+    @app.post("/buffer")
+    def buffer(req: BufferReq):
+        cfg = load_config()
+        conn = _db()
         try:
-            # spec §5.4 (v1.4.0): exact text only (same turn when turn_id is
-            # given); checked before computing the embedding. No similarity dedup.
-            if check_exact_duplicate(conn, content, turn_id=tid):
-                return {'status': 'skipped', 'count': 0, 'reason': 'exact_duplicate'}
-
-            vec = None
-            try:
-                vec = embed_passage(content)
-            except Exception as e:
-                logger.warning(f"Embed error: {e}")
-
-            before = count_memories(conn)
-            ts = datetime.now(timezone.utc).isoformat()
-            rowid = insert_memory_once(
-                conn, str(uuid7()), content, ts,
-                owner_id=_srv_cfg['owner_id'],
-                embedding=vec,
-                local_id=local,
-                agent_name=agent,
-                session_id=sess,
-                turn_id=tid,
-            )
-            if rowid is None:               # spec §5.4 (R04): saved meanwhile
-                return {'status': 'skipped', 'count': 0, 'reason': 'exact_duplicate'}
-            if count_memories(conn) == before:
-                # spec §5.4: record count unchanged after INSERT → fatal
-                return {'status': 'error',
-                        'message': 'record count did not change after INSERT'}
-            return {'status': 'ok', 'count': 1}
+            return _do_buffer(conn, cfg, sanitize_surrogates(req.content), req.agent_name,
+                              req.local_id, req.session_id, req.turn_id)
         finally:
             conn.close()
 
-    @app.post('/search')
-    def ep_search(req: SearchRequest):
-        from .core.processor import hybrid_search
+    @app.post("/search")
+    def search(req: SearchReq):
+        cfg = load_config()
         try:
-            since, until = _parse_time_range(req.since, req.until)
-        except TimeBoundError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        sess = req.session_id or _srv_session
-        return hybrid_search(
-            DB_PATH, req.query or '', _srv_cfg, sess,
-            since=since, until=until,
-        )
+            since, until = _time_range(req.since, req.until)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"cannot read time bound: {e}")
+        conn = _db()
+        try:
+            res = hybrid_search(conn, sanitize_surrogates(req.query), cfg, req.session_id,
+                                since, until)
+        finally:
+            conn.close()
+        keep = ("id", "content", "score", "timestamp", "turn_id", "weak", "agent_name",
+                "session_id", "filter_score", "cos_sim", "keyword_relevance")
+        rows = []
+        for r in res["results"]:
+            row = {k: r.get(k) for k in keep}
+            row["score"] = round(r["score"], 4)
+            rows.append(row)
+        return {"results": rows, "pairs": res["pairs"], "pairs_omitted": res["pairs_omitted"]}
 
-    @app.post('/repair')
-    def ep_repair(req: Optional[RepairRequest] = None):
-        max_records = req.max_records if req is not None else None
-        return {'status': 'ok', 'count': _repair_db(max_records)}
+    @app.post("/repair")
+    def repair(req: Optional[RepairReq] = None):
+        cfg = load_config()
+        n = repair_records(cfg, req.max_records if req else None)
+        return {"status": "ok", "count": n}
 
-    @app.get('/list')
-    def ep_list():
-        from .core.database import get_connection, get_all_memories
-        conn = get_connection(DB_PATH)
+    @app.get("/list")
+    def list_records():
+        conn = _db()
         try:
             rows = get_all_memories(conn)
-            records = [
-                {
-                    'id':         r['id'],
-                    'content':    r['content'],
-                    'timestamp':  r['timestamp'],
-                    'agent_name': r['agent_name'],
-                }
-                for r in rows
-            ]
-            return {'records': records, 'total': len(records)}
         finally:
             conn.close()
+        recs = [{"id": r["id"], "content": r["content"], "timestamp": r["timestamp"],
+                 "agent_name": r["agent_name"]} for r in rows]
+        return {"records": recs, "total": len(recs)}
 
-    # spec §3: Pro-only endpoints — stub returns 403 in Free edition
-    @app.delete('/delete/{memory_id}')
-    async def ep_delete(memory_id: str):
-        raise HTTPException(status_code=403, detail='Pro feature')
+    @app.post("/shutdown")
+    def shutdown(req: ShutdownReq):
+        if _norm(req.root) != _norm(HOME_DIR):
+            raise HTTPException(status_code=403, detail="root mismatch")
 
-    @app.post('/gc')
-    async def ep_gc():
-        raise HTTPException(status_code=403, detail='Pro feature')
+        def _exit():
+            _remove_pid_file_if(os.getpid())
+            os._exit(0)
 
-    @app.post('/import')
-    async def ep_import():
-        raise HTTPException(status_code=403, detail='Pro feature')
+        t = threading.Timer(0.3, _exit)
+        t.daemon = True
+        t.start()
+        return {"status": "ok"}
 
-except ImportError:
-    app = None  # type: ignore
+    @app.delete("/delete/{memory_id}")
+    def delete_pro(memory_id: str):
+        raise HTTPException(status_code=403, detail="Pro feature")
+
+    @app.post("/gc")
+    def gc_pro():
+        raise HTTPException(status_code=403, detail="Pro feature")
+
+    @app.post("/import")
+    def import_pro():
+        raise HTTPException(status_code=403, detail="Pro feature")
+
+    return app
 
 
-# ---------------------------------------------------------------------------
-# CLI helpers
-# ---------------------------------------------------------------------------
+def __getattr__(name):  # module-level ``app`` is built on first use
+    if name == "app":
+        global _APP
+        try:
+            return _APP
+        except NameError:
+            _APP = create_app()
+            return _APP
+    raise AttributeError(name)
 
-def _turn_id_file(cc_session_id: str = '') -> str:
-    """Resolve turn_id file path (session-specific or legacy)."""
-    if cc_session_id:
-        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', cc_session_id)[:64]
-        return os.path.join(MEMORY_DIR, f'turn_id_{safe_id}.txt')
+
+def _claim_pid_file():
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    for _ in range(2):
+        try:
+            with open(PID_FILE, "x", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            return True
+        except FileExistsError:
+            pid = _read_pid_file()
+            if pid and pid != os.getpid() and _pid_is_own_server(pid):
+                return False
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+    return False
+
+
+def run_server():
+    global _SERVER_CODE_VERSION
+    cfg = load_config()
+    if cfg["bind_host"] != "127.0.0.1":
+        _err(f"N3MC WARNING: bind_host is {cfg['bind_host']}. The server has no authentication; "
+             "anyone who can reach this address can read your memories. Use 127.0.0.1.")
+    if not _claim_pid_file():
+        return 0  # another server for this folder already runs (or is starting)
+    atexit.register(lambda: _remove_pid_file_if(os.getpid()))
+    try:
+        _SERVER_CODE_VERSION = _code_version()
+        conn = _connect_checked("integrity_check")
+        try:
+            init_db(conn)
+        finally:
+            conn.close()
+        try:  # preload before binding the port (first run may download ~470 MB)
+            get_model(cfg["embed_model"])
+        except Exception as e:
+            _err(f"N3MC: embedding model not loaded ({e}); saves will be stored without vectors")
+        import uvicorn
+        uvicorn.run(create_app(), host=cfg["bind_host"], port=cfg["server_port"],
+                    log_level="error")
+    finally:
+        _remove_pid_file_if(os.getpid())
+    return 0
+
+
+# ============================================================ hook helpers / input
+
+_IMAGE_RE = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+
+def _strip_images(text):
+    return _IMAGE_RE.sub("", text or "")
+
+
+def _extract_text(prompt):
+    """Text of a prompt. Multimodal arrays keep only their text parts; plain text stays as typed."""
+    if prompt is None:
+        return ""
+    if isinstance(prompt, list):
+        parts = prompt
+    elif isinstance(prompt, str):
+        s = prompt.strip()
+        parts = None
+        if s.startswith("["):
+            try:
+                data = json.loads(s)
+            except ValueError:
+                data = None
+            if (isinstance(data, list) and data and
+                    all(isinstance(p, dict) and isinstance(p.get("type"), str) for p in data)):
+                parts = data
+        if parts is None:
+            return _strip_images(prompt)
+    else:
+        return ""
+    texts = [p.get("text", "") for p in parts
+             if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)]
+    return _strip_images("\n".join(t for t in texts if t))
+
+
+def _session_slug(session_id):
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", str(session_id))[:64]
+
+
+def _turn_file(session_id):
+    if session_id:
+        return os.path.join(MEMORY_DIR, f"turn_id_{_session_slug(session_id)}.txt")
     return TURN_ID_FILE
 
 
-def _read_turn_id(cc_session_id: str = '') -> Optional[str]:
-    # spec §2: turn_id_<session>.txt per Claude Code session_id; turn_id.txt
-    # only when there is no session_id (never another session's file).
-    f = _turn_id_file(cc_session_id)
-    if os.path.exists(f):
-        try:
-            with open(f, 'r', encoding='utf-8') as fh:
-                tid = fh.read().strip()
-            return tid or None
-        except Exception:
-            pass
-    return None
-
-
-def _write_turn_id(tid: str, cc_session_id: str = '') -> None:
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    with open(_turn_id_file(cc_session_id), 'w', encoding='utf-8') as f:
-        f.write(tid)
-
-
-def _is_multimodal_parts(parts) -> bool:
-    """spec §4.5: a non-empty JSON array whose elements are all objects with
-    a string `type` key. Typed text that happens to be valid JSON
-    (`[1, 2, 3]`, `["a", "b"]`, `[]`) is not such an array."""
-    return (isinstance(parts, list) and bool(parts)
-            and all(isinstance(p, dict) and isinstance(p.get('type'), str)
-                    for p in parts))
-
-
-def _extract_text(prompt) -> str:
-    if isinstance(prompt, str):
-        try:
-            parts = json.loads(prompt)
-        except Exception:
-            return prompt
-        if _is_multimodal_parts(parts):
-            return ' '.join(
-                p.get('text', '') for p in parts
-                if p.get('type') == 'text' and isinstance(p.get('text', ''), str)
-            )
-        return prompt
-    if isinstance(prompt, list):
-        return ' '.join(
-            p.get('text', '') for p in prompt
-            if isinstance(p, dict) and p.get('type') == 'text'
-        )
-    return str(prompt) if prompt else ''
-
-
-def _do_buffer(
-    text: str, cfg: dict,
-    agent_name: Optional[str] = None,
-    session_id: Optional[str] = None,
-    turn_id: Optional[str] = None,
-) -> None:
-    def _direct():
-        try:
-            _buffer_direct(text, cfg, agent_name=agent_name,
-                           session_id=session_id, turn_id=turn_id)
-        except Exception as e2:
-            # spec §5.4: fatal failure warning (DB write failed)
-            print(f"{_FATAL_SAVE_MSG} ({e2})", file=sys.stderr)
-            # F11: the hook's stderr is read by nobody; the notice reaches the
-            # next search output
-            _notify('save_failed', _SAVE_FAILED_MSG.format(error=f"{type(e2).__name__}: {e2}"))
-
-    # spec §3: another folder's server owns the port → never write to its DB.
-    # No server for this command (still starting / failed to start): save
-    # directly (spec §3 "PID file handling", "Starting the server").
-    if _FOREIGN_SERVER_ROOT is not None or _NO_SERVER_REASON is not None:
-        _direct()
-        return
-
-    payload = {
-        'content':    text,
-        'agent_name': agent_name,
-        'session_id': session_id,
-        'turn_id':    turn_id,
-    }
+def _read_turn_id(session_id):
     try:
-        result = _post(cfg, '/buffer', payload)
+        with open(_turn_file(session_id), "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _write_turn_id(session_id, turn_id):
+    path = _turn_file(session_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(turn_id)
+    except OSError as e:
+        _err(f"N3MC: could not write turn id: {e}")
+
+
+def _message_text(content):
+    """(has_text_part, text) of a transcript message content."""
+    if isinstance(content, str):
+        return True, content
+    if isinstance(content, list):
+        texts = [p.get("text", "") for p in content
+                 if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)]
+        if any(isinstance(p, dict) and p.get("type") == "text" for p in content):
+            return True, "\n".join(texts)
+    return False, ""
+
+
+def _is_real_prompt(obj):
+    if obj.get("isMeta"):
+        return False
+    has, text = _message_text((obj.get("message") or {}).get("content"))
+    if not has:
+        return False
+    t = text.lstrip()
+    return not t.startswith(("[Request interrupted by user", "<command-", "<local-command-")
+                            + _SYSTEM_PROMPT_PREFIXES)
+
+
+def _read_previous_reply(transcript_path, current_prompt):
+    """Last assistant text block before the current prompt, from the session transcript."""
+    if not transcript_path:
+        return None
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, "rb") as f:
+            start = max(0, size - 5 * 1024 * 1024)
+            f.seek(start)
+            data = f.read().decode("utf-8", errors="replace")
+        lines = data.split("\n")
+        if start > 0:
+            lines = lines[1:]
+        first_seen = False
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("isSidechain") is True:
+                continue
+            typ = obj.get("type")
+            if typ not in ("user", "assistant") or obj.get("isMeta"):
+                continue
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            if not first_seen:
+                first_seen = True
+                if typ == "user" and _is_real_prompt(obj):
+                    if _message_text(msg.get("content"))[1].strip() == (current_prompt or "").strip():
+                        continue
+            if typ == "user":
+                if _is_real_prompt(obj):
+                    return None
+                continue
+            content = msg.get("content")
+            blocks = [p.get("text", "") for p in content
+                      if isinstance(p, dict) and p.get("type") == "text"] if isinstance(content, list) \
+                else ([content] if isinstance(content, str) else [])
+            blocks = [b for b in blocks if isinstance(b, str) and b.strip()]
+            if blocks:
+                return blocks[-1]
+        return None
     except Exception as e:
-        print(f"Warning: HTTP buffer failed ({e}), using direct write.", file=sys.stderr)
-        _direct()
-        return
-    if isinstance(result, dict) and result.get('status') == 'error':
-        print(f"Warning: /buffer failed ({result.get('message')}), using direct write.",
-              file=sys.stderr)
-        _direct()
+        _audit({"ts": _now_iso(), "hook": "UserPromptSubmit", "stage": "transcript_unreadable",
+                "reason": str(e)[:200]})
+        return None
 
 
-def _do_search(
-    query: str, cfg: dict,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-    current_session: Optional[str] = None,
-) -> None:
-    """spec §5.4 (v1.4.0): print the result to stdout only (no file), on
-    every invocation, including degraded states."""
-    if not query or not query.strip():
-        _emit(_status_md("_No relevant memories found._"))
-        return
+# ===================================================================== commands
 
-    if _FOREIGN_SERVER_ROOT is not None:
-        _emit(_status_md(
-            "_(memory search unavailable: another N3MC folder's server is "
-            f"using port {cfg.get('server_port')})_"
-        ))
-        return
+def _placeholder(text, notices):
+    lines = ["# Recalled Memory Context", ""]
+    for n in notices:
+        lines += [f"> ⚠️ N3MC notice: {n}", ""]
+    lines.append(text)
+    return "\n".join(lines) + "\n"
 
-    if _NO_SERVER_REASON is not None:
-        _emit(_status_md(f"_(memory search unavailable: {_NO_SERVER_REASON})_"))
-        return
 
-    payload: dict = {'query': query}
-    if since:
-        payload['since'] = since
-    if until:
-        payload['until'] = until
-    if current_session:
-        payload['session_id'] = current_session
-
+def _search_output(cfg, server_ok, query, session_id=None, since=None, until=None):
+    notices = _take_notices()
+    if not (query or "").strip():
+        return _placeholder("_No relevant memories found._", notices)
+    if _FOREIGN_SERVER_ROOT:
+        return _placeholder(f"_(memory search unavailable: another N3MC folder's server is using "
+                            f"port {_PORT})_", notices)
+    if not server_ok:
+        reason = ("the memory server is still starting" if _SERVER_STARTING
+                  else "the memory server could not be started")
+        return _placeholder(f"_(memory search unavailable: {reason})_", notices)
     try:
-        result = _post(cfg, '/search', payload)
-        if not isinstance(result, dict):
-            raise RuntimeError('invalid /search response')
-        if result.get('status') == 'error':
-            raise RuntimeError(result.get('message') or '/search error')
+        res = _post("/search", {"query": query[:cfg["search_query_max_chars"]],
+                                "session_id": session_id, "since": since, "until": until})
     except Exception as e:
-        _emit(_status_md(f"_(memory search unavailable: {e})_"))
-        return
+        return _placeholder(f"_(memory search unavailable: {type(e).__name__}: {e})_", notices)
+    return render_memory_context(res, query[:cfg["search_query_max_chars"]], notices)
 
+
+def _emit(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _checked_range(since, until):
+    """(since, until, 0) or (None, None, 2) after one stderr line (shared by --search / --list)."""
     try:
-        md = render_memory_context(result, query, notices=_take_notices())
-    except Exception as e:
-        md = _status_md(f"_(memory search unavailable: rendering failed: {e})_")
-    _emit(md)
-
-
-# ---------------------------------------------------------------------------
-# CLI commands
-# ---------------------------------------------------------------------------
-
-def cmd_buffer(text: str, cfg: dict, agent_name: Optional[str] = None) -> None:
-    ensure_server(cfg)
-    _do_buffer(text, cfg, agent_name=agent_name)
-
-
-def cmd_search(
-    query: str, cfg: dict,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-) -> None:
-    # A failed start falls through: _do_search then prints
-    # "_(memory search unavailable: <reason>)_" (spec §5.4).
-    ensure_server(cfg)
-    _do_search(query, cfg, since=since, until=until)
-
-
-def cmd_repair(cfg: dict) -> None:
-    if not ensure_server(cfg) and _FOREIGN_SERVER_ROOT is not None:
-        print(
-            f"N3MC: --repair skipped: port {cfg.get('server_port')} is used by "
-            "another N3MC folder's server.",
-            file=sys.stderr,
-        )
-        return
-    if _NO_SERVER_REASON is not None:
-        print(f"N3MC: --repair skipped: {_NO_SERVER_REASON}.", file=sys.stderr)
-        return
-    try:
-        result = _post(cfg, '/repair', {})   # no limit: process everything
-        count = result.get('count', 0)
-        if count > 0:
-            print(f"Repaired {count} record(s).", file=sys.stderr)
-    except Exception as e:
-        print(f"Repair failed: {e}", file=sys.stderr)
-
-
-def _open_db_readonly_ready():
-    from .core.database import get_connection, init_db, migrate_schema
-    conn = get_connection(DB_PATH)
-    init_db(conn)
-    migrate_schema(conn)
-    return conn
-
-
-def cmd_list(
-    cfg: dict,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-    fmt: str = 'tsv',
-) -> None:
-    from .core.database import get_all_memories
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    if not os.path.exists(DB_PATH):
-        print("Total: 0 records")
-        return
-
-    conn = _open_db_readonly_ready()
-    try:
-        rows = get_all_memories(conn, since=since, until=until)
-        if fmt == 'jsonl':
-            for r in rows:
-                print(json.dumps({
-                    'id':         r['id'],
-                    'timestamp':  r['timestamp'],
-                    'agent_name': r['agent_name'],
-                    'content':    r['content'],
-                }, ensure_ascii=False))
+        s, u = _time_range(since, until)
+        return s, u, 0
+    except ValueError as e:
+        msg = str(e)
+        if msg.startswith("--since is later"):
+            _err(msg)
         else:
-            for r in rows:
-                # spec §6 test 2: [UUIDv7]\t[timestamp]\t[agent_name]\t[content[:80]]
-                content_80 = r['content'][:80].replace('\n', ' ').replace('\r', ' ')
-                agent = r['agent_name'] or '-'
-                print(f"{r['id']}\t{r['timestamp']}\t{agent}\t{content_80}")
-        print(f"Total: {len(rows)} records")
+            flag = "--since" if since and msg == since else "--until"
+            _err(f"{flag}: cannot read '{msg}' (use 2026-11-13 or 2026-11-13T09:00)")
+        return None, None, 2
+
+
+def _cli_session_id():
+    """N3MC_SESSION_ID of the process that runs the CLI, or None.
+
+    The resident server may have been started by another process (usually the hook) with a
+    different environment, so --buffer / --search send the caller's value explicitly. Without it
+    the server's own session is used (resolution order, §3 "Identifiers")."""
+    return os.environ.get("N3MC_SESSION_ID") or None
+
+
+def cmd_search(query, since=None, until=None):
+    s, u, rc = _checked_range(since, until)
+    if rc:
+        return rc
+    cfg = load_config()
+    _set_port(cfg)
+    query = sanitize_surrogates(query or "")
+    server_ok = ensure_server() if query.strip() else False
+    _emit(_search_output(cfg, server_ok, query, _cli_session_id(), s, u))
+    return 0
+
+
+def cmd_buffer(text, agent_id=None):
+    if text == "-":
+        text = sys.stdin.read()
+    text = sanitize_surrogates(text or "")
+    cfg = load_config()
+    _set_port(cfg)
+    server_ok = ensure_server()
+    r = _save_record(cfg, server_ok, text, agent_id, _cli_session_id())
+    return 1 if r.get("status") == "error" else 0
+
+
+def cmd_repair():
+    cfg = load_config()
+    _set_port(cfg)
+    server_ok = ensure_server()
+    if _FOREIGN_SERVER_ROOT:
+        _err(f"N3MC: --repair skipped: another N3MC folder's server is using port {_PORT}")
+        return 0
+    if server_ok:
+        try:
+            n = _post("/repair", {}, timeout=3600).get("count", 0)
+        except Exception as e:
+            _err(f"N3MC: --repair failed: {e}")
+            return 1
+    else:
+        n = repair_records(cfg)
+    if n:
+        print(f"Repaired {n} record(s)")
+    return 0
+
+
+def _read_stdin_payload():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None
+    return raw, payload
+
+
+def cmd_hook_submit():
+    raw, payload = _read_stdin_payload()
+    if not isinstance(payload, dict):
+        payload = {"prompt": raw}
+    payload = sanitize_surrogates(payload)
+    cfg = load_config()
+    _set_port(cfg)
+    prompt = payload.get("prompt", payload.get("message"))
+    text = _extract_text(prompt)
+    if text.lstrip().startswith(_SYSTEM_PROMPT_PREFIXES):
+        _audit({"ts": _now_iso(), "hook": "UserPromptSubmit", "stage": "skipped",
+                "reason": "system_prompt"})
+        _emit(_placeholder("_No relevant memories found._", []))
+        return 0
+    session_id = payload.get("session_id")
+    server_ok = ensure_server()
+    if server_ok:
+        try:
+            _post("/repair", {"max_records": 200}, timeout=120)
+        except Exception as e:
+            _err(f"N3MC: repair skipped ({e})")
+    prev = payload.get("last_assistant_message") or _read_previous_reply(
+        payload.get("transcript_path"), text)
+    if prev:
+        old_turn = _read_turn_id(session_id) or str(uuid.uuid4())
+        _save_chunks(cfg, server_ok, prev, "claude", old_turn, session_id)
+    turn_id = str(uuid.uuid4())
+    _write_turn_id(session_id, turn_id)
+    if text.strip():
+        _emit(_search_output(cfg, server_ok, text, session_id))
+        _save_chunks(cfg, server_ok, text, "user", turn_id, session_id)
+    else:
+        _emit(_placeholder("_No relevant memories found._", _take_notices()))
+    return 0
+
+
+def cmd_save_claude_turn():
+    _raw, payload = _read_stdin_payload()
+    if not isinstance(payload, dict):
+        return 0
+    payload = sanitize_surrogates(payload)
+    msg = payload.get("last_assistant_message")
+    if not isinstance(msg, str) or not msg.strip():
+        return 0
+    cfg = load_config()
+    _set_port(cfg)
+    session_id = payload.get("session_id")
+    turn_id = _read_turn_id(session_id) or str(uuid.uuid4())
+    server_ok = ensure_server()
+    _save_chunks(cfg, server_ok, msg, "claude", turn_id, session_id)
+    return 0
+
+
+def _oneline(s):
+    return re.sub(r"[\r\n\t]", " ", s)
+
+
+def _open_existing_db():
+    if not os.path.exists(DB_PATH):
+        _err(f"No DB found at {DB_PATH}")
+        return None
+    return get_connection(DB_PATH)
+
+
+def cmd_list(since=None, until=None, fmt="table"):
+    s, u, rc = _checked_range(since, until)
+    if rc:
+        return rc
+    conn = _open_existing_db()
+    if conn is None:
+        return 0
+    try:
+        rows = get_all_memories(conn, s, u)
     finally:
         conn.close()
-
-
-def cmd_recall_thread(
-    turn_id: str,
-    cfg: dict,
-    before: int = 2,
-    after: int = 2,
-    fmt: str = 'tsv',
-) -> None:
-    """spec §3.6: return turn_id's records plus N surrounding turns."""
-    from .core.database import get_thread_context
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    if not os.path.exists(DB_PATH):
-        print(f"No DB found at {DB_PATH}", file=sys.stderr)
-        return
-
-    conn = _open_db_readonly_ready()
-    try:
-        rows = get_thread_context(conn, turn_id, before=before, after=after)
-        if fmt == 'jsonl':
-            for r in rows:
-                print(json.dumps({
-                    'id':         r['id'],
-                    'timestamp':  r['timestamp'],
-                    'agent_name': r['agent_name'],
-                    'turn_id':    r['turn_id'],
-                    'content':    r['content'],
-                }, ensure_ascii=False))
+    for r in rows:
+        if fmt == "jsonl":
+            print(json.dumps({"id": r["id"], "timestamp": r["timestamp"],
+                              "agent_name": r["agent_name"], "content": r["content"]},
+                             ensure_ascii=False))
         else:
-            for r in rows:
-                content_80 = r['content'][:80].replace('\n', ' ').replace('\r', ' ')
-                agent = r['agent_name'] or '-'
-                print(f"{r['id']}\t{r['timestamp']}\t{agent}\t{content_80}")
-        print(f"Total: {len(rows)} records")
+            print(f"{r['id']}\t{r['timestamp']}\t{r['agent_name'] or '-'}\t"
+                  f"{_oneline(r['content'][:80])}")
+    out = sys.stderr if fmt == "jsonl" else sys.stdout
+    print(f"Total: {len(rows)} records", file=out)
+    return 0
+
+
+def cmd_recall_thread(turn_id, before=2, after=2, fmt="table"):
+    conn = _open_existing_db()
+    if conn is None:
+        return 0
+    try:
+        lo, hi = conn.execute("SELECT MIN(rowid), MAX(rowid) FROM memories WHERE turn_id = ?",
+                              (turn_id,)).fetchone()
+        ids = []
+        if lo is not None:
+            prev = [r[0] for r in conn.execute(
+                "SELECT turn_id FROM memories WHERE turn_id IS NOT NULL AND turn_id <> ? "
+                "GROUP BY turn_id HAVING MAX(rowid) < ? ORDER BY MAX(rowid) DESC LIMIT ?",
+                (turn_id, lo, before))]
+            nxt = [r[0] for r in conn.execute(
+                "SELECT turn_id FROM memories WHERE turn_id IS NOT NULL AND turn_id <> ? "
+                "GROUP BY turn_id HAVING MIN(rowid) > ? ORDER BY MIN(rowid) ASC LIMIT ?",
+                (turn_id, hi, after))]
+            ids = prev[::-1] + [turn_id] + nxt
+        rows = []
+        if ids:
+            q = ",".join("?" * len(ids))
+            rows = conn.execute(f"SELECT id, timestamp, agent_name, turn_id, content FROM memories "
+                                f"WHERE turn_id IN ({q}) ORDER BY rowid", ids).fetchall()
     finally:
         conn.close()
+    for r in rows:
+        if fmt == "jsonl":
+            print(json.dumps({"id": r[0], "timestamp": r[1], "agent_name": r[2], "turn_id": r[3],
+                              "content": r[4]}, ensure_ascii=False))
+        else:
+            print(f"{r[0]}\t{r[1]}\t{r[2] or '-'}\t{_oneline(r[4][:80])}")
+    out = sys.stderr if fmt == "jsonl" else sys.stdout
+    print(f"Total: {len(rows)} records", file=out)
+    return 0
 
 
-def cmd_show_turn(turn_id: str, cfg: dict) -> None:
-    """spec §4.5: full text of one exchange (no truncation)."""
-    from .core.database import get_memories_by_turn_id
-    from .core.processor import _fmt_saved
-    if not os.path.exists(DB_PATH):
-        print("Total: 0 records")
-        return
-    conn = _open_db_readonly_ready()
+def cmd_show_turn(turn_id):
+    conn = _open_existing_db()
+    if conn is None:
+        return 0
     try:
         rows = get_memories_by_turn_id(conn, turn_id)
-        for r in rows:
-            print(f"--- {r['id']} saved={_fmt_saved(r['timestamp'])} ---")
-            print(r['content'])
-        print(f"Total: {len(rows)} records")
     finally:
         conn.close()
+    for r in rows:
+        print(f"--- {r['id']} saved={_fmt_saved(r['timestamp'])} ---")
+        print(r["content"])
+    print(f"Total: {len(rows)} records")
+    return 0
 
 
-# ---------------------------------------------------------------------------
-# --stop: behavior rules + memory_context retirement (spec §4)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------- --stop
 
-_BEHAVIOR_MD_MARKER = '<!-- n3mc-behavior v3 -->'
-
-_BEHAVIOR_MD_CONTENT = _BEHAVIOR_MD_MARKER + """
+_BEHAVIOR_MD_MARKER = "<!-- n3mc-behavior v3 -->"
+_KNOWN_BEHAVIOR_MD_HASHES = {"ade0a59b94f59f9a", "34ed39efe5a3833d", "5af3c015c06c62c1"}
+_BEHAVIOR_MD_CONTENT = '''<!-- n3mc-behavior v3 -->
 # N3MemoryCore Behavioral Guidelines
 
 These guidelines apply to every Claude Code session in this project. They are
@@ -1894,711 +1644,287 @@ or it did not influence your answer, do NOT announce anything.
 ## Fatal-Failure Warning
 If a save fails physically, surface the warning prominently:
 > ⚠️ Physical save failed. Current memories may be lost.
-"""
-
-# Templates shipped before the current one (sha256 of LF-normalized text,
-# first 16 hex). Add the previous template's hash whenever the template changes.
-_KNOWN_BEHAVIOR_MD_HASHES = frozenset({
-    'ade0a59b94f59f9a',  # v1.2.x – v1.3.x
-    '34ed39efe5a3833d',  # v1.2.0 scaffolding
-    '5af3c015c06c62c1',  # v2 template, v1.4.0 – v1.5.0
-})
+'''
 
 
-def _behavior_md_hash(text: str) -> str:
-    t = text.replace('\r\n', '\n').replace('\r', '\n')
-    return hashlib.sha256(t.encode('utf-8')).hexdigest()[:16]
+def _read_text_lf(path):
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
-def _backup(path: str) -> str:
-    dst = f"{path}.bak-n3mc-{datetime.now():%Y%m%d%H%M%S}"
-    shutil.copy2(path, dst)
-    return dst
-
-
-def _behavior_notice_key(path: str) -> str:
-    """spec §4 (v1.5.0): behavior_md_edited:<first 12 hex of sha256(abs path)>."""
-    h = hashlib.sha256(os.path.abspath(path).encode('utf-8')).hexdigest()[:12]
-    return f'behavior_md_edited:{h}'
-
-
-def _ensure_behavior_md(path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    key = _behavior_notice_key(path)
-    # v1.4.0 used one key without the path; v1.5.0 never emits it.
-    _clear_notice('behavior_md_edited')
+def _ensure_behavior_md(cwd=None):
+    path = claude_paths(cwd)["behavior_md"]
+    key = "behavior_md_edited:" + hashlib.sha256(
+        os.path.abspath(path).encode("utf-8")).hexdigest()[:12]
+    _clear_notice("behavior_md_edited")  # v1.4.0 key
     if not os.path.exists(path):
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(_BEHAVIOR_MD_CONTENT)
-        return
-    with open(path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    first_line = text.lstrip('﻿').splitlines()[0].strip() if text else ''
-    if first_line == _BEHAVIOR_MD_MARKER:
-        # The user merged the template (or it is ours): nothing to report.
-        _clear_notice(key)
-        return
-    if _behavior_md_hash(text) in _KNOWN_BEHAVIOR_MD_HASHES:
-        _backup(path)
-        with open(path, 'w', encoding='utf-8') as f:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(_BEHAVIOR_MD_CONTENT)
         _clear_notice(key)
         return
-    _notify(
-        key,
-        f"The rules file {os.path.abspath(path)} has been edited by hand, so it "
-        "was not updated. Merge the new template manually if needed.",
-    )
+    text = _read_text_lf(path)
+    if text.split("\n", 1)[0].strip() == _BEHAVIOR_MD_MARKER:
+        _clear_notice(key)
+        return
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    if digest in _KNOWN_BEHAVIOR_MD_HASHES:
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        shutil.copy2(path, f"{path}.bak-n3mc-{stamp}")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_BEHAVIOR_MD_CONTENT)
+        _clear_notice(key)
+    else:
+        _notify(key, f"The rules file {os.path.abspath(path)} has been edited by hand, so it was "
+                     "not updated. Merge the new template manually if needed.")
 
 
-_MEMORY_CONTEXT_IMPORT_RE = re.compile(r'^[ \t]*@[^\n]*memory_context\.md[ \t]*$')
-_N3MC_COMMENT_PREFIXES = (
-    '# N3MemoryCore — ',
-    '# N3MemoryCore - ',
-    '# Path resolves to ',
-    '# If you have not yet run ',
-)
+_IMPORT_LINE_RE = re.compile(r"^[ \t]*@[^\n]*memory_context\.md[ \t\r]*$")
+_N3MC_COMMENT_RE = re.compile(r"^#\s*(N3MemoryCore\b|Path resolves to|If you have not yet run)")
 
 
-def _cmp_path(path: str) -> str:
-    """Normalize for comparison: forward and back slashes compare equal."""
-    p = path.replace('\\', '/')
-    return os.path.normcase(os.path.normpath(p))
+def _retire_memory_context(cwd=None):
+    md = claude_paths(cwd)["claude_md"]
+    if os.path.exists(md):
+        with open(md, "rb") as f:
+            raw = f.read()
+        lines = raw.decode("utf-8", errors="surrogateescape").splitlines(keepends=True)
+        mine = _norm(CONTEXT_FILE)
+        drop = set()
+        for i, line in enumerate(lines):
+            body = line.rstrip("\r\n")
+            if not _IMPORT_LINE_RE.match(body):
+                continue
+            target = os.path.expanduser(body.strip()[1:].strip())
+            if not os.path.isabs(target) or \
+                    os.path.normcase(os.path.normpath(target)) != os.path.normcase(os.path.normpath(CONTEXT_FILE)):
+                continue
+            drop.add(i)
+            j = i - 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+            comments = []
+            while j >= 0 and _N3MC_COMMENT_RE.match(lines[j].strip()):
+                comments.append(j)
+                j -= 1
+            if comments:
+                drop.update(comments)
+                drop.update(range(comments[0] + 1, i))  # blank lines between comment and import
+        if drop:
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            shutil.copy2(md, f"{md}.bak-n3mc-{stamp}")
+            kept = "".join(l for i, l in enumerate(lines) if i not in drop)
+            with open(md, "wb") as f:
+                f.write(kept.encode("utf-8", errors="surrogateescape"))
+    if not os.path.exists(CONTEXT_RETIRED) and os.path.exists(CONTEXT_FILE):
+        os.remove(CONTEXT_FILE)
+        with open(CONTEXT_RETIRED, "w", encoding="utf-8") as f:
+            f.write(_now_iso())
 
 
-def _is_own_context_import(line: str) -> bool:
-    """spec §4 (v1.5.0): the @ line names this installation's own
-    CONTEXT_FILE by an absolute path."""
-    body = line.rstrip('\r\n')
-    if not _MEMORY_CONTEXT_IMPORT_RE.match(body):
-        return False
-    target = body.strip()[1:].strip()
-    target = os.path.expanduser(target)
-    if not os.path.isabs(target):
-        return False
-    return _cmp_path(target) == _cmp_path(CONTEXT_FILE)
-
-
-def _retire_memory_context(claude_md: str) -> None:
-    """spec §4 (v1.5.0): remove the legacy @import of THIS installation's
-    memory_context.md from <cwd>/.claude/CLAUDE.md (backup first, keep
-    LF/CRLF) and delete the leftover global memory_context.md once."""
-    if os.path.exists(claude_md):
-        try:
-            with open(claude_md, 'rb') as f:
-                text = f.read().decode('utf-8')
-        except Exception:
-            text = None
-        if text is not None:
-            # Lines keep their own endings (LF / CRLF), so the file is written
-            # back with its original line endings.
-            lines = text.splitlines(keepends=True)
-            drop = set()
-            for i, line in enumerate(lines):
-                if not _is_own_context_import(line):
-                    continue
-                drop.add(i)
-                # The N3MC comment lines just before it (blank lines between
-                # the comment block and the @import go with them).
-                j = i - 1
-                first_comment = None
-                while j >= 0 and j not in drop:
-                    body = lines[j].rstrip('\r\n')
-                    if body.startswith(_N3MC_COMMENT_PREFIXES):
-                        first_comment = j
-                    elif body.strip():
-                        break
-                    j -= 1
-                if first_comment is not None:
-                    drop.update(range(first_comment, i))
-            if drop:
-                new_text = ''.join(l for k, l in enumerate(lines) if k not in drop)
-                _backup(claude_md)
-                with open(claude_md, 'wb') as f:
-                    f.write(new_text.encode('utf-8'))
-
-    # Leftover global memory_context.md: delete once, then mark as retired.
-    if not os.path.exists(CONTEXT_RETIRED_MARKER) and os.path.exists(CONTEXT_FILE):
-        try:
-            os.remove(CONTEXT_FILE)
-            os.makedirs(os.path.dirname(CONTEXT_RETIRED_MARKER), exist_ok=True)
-            with open(CONTEXT_RETIRED_MARKER, 'w', encoding='utf-8') as f:
-                f.write(datetime.now(timezone.utc).isoformat())
-        except Exception as e:
-            print(f"Warning: could not retire memory_context.md: {e}", file=sys.stderr)
-
-
-# spec §4 --stop housekeeping (v1.5.0)
-_TURN_ID_MAX_AGE_SECONDS = 30 * 86400
-_AUDIT_LOG_MAX_BYTES = 50 * 1024 * 1024
-
-
-def _housekeeping() -> None:
-    """Delete turn_id_*.txt older than 30 days; rotate audit.log > 50 MB."""
-    import glob
+def _housekeeping():
     now = time.time()
-    for path in glob.glob(os.path.join(MEMORY_DIR, 'turn_id_*.txt')):
-        try:
-            if now - os.path.getmtime(path) > _TURN_ID_MAX_AGE_SECONDS:
-                os.remove(path)
-        except OSError as e:
-            print(f"Warning: could not remove {path}: {e}", file=sys.stderr)
     try:
-        if os.path.getsize(AUDIT_LOG) > _AUDIT_LOG_MAX_BYTES:
-            os.replace(AUDIT_LOG, AUDIT_LOG + '.1')
+        for name in os.listdir(MEMORY_DIR):
+            if name.startswith("turn_id_") and name.endswith(".txt"):
+                p = os.path.join(MEMORY_DIR, name)
+                if now - os.path.getmtime(p) > 30 * 86400:
+                    os.remove(p)
     except FileNotFoundError:
         pass
-    except OSError as e:
-        print(f"Warning: could not rotate {AUDIT_LOG}: {e}", file=sys.stderr)
-
-
-def cmd_stop(cfg: dict) -> None:
-    """spec §4: behavior rules (versioned) + memory_context retirement +
-    housekeeping. Writes nothing into CLAUDE.md. Does NOT stop the server.
-    Never prints the physical-save warning (it does not write to the DB);
-    each failing step prints one line to stderr."""
-    cp = claude_paths()
-    steps = (
-        ('rules file', lambda: _ensure_behavior_md(cp['BEHAVIOR_MD'])),
-        ('memory_context cleanup', lambda: _retire_memory_context(cp['CLAUDE_MD'])),
-        ('housekeeping', _housekeeping),
-    )
-    for name, fn in steps:
-        try:
-            fn()
-        except Exception as e:
-            print(f"Warning: --stop {name} failed: {e}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# Hooks
-# ---------------------------------------------------------------------------
-
-_TRANSCRIPT_TAIL_BYTES = 5 * 1024 * 1024
-# spec §4.5 D3 step 2: user-line texts that are not a real prompt.
-_NON_PROMPT_PREFIXES = ('[Request interrupted by user', '<command-', '<local-command-')
-
-
-class TranscriptUnreadable(Exception):
-    pass
-
-
-def _content_texts(content) -> Optional[list]:
-    """Text parts of message.content: [str] for a string, the type=="text"
-    parts for a list, None for anything else."""
-    if isinstance(content, str):
-        return [content]
-    if isinstance(content, list):
-        return [p.get('text', '') for p in content
-                if isinstance(p, dict) and p.get('type') == 'text'
-                and isinstance(p.get('text', ''), str)]
-    return None
-
-
-def _read_previous_response(transcript_path, current_prompt: str) -> str:
-    """spec §4.5 (decision D3, v1.5.0): the last assistant reply that
-    precedes the current prompt, read from the session's JSONL transcript.
-
-    Raises TranscriptUnreadable on any failure (the caller logs it)."""
-    if not transcript_path or not isinstance(transcript_path, str):
-        raise TranscriptUnreadable('no transcript_path')
     try:
-        size = os.path.getsize(transcript_path)
-        with open(transcript_path, 'rb') as f:
-            start = max(0, size - _TRANSCRIPT_TAIL_BYTES)
-            f.seek(start)
-            data = f.read()
-    except Exception as e:
-        raise TranscriptUnreadable(f'{type(e).__name__}: {e}') from None
-    text = data.decode('utf-8', errors='replace')
-    lines = text.splitlines()
-    if start > 0 and lines:
-        lines = lines[1:]          # first line may be cut by the seek
-
-    current = (current_prompt or '').strip()
-    parsed_any = False
-    # spec §4.5 step 3 (C-05): only the trailing line may be the current
-    # prompt. Lines skipped by step 1 and isMeta lines do not count.
-    trailing = True
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        parsed_any = True
-        if not isinstance(obj, dict) or obj.get('isSidechain') is True:
-            continue
-        typ = obj.get('type')
-        if typ not in ('user', 'assistant'):
-            continue
-        msg = obj.get('message')
-        content = msg.get('content') if isinstance(msg, dict) else None
-        if typ == 'user':
-            if obj.get('isMeta') is True:
-                continue           # meta line, not a prompt
-            parts = _content_texts(content)
-            is_prompt = isinstance(content, str) or bool(
-                isinstance(content, list) and any(
-                    isinstance(p, dict) and p.get('type') == 'text' for p in content))
-            if not is_prompt:
-                trailing = False
-                continue           # tool_result-only line: same reply
-            first = (parts[0] if parts else '').lstrip()
-            if first.startswith(_NON_PROMPT_PREFIXES) or \
-                    first.startswith(tuple(_SYSTEM_PROMPT_PREFIXES)):
-                trailing = False
-                continue           # interruption marker / slash command / system input
-            joined = '\n\n'.join(parts or []).strip()
-            if trailing and (joined == current
-                             or ' '.join(parts or []).strip() == current):
-                trailing = False
-                continue           # the current prompt itself (trailing line only)
-            break                  # the previous real user prompt: no response
-        trailing = False
-        # assistant: the LAST non-empty text part of the newest assistant line
-        # that has one — the same block Stop receives as last_assistant_message.
-        parts = _content_texts(content) if isinstance(content, list) else None
-        texts = [p for p in (parts or []) if p and p.strip()]
-        if texts:
-            return texts[-1]
-    if not parsed_any and any(l.strip() for l in lines):
-        raise TranscriptUnreadable('no JSON lines')
-    return ''
-
-
-def _save_claude_text(text: str, cfg: dict, session_id: Optional[str],
-                      turn_id: Optional[str]) -> None:
-    """purify the whole text, then chunk and save as [claude] / [claude i/N]."""
-    cleaned = purify_text(text)
-    for chunk in add_chunk_prefixes(chunk_text(cleaned), 'claude'):
-        _do_buffer(chunk, cfg, agent_name='claude-code',
-                   session_id=session_id, turn_id=turn_id)
-
-
-def cmd_hook_submit(cfg: dict) -> None:
-    """spec §4.5: UserPromptSubmit hook — repair → buffer(claude) → search → buffer(user)."""
-    raw = sys.stdin.read()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    # spec §4.5 (F12): lone surrogates (e.g. "\ud83d") cannot be encoded as
-    # UTF-8; remove them before the text is searched, printed or saved.
-    from .core.processor import sanitize_surrogates
-    data = sanitize_surrogates(data)
-
-    user_text     = _extract_text(data.get('prompt') or data.get('message') or '')
-    cc_session_id = data.get('session_id', '') or ''
-    if not isinstance(cc_session_id, str):
-        cc_session_id = str(cc_session_id)
-
-    # spec §4.5: system inputs (e.g. <task-notification>) — no search, no save,
-    # no new turn_id; the reply to it belongs to the current exchange.
-    if user_text.lstrip().startswith(_SYSTEM_PROMPT_PREFIXES):
-        _append_audit({'hook': 'UserPromptSubmit', 'stage': 'skipped',
-                       'reason': 'system_prompt'})
-        _emit(_status_md("_No relevant memories found._"))
-        return
-
-    # Previous Claude response: a supplied last_assistant_message wins;
-    # otherwise read it from the transcript (decision D3).
-    last_claude = data.get('last_assistant_message')
-    if not isinstance(last_claude, str) or not last_claude.strip():
-        last_claude = ''
-        try:
-            last_claude = sanitize_surrogates(
-                _read_previous_response(data.get('transcript_path'), user_text))
-        except TranscriptUnreadable as e:
-            _append_audit({'hook': 'UserPromptSubmit', 'stage': 'transcript_unreadable',
-                           'reason': str(e)[:200]})
-        except Exception as e:     # never let the transcript fail the hook
-            _append_audit({'hook': 'UserPromptSubmit', 'stage': 'transcript_unreadable',
-                           'reason': f'{type(e).__name__}: {e}'[:200]})
-
-    server_ok = ensure_server(cfg)
-
-    # Step 1: Repair unindexed records (own server only; one batch per turn)
-    if server_ok:
-        try:
-            _post(cfg, '/repair', {'max_records': _HOOK_REPAIR_MAX_RECORDS})
-        except Exception as e:
-            logger.warning(f"Repair failed during hook: {e}")
-
-    # Step 2: Save Claude's previous response under the previous turn_id
-    if last_claude.strip():
-        prev_tid = _read_turn_id(cc_session_id)
-        _save_claude_text(last_claude, cfg, cc_session_id or None, prev_tid)
-
-    # Step 3: Search memory for current query
-    q = user_text[:cfg.get('search_query_max_chars', 2000)]
-    _do_search(q, cfg, current_session=cc_session_id or None)
-
-    # Step 4: a new turn_id for every typed prompt (also image-only, v1.5.0);
-    # save the user message (purified as a whole, then chunked).
-    new_tid = str(uuid.uuid4())
-    _write_turn_id(new_tid, cc_session_id)
-    if user_text.strip():
-        cleaned = purify_text(user_text)
-        for chunk in add_chunk_prefixes(chunk_text(cleaned), 'user'):
-            _do_buffer(chunk, cfg, agent_name='claude-code',
-                       session_id=cc_session_id or None, turn_id=new_tid)
-
-
-def cmd_save_claude_turn(cfg: dict) -> None:
-    """spec §4.5: Stop hook helper — save last_assistant_message via chunking.
-    The turn_id file is NOT cleared (the next UserPromptSubmit overwrites it);
-    a second Stop in the same turn is stopped by the same-turn exact check."""
-    raw = sys.stdin.read()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    # spec §4.5 (F12): lone surrogates (e.g. "\ud83d") cannot be encoded as
-    # UTF-8; remove them before the text is searched, printed or saved.
-    from .core.processor import sanitize_surrogates
-    data = sanitize_surrogates(data)
-
-    last_claude   = data.get('last_assistant_message') or ''
-    cc_session_id = data.get('session_id', '') or ''
-
-    if not isinstance(last_claude, str) or not last_claude.strip():
-        return
-
-    tid = _read_turn_id(cc_session_id)
-    if not tid:
-        tid = str(uuid.uuid4())
-        _write_turn_id(tid, cc_session_id)
-    ensure_server(cfg)
-    _save_claude_text(last_claude, cfg, cc_session_id or None, tid)
-
-
-# ---------------------------------------------------------------------------
-# Server runner
-# ---------------------------------------------------------------------------
-
-def run_server(cfg: dict) -> None:
-    import uvicorn
-    host = cfg.get('bind_host') or '127.0.0.1'
-    if host != '127.0.0.1':
-        print(
-            f"WARNING: bind_host is {host}. The N3MC API (search, list, "
-            "/shutdown, ...) has no authentication and becomes reachable from "
-            "the network. Keep the default 127.0.0.1 unless you know what you "
-            "are doing.",
-            file=sys.stderr,
-        )
-    uvicorn.run(
-        app, host=host, port=cfg.get('server_port', 18520),
-        log_level='error',
-    )
-
-
-# ---------------------------------------------------------------------------
-# n3mc --init  —  register hooks in ~/.claude/settings.json
-# ---------------------------------------------------------------------------
-
-_HOOK_EVENTS = {  # event -> (entry-point name, module name)
-    'UserPromptSubmit': ('n3mc-hook',      'n3memorycore.n3mc_hook'),
-    'Stop':             ('n3mc-stop-hook', 'n3memorycore.n3mc_stop_hook'),
-}
-
-# spec §4 ② (v1.5.0): rules `--init` adds to permissions.allow
-PERMISSION_RULES = (
-    "Bash(python -m n3memorycore.n3memory --search *)",
-    "Bash(python -m n3memorycore.n3memory --buffer *)",
-    "Bash(python -m n3memorycore.n3memory --list*)",
-    "Bash(python -m n3memorycore.n3memory --repair*)",
-    "Bash(python -m n3memorycore.n3memory --stop*)",
-    "Bash(python -m n3memorycore.n3memory --show-turn *)",
-    "Bash(python -m n3memorycore.n3memory --recall-thread *)",
-    "Bash(n3mc --search *)",
-    "Bash(n3mc --buffer *)",
-    "Bash(n3mc --list*)",
-    "Bash(n3mc --repair*)",
-    "Bash(n3mc --stop*)",
-    "Bash(n3mc --show-turn *)",
-    "Bash(n3mc --recall-thread *)",
-)
-
-_OTHER_N3MC_MARKERS = ('n3mc_hook', 'n3mc-hook', 'n3mc_stop_hook', 'n3mc-stop-hook')
-
-
-def _hook_tokens(command: str) -> list:
-    """spec §4: backslashes become "/" first. posix shlex drops an unquoted
-    "\\" as an escape, so C:\\Tools\\n3mc-hook.exe was not recognized (review of
-    2026-11-17). The tokens are only compared, never executed."""
-    import shlex
-    command = command.replace('\\', '/')
-    try:
-        return shlex.split(command, posix=True)
-    except ValueError:
-        return command.split()
-
-
-def is_own_hook(command: str, event: str) -> bool:
-    """spec §4 ① Path B (decision D1): True only for a hook command that runs
-    THIS package's hook — (a) the entry point n3mc-hook / n3mc-stop-hook
-    (.exe ignored, any folder), (b) `-m n3memorycore.n3mc_hook`, or (c)
-    n3mc_hook.py / n3mc_stop_hook.py inside this package's folder."""
-    if event not in _HOOK_EVENTS or not isinstance(command, str):
-        return False
-    exe_name, module = _HOOK_EVENTS[event]
-    toks = _hook_tokens(command)
-    if not toks:
-        return False
-    first = toks[0].replace('\\', '/').rsplit('/', 1)[-1].lower()
-    if first.endswith('.exe'):
-        first = first[:-4]
-    if first == exe_name:
-        return True
-    for i, t in enumerate(toks[:-1]):
-        if t == '-m' and toks[i + 1] == module:
-            return True
-    script = module.split('.')[-1] + '.py'
-    pkg_dir = os.path.normcase(os.path.abspath(_PKG_DIR))
-    for t in toks[1:]:
-        tt = os.path.expanduser(t)
-        if os.path.basename(tt.replace('\\', '/')).lower() == script:
-            d = os.path.normcase(os.path.abspath(os.path.dirname(tt)))
-            if d == pkg_dir:
-                return True
-    return False
-
-
-def _shell_path(p) -> str:
-    """Forward slashes always (bash reads a backslash as an escape). Quote only
-    when the path has a space: a hook command that starts with a quote did not
-    run on a Windows PC (2026-11-15), while a bare path did."""
-    import pathlib
-    s = pathlib.Path(p).as_posix()
-    return f'"{s}"' if ' ' in s else s
-
-
-def _resolve_hook_command(script_name: str) -> str:
-    """Resolve the hook command (spec section 4, resolve_cmd).
-
-    1. The scripts folder of the running Python (normal, then user scheme):
-       found even when PATH is stale, e.g. Python was installed after
-       Claude Code started.
-    2. PATH (shutil.which).
-    3. python -m (unquoted unless the path has a space).
-    """
-    import pathlib
-    folders = [sysconfig.get_path('scripts')]
-    try:
-        folders.append(sysconfig.get_path('scripts', sysconfig.get_preferred_scheme('user')))
-    except (KeyError, ValueError):
+        if os.path.getsize(AUDIT_LOG) > AUDIT_MAX_BYTES:
+            os.replace(AUDIT_LOG, AUDIT_LOG + ".1")
+    except FileNotFoundError:
         pass
-    for folder in folders:
-        if not folder:
-            continue
-        for name in (script_name + '.exe', script_name):
-            cand = pathlib.Path(folder) / name
-            if cand.is_file():
-                return _shell_path(cand)
-    exe = shutil.which(script_name)
-    if exe:
-        return _shell_path(exe)
-    module = {
-        'n3mc-hook':      'n3memorycore.n3mc_hook',
-        'n3mc-stop-hook': 'n3memorycore.n3mc_stop_hook',
-    }[script_name]
-    return f'{_shell_path(sys.executable)} -m {module}'
 
 
-def _settings_path() -> str:
-    return os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
-
-
-def _merge_settings(settings: dict) -> list:
-    """Merge our hooks and the permission rules into `settings` (in place).
-    Returns the report lines about other N3MC hooks that were left alone."""
-    report = []
-    hooks = settings.setdefault('hooks', {})
-    for event, (exe_name, _module) in _HOOK_EVENTS.items():
-        kept = []
-        entries = hooks.get(event, [])
-        if not isinstance(entries, list):
-            raise ValueError(f'hooks.{event} is not a list')
-        for entry in entries:
-            if not isinstance(entry, dict):
-                kept.append(entry)
-                continue
-            inner_all = entry.get('hooks', [])
-            if not isinstance(inner_all, list):
-                kept.append(entry)
-                continue
-            inner = [h for h in inner_all
-                     if not (isinstance(h, dict) and is_own_hook(h.get('command', ''), event))]
-            for h in inner:
-                c = h.get('command', '') if isinstance(h, dict) else ''
-                if isinstance(c, str) and any(m in c for m in _OTHER_N3MC_MARKERS):
-                    report.append(f"Another N3MC hook is registered for {event} "
-                                  f"and was left in place: {c}")
-            if inner:
-                kept.append({**entry, 'hooks': inner})
-        kept.append({'hooks': [{'type': 'command',
-                                'command': _resolve_hook_command(exe_name)}]})
-        hooks[event] = kept
-
-    allow = settings.setdefault('permissions', {}).setdefault('allow', [])
-    for rule in PERMISSION_RULES:
-        if rule not in allow:
-            allow.append(rule)
-    return report
-
-
-def cmd_init() -> int:
-    """Set up ~/.n3mc/ and register hooks + permission rules in
-    ~/.claude/settings.json (spec §4 ①②, v1.5.0). Returns the exit status."""
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    print(f"Data directory: {HOME_DIR}")
-
-    cfg = _load_config()
-    print(f"Config: {CONFIG_FILE}")
-    print(f"  owner_id = {cfg['owner_id']}")
-    print(f"  port     = {cfg['server_port']}")
-
-    settings_path = _settings_path()
-
-    # 1. Read. An unreadable file is never touched.
-    raw = None
-    if os.path.exists(settings_path):
+def cmd_stop():
+    for step in (_ensure_behavior_md, _retire_memory_context, _housekeeping):
         try:
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                raw = f.read()
-            settings = json.loads(raw)
+            step()
         except Exception as e:
-            print(f"{settings_path} is not valid JSON ({e}). Nothing was changed. "
-                  "Fix the file, then run n3mc --init again.", file=sys.stderr)
-            return 1
-        perms = settings.get('permissions', {}) if isinstance(settings, dict) else None
-        if (not isinstance(settings, dict)
-                or not isinstance(settings.get('hooks', {}), dict)
-                or not isinstance(perms, dict)
-                or not isinstance(perms.get('allow', []), list)):
-            print(f"{settings_path} has an unexpected structure. Nothing was changed.",
-                  file=sys.stderr)
-            return 1
-        before = json.loads(raw)
-    else:
-        settings, before = {}, None
-
-    # 2-3. Merge hooks and permission rules.
-    try:
-        report = _merge_settings(settings)
-    except ValueError as e:
-        print(f"{settings_path} has an unexpected structure ({e}). "
-              "Nothing was changed.", file=sys.stderr)
-        return 1
-    for line in report:
-        print(line)
-
-    # 4. Write only when something changed: back up, then replace atomically.
-    if settings != before:
-        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-        if raw is not None:
-            stamp = datetime.now().strftime('%Y%m%d%H%M%S')
-            bak = os.path.join(os.path.dirname(settings_path),
-                               f'settings.json.bak-n3mc-{stamp}')
-            shutil.copy2(settings_path, bak)
-            print(f"Backup: {bak}")
-        _atomic_write_text(settings_path,
-                           json.dumps(settings, indent=2, ensure_ascii=False) + '\n')
-        print(f"Hooks and permission rules registered in: {settings_path}")
-    else:
-        print(f"Already registered (no change): {settings_path}")
-    for event, (exe_name, _m) in _HOOK_EVENTS.items():
-        print(f"  {event:<16} -> {_resolve_hook_command(exe_name)}")
-    print("Done. Restart Claude Code: saving will start from the next session.")
+            _err(f"N3MC: --stop {step.__name__}: {e}")
     return 0
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------ --init
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description='N3MemoryCore CLI')
-    grp = parser.add_mutually_exclusive_group()
-    grp.add_argument('--init',   action='store_true',
-                     help='Set up ~/.n3mc/ and register Claude Code hooks')
-    grp.add_argument('--buffer', metavar='TEXT', nargs='?', const='-')
-    grp.add_argument('--search', metavar='QUERY')
-    grp.add_argument('--repair', action='store_true')
-    grp.add_argument('--reembed', action='store_true',
-                     help='Re-embed every record with the configured embed_model')
-    grp.add_argument('--list',   action='store_true')
-    grp.add_argument('--recall-thread', metavar='TURN_ID', dest='recall_thread')
-    grp.add_argument('--show-turn', metavar='TURN_ID', dest='show_turn',
-                     help='Print the full text of one exchange')
-    grp.add_argument('--stop',   action='store_true')
-    grp.add_argument('--hook-submit',      action='store_true', dest='hook_submit')
-    grp.add_argument('--save-claude-turn', action='store_true', dest='save_claude_turn')
-    grp.add_argument('--run-server',       action='store_true', dest='run_server')
+def cmd_init():
+    import pathlib
+    import sysconfig
+    import n3memorycore
 
-    parser.add_argument('--agent-id', dest='agent_id', default=None)
-    parser.add_argument('--since', default=None,
-                        help='Filter from (2026-11-13 or 2026-11-13T09:00; local time unless an offset is given)')
-    parser.add_argument('--until', default=None,
-                        help='Filter until (a date means the end of that day)')
-    parser.add_argument('--before', type=int, default=2, help='Turns before target (default 2)')
-    parser.add_argument('--after',  type=int, default=2, help='Turns after target (default 2)')
-    parser.add_argument('--format', dest='fmt', default='tsv',
-                        choices=['tsv', 'jsonl'], help='Output format for --list/--recall-thread')
+    settings_path = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
+    pkg_dir = os.path.normcase(os.path.abspath(os.path.dirname(n3memorycore.__file__)))
+    ours = {
+        "UserPromptSubmit": ("n3mc-hook", "n3memorycore.n3mc_hook"),
+        "Stop": ("n3mc-stop-hook", "n3memorycore.n3mc_stop_hook"),
+    }
+    import shlex
 
-    args = parser.parse_args()
+    def tokens(command):
+        command = command.replace("\\", "/")
+        try:
+            return shlex.split(command, posix=True)
+        except ValueError:
+            return command.split()
 
-    if args.init:
-        sys.exit(cmd_init())
+    def is_own_hook(command, event):
+        exe_name, module = ours[event]
+        toks = tokens(command)
+        if not toks:
+            return False
+        first = os.path.basename(toks[0]).lower()
+        if first.endswith(".exe"):
+            first = first[:-4]
+        if first == exe_name:
+            return True
+        for i, t in enumerate(toks[:-1]):
+            if t == "-m" and toks[i + 1] == module:
+                return True
+        script = module.split(".")[-1] + ".py"
+        for t in toks[1:]:
+            if os.path.basename(t).lower() == script:
+                d = os.path.normcase(os.path.abspath(os.path.dirname(os.path.expanduser(t))))
+                if d == pkg_dir:
+                    return True
+        return False
 
-    # spec §3.6 (v1.5.0): unreadable bounds → one stderr line, exit status 2
-    try:
-        since, until = _parse_time_range(args.since, args.until)
-    except TimeBoundError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(2)
+    def shell_path(p):
+        s = pathlib.Path(p).as_posix()
+        return f'"{s}"' if " " in s else s
 
-    cfg = _load_config()
+    def resolve_cmd(script_name):
+        folders = [sysconfig.get_path("scripts")]
+        try:
+            folders.append(sysconfig.get_path("scripts", sysconfig.get_preferred_scheme("user")))
+        except (KeyError, ValueError):
+            pass
+        for folder in folders:
+            for name in (script_name + ".exe", script_name):
+                cand = pathlib.Path(folder) / name
+                if cand.is_file():
+                    return shell_path(cand)
+        exe = shutil.which(script_name)
+        if exe:
+            return shell_path(exe)
+        module = {"n3mc-hook": "n3memorycore.n3mc_hook",
+                  "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
+        return f"{shell_path(sys.executable)} -m {module}"
 
-    if args.run_server:
-        run_server(cfg)
-    elif args.buffer is not None:
-        text = sys.stdin.read() if args.buffer == '-' else args.buffer
-        if text.strip():
-            cmd_buffer(text, cfg, agent_name=args.agent_id)
-    elif args.search is not None:
-        from .core.processor import sanitize_surrogates
-        cmd_search(sanitize_surrogates(args.search), cfg, since=since, until=until)
-    elif args.repair:
-        cmd_repair(cfg)
-    elif args.reembed:
-        sys.exit(cmd_reembed(cfg))
-    elif args.list:
-        cmd_list(cfg, since=since, until=until, fmt=args.fmt)
-    elif args.recall_thread:
-        cmd_recall_thread(
-            args.recall_thread, cfg,
-            before=args.before, after=args.after, fmt=args.fmt,
-        )
-    elif args.show_turn:
-        cmd_show_turn(args.show_turn, cfg)
-    elif args.stop:
-        cmd_stop(cfg)
-    elif args.hook_submit:
-        cmd_hook_submit(cfg)
-    elif args.save_claude_turn:
-        cmd_save_claude_turn(cfg)
+    if settings_path.exists():
+        raw = settings_path.read_text(encoding="utf-8")
+        try:
+            settings = json.loads(raw)
+        except json.JSONDecodeError as e:
+            _err(f"{settings_path} is not valid JSON ({e}). Nothing was changed. "
+                 "Fix the file, then run n3mc --init again.")
+            return 1
+        perms = settings.get("permissions", {}) if isinstance(settings, dict) else None
+        if (not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict)
+                or not isinstance(perms, dict) or not isinstance(perms.get("allow", []), list)):
+            _err(f"{settings_path} has an unexpected structure. Nothing was changed.")
+            return 1
+        before = json.loads(raw)
     else:
-        parser.print_help()
+        raw, settings, before = None, {}, None
+
+    hooks = settings.setdefault("hooks", {})
+    for event, (exe_name, _module) in ours.items():
+        kept = []
+        for entry in hooks.get(event, []):
+            inner = [h for h in entry.get("hooks", []) if not is_own_hook(h.get("command", ""), event)]
+            for h in inner:
+                c = h.get("command", "")
+                if any(m in c for m in ("n3mc_hook", "n3mc-hook", "n3mc_stop_hook", "n3mc-stop-hook")):
+                    print(f"Another N3MC hook is registered for {event} and was left in place: {c}")
+            if inner:
+                kept.append({**entry, "hooks": inner})
+        kept.append({"hooks": [{"type": "command", "command": resolve_cmd(exe_name)}]})
+        hooks[event] = kept
+
+    allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+    for rule in PERMISSION_RULES:
+        if rule not in allow:
+            allow.append(rule)
+
+    if settings != before:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        if raw is not None:
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            shutil.copy2(settings_path, settings_path.with_name(f"settings.json.bak-n3mc-{stamp}"))
+        fd, tmp = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings.json.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp, settings_path)
+
+    load_config()
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    conn = _connect_checked(None)
+    try:
+        init_db(conn)
+    finally:
+        conn.close()
+    print("次のセッションから保存できます。 (Restart Claude Code to activate.)")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+# ======================================================================== main
+
+def main(argv=None):
+    _utf8()
+    p = argparse.ArgumentParser(prog="n3mc", description="N3MemoryCore Free")
+    p.add_argument("--init", action="store_true")
+    p.add_argument("--buffer", metavar="TEXT")
+    p.add_argument("--agent-id", metavar="NAME")
+    p.add_argument("--search", metavar="QUERY")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--recall-thread", metavar="TURN_ID")
+    p.add_argument("--show-turn", metavar="TURN_ID")
+    p.add_argument("--before", type=int, default=2)
+    p.add_argument("--after", type=int, default=2)
+    p.add_argument("--since")
+    p.add_argument("--until")
+    p.add_argument("--format", choices=("table", "jsonl"), default="table")
+    p.add_argument("--stop", action="store_true")
+    p.add_argument("--repair", action="store_true")
+    p.add_argument("--reembed", action="store_true")
+    p.add_argument("--hook-submit", action="store_true")
+    p.add_argument("--save-claude-turn", action="store_true")
+    p.add_argument("--run-server", action="store_true")
+    p.add_argument("--version", action="version", version=f"n3memorycore {__version__}")
+    a = p.parse_args(argv)
+    try:
+        if a.run_server:
+            return run_server()
+        if a.init:
+            return cmd_init()
+        if a.hook_submit:
+            return cmd_hook_submit()
+        if a.save_claude_turn:
+            return cmd_save_claude_turn()
+        if a.stop:
+            return cmd_stop()
+        if a.reembed:
+            return cmd_reembed()
+        if a.repair:
+            return cmd_repair()
+        if a.buffer is not None:
+            return cmd_buffer(a.buffer, a.agent_id)
+        if a.search is not None:
+            return cmd_search(a.search, a.since, a.until)
+        if a.list:
+            return cmd_list(a.since, a.until, a.format)
+        if a.recall_thread:
+            return cmd_recall_thread(a.recall_thread, a.before, a.after, a.format)
+        if a.show_turn:
+            return cmd_show_turn(a.show_turn)
+    except BrokenPipeError:
+        return 0
+    p.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -101,6 +101,8 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
 
+> Then run `pip install -e . --no-deps` at the repository root, also automatically. This is what creates the console scripts (`n3mc`, `n3mc-hook`, `n3mc-stop-hook`). Without it `n3mc --init` (the definition of done in §6) cannot run, and the hooks fall back to the `python -m` form.
+
 > **⚠️ First-run download**: `sentence-transformers` downloads the `multilingual-e5-base` model (~470 MB) on first server start. This can take **2–10 minutes** — the server will appear unresponsive during this time, which is expected. Subsequent startups complete in seconds once cached.
 
 > **Important: Character Limits (Design Constraints for Implementation)**
@@ -454,7 +456,7 @@ On `--buffer` or API-based saves, complete INSERT and COMMIT at that instant.
 - **Local ID**: Generate a UUIDv4 on first launch (if absent from `config.json`) and save it persistently. Identifier for the N3MC installation (or agent). Stamp it on every record. For multi-agent scenarios, the `/buffer` API accepts a `local_id` parameter to specify an agent-specific UUIDv4 (falls back to config.json value when omitted).
   - **Use cases**: Multiple Claude Code installations (each machine or install gets its own `local_id`); different agents sharing the same N3MC DB (e.g., Claude Code + CordX each run as separate instances with distinct `local_id`s); separating memories by agent type or project environment.
   - **Note**: In Free, `local_id` is stored per-record but not used in ranking. The `B_local` bias multiplier that prioritizes same-environment memories is a Pro feature.
-- **Session ID**: A grouping key for one task / project / conversation. **Resolution order**: (1) explicit `session_id` argument on the `/buffer` and `/search` API calls (highest priority — used by hosts that already track sessions, e.g. n3memory-lite assigns task numbers, an Ollama-style chat picker can pass the chat id); (2) `N3MC_SESSION_ID` environment variable; (3) per-process UUIDv4 generated at server startup (fallback for clients like Claude Code that cannot read a host session id). Stored on every record but **not persisted to `config.json`** — `session_id` is meant to identify a transient task / project, not a persistent installation. Drives the `b_session` ranking bias (match=1.0 / mismatch=0.6) so memories from the current task surface above unrelated past sessions.
+- **Session ID**: A grouping key for one task / project / conversation. **Resolution order**: (1) explicit `session_id` argument on the `/buffer` and `/search` API calls (highest priority — used by hosts that already track sessions, e.g. n3memory-lite assigns task numbers, an Ollama-style chat picker can pass the chat id); (2) `N3MC_SESSION_ID` environment variable (the CLI `--buffer` / `--search` send the calling process's value as the (1) `session_id` when it is set. The resident server is usually started by a hook, so the server's own environment does not have a value the user set on the CLI side; without sending it, the user's value has no effect. 2026-11-20); (3) per-process UUIDv4 generated at server startup (fallback for clients like Claude Code that cannot read a host session id). Stored on every record but **not persisted to `config.json`** — `session_id` is meant to identify a transient task / project, not a persistent installation. Drives the `b_session` ranking bias (match=1.0 / mismatch=0.6) so memories from the current task surface above unrelated past sessions.
 
 Complete `config.json` schema (auto-initialize any missing fields with the default values below):
 
@@ -506,7 +508,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 
 > **Database migration (advanced)**: The current specification assumes SQLite + sqlite-vec, but for larger teams, migration to PostgreSQL + pgvector is technically feasible. Consult Claude Code for schema compatibility, connection pooling, and migration procedures.
 
-- **Primary Key**: UUIDv7 (time-sortable; generated at DB insert time). Use the external library `uuid7` (PyPI).
+- **Primary Key**: UUIDv7 (time-sortable; generated at DB insert time). Use the external library `uuid7` (PyPI). Import it as `from uuid_extensions import uuid7` and use `str(uuid7())` as the ID (the distribution is named `uuid7` but the module is `uuid_extensions`; `import uuid7` raises `ModuleNotFoundError`).
 
 ### Ranking Formula
 
@@ -532,6 +534,8 @@ SQLite FTS5's `bm25()` returns negative values (more negative = more relevant). 
 $$keyword\_relevance = \frac{-bm25\_score}{\max(1.0,\ \max_{results}(-bm25\_score))}$$
 
 If the search returns 0 results, set `keyword_relevance = 0.0`.
+
+**Exception: DBs with 2 or fewer records (2026-11-20)**: with one or two records FTS5 clamps IDF to about `1e-6`, so a genuine match scores about `-2e-6`, step 1 turns it into 0 and the keyword hit disappears (with no embedding available the search returns nothing). Only while `memories` holds 2 or fewer rows, skip step 1 and use `keyword_relevance = -bm25_score ÷ max(-bm25_score)` (the best hit is 1.0). With 3 or more records the formula above applies unchanged.
 
 Since 2026-11-17 the keyword search runs on two FTS5 tables (trigram and CJK bigram, below). Normalize each table's bm25 by **that table's own** maximum; a record found by both keeps the higher `keyword_relevance`.
 
@@ -1273,7 +1277,7 @@ The CLI sends HTTP requests to the FastAPI server. All endpoints are issued to `
 | Method | Path | Corresponding CLI Command | Description |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | (internal health check) | Returns `{"status": "ok", "root", "code_version", "pid"}` (§3 "Server identity") |
-| `POST` | `/buffer` | `--buffer`, hooks | Body `{"content": str, "agent_name": str?, "local_id": str?, "session_id": str?, "turn_id": str?}` (omitted `local_id` → `config.json`; omitted `session_id` → the server's session, §3 "Identifiers"). Saves |
+| `POST` | `/buffer` | `--buffer`, hooks | Body `{"content": str, "agent_name": str?, "local_id": str?, "session_id": str?, "turn_id": str?}` (omitted `local_id` → `config.json`; omitted `session_id` → the server's session, §3 "Identifiers"; the CLI sends `N3MC_SESSION_ID` when it is set). Saves |
 | `POST` | `/search` | `--search`, `--hook-submit` | Body `{"query": str, "session_id": str?, "since": str?, "until": str?}`. `since` / `until` are parsed with the same rules as the CLI (§3.6); an unreadable value returns 400. Returns results |
 | `POST` | `/repair` | `--repair`, `--hook-submit` | Body optional: `{"max_records": int?}` (§3.5 "Migration Batch Processing"). Repairs unindexed records |
 | `GET` | `/list` | (no CLI command) | Returns all records (each record includes `agent_name`). Kept for API clients; `--list`, `--recall-thread` and `--show-turn` read the DB directly and never call it |
