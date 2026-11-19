@@ -120,8 +120,8 @@ AI が覚えていてくれるのは便利ですが、その記憶がどこに�
 
 | ファイル | 内容 |
 |---|---|
-| `N3MemoryCore_v1.9.0_Free_JP.md` | Free版（日本語） |
-| `N3MemoryCore_v1.9.0_Free_EN.md` | Free版（英語） |
+| `N3MemoryCore_v1.9.1_Free_JP.md` | Free版（日本語） |
+| `N3MemoryCore_v1.9.1_Free_EN.md` | Free版（英語） |
 
 > 💡 **指示書内の「注釈」について**
 > 指示書（Markdown）内の各所に、AIの挙動を厳格に制御するための「設計意図」を注釈として記しています。コードを生成する前に、ぜひ一度この注釈に目を通してください。そこには、単なるコード以上の「AIを使いこなすための論理」が詰まっています。
@@ -306,7 +306,7 @@ owner_id  (1 つの N3MC サーバ／データ所有者)
 N3MemoryCoreは指示書（仕様書）を読ませて作るため、拡張もClaude Codeに相談するだけで対応できます。
 
 - **MCPサーバー化** — N3MCをMCPサーバーとして公開し、他のAIツールから記憶にアクセス
-- **PostgreSQL移行** — SQLiteからPostgreSQL + pgvectorへ。チーム規模の運用に
+- **PostgreSQL移行** — SQLiteからPostgreSQL + pgvectorへ（1 人が 1 台の PC で使う既製の版は、PostgreSQL の N3MC Pro、`n3mc-pro-postgres`）
 - **カスタム検索ロジック** — バイアス係数やランキング式の調整
 - **他のembeddingモデル** — 用途に合わせたモデルへの差し替え
 - **キーワード検索のトークナイザー** — 既定の FTS5 `trigram` は、日本語・中国語のように空白で区切らない言語でも、英語のような言語でも動くように選んでいます（PyPI 版はどこの国でも使われるため）。最終的なトークナイザーは、ご自分の言語・環境に合わせて直してください（例: 英語中心なら語形変化をまとめる `porter unicode61`、日本語の精度を上げるなら形態素解析）。既存の DB の作り直しも含めて、Claude Code に相談すれば対応できます

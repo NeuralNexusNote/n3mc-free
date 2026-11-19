@@ -4,6 +4,16 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - Unreleased
+
+### Security
+- **The resident server refuses requests with an `Origin` header** (spec §3
+  "Resident FastAPI Server"): every endpoint returns 403 when the request
+  carries `Origin`, whatever its value. A browser adds it to the requests a
+  web page sends to another site; the `Host` check did not stop those, because
+  their `Host` is `127.0.0.1:<port>`. The CLI and the hooks never send
+  `Origin`, so what they do does not change.
+
 ## [1.9.0] - 2026-11-18
 
 ### Fixed (final review of 2026-11-18)

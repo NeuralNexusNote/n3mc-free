@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.9.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.9.1 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -121,7 +121,7 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.9.0_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.9.1_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
@@ -190,7 +190,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n3memorycore-free"
-version = "1.9.0"
+version = "1.9.1"
 description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -355,6 +355,7 @@ from .core.processor import (
 - **Start Timing**: On execution of any `n3mc` subcommand (or `python -m n3memorycore.n3memory`), follow "Server check and replacement (`ensure_server`)" below and, if needed, automatically start the server in the background as `python -m n3memorycore.n3memory --run-server`. Write the PID file using an atomic operation (e.g., `open(..., 'x')` exclusive-create flag) to prevent duplicate launches when multiple processes check simultaneously.
 - **Communication**: HTTP over TCP (`http://127.0.0.1:{port}`). **Never through a proxy** (final review of 2026-11-18, F16): `_post` / `_get` open their requests with `urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=…)`, not `urllib.request.urlopen`. The default opener follows `HTTP_PROXY` and the system proxy settings: with a proxy and no `NO_PROXY` entry for `127.0.0.1` (common on company PCs), every request went to the proxy, the server looked down, each hook waited for the server start, the search said "still starting" and saves went in directly without a vector.
 - **Host header check (v1.5.0)**: every endpoint returns 403 unless the request's `Host` header is `127.0.0.1:<port>` or `localhost:<port>`. A web page in the user's browser can otherwise reach the server through DNS rebinding (a name that resolves to 127.0.0.1) and read `GET /list`. The CLI always sends `Host: 127.0.0.1:<port>`; FastAPI's `TestClient` sends `testserver`, so tests set the header explicitly or replace the check.
+- **Requests with an `Origin` header are refused (v1.9.1)**: every endpoint returns 403 when the request carries an `Origin` header, whatever its value (`null` included). Requests without it still go through the `Host` check above. A browser adds `Origin` to the requests a web page sends to another site (`fetch`, a form POST). The server listens on `127.0.0.1` without authentication, so a page the user opens can send requests to it, and the `Host` check does not stop them: their `Host` is `127.0.0.1:<port>`. The CLI, the hooks and the tests' clients never send `Origin`, so nothing they do changes. Make this check in the same place as the `Host` check, before any endpoint runs.
 - **Endpoints do not block the event loop (v1.5.0)**: define the endpoints that embed or touch the DB (`/buffer`, `/search`, `/repair`, `/list`) with plain `def`, not `async def`, so FastAPI runs them in its thread pool and `/health` keeps answering during a long `/repair`. (In v1.4.0 they were `async def` with synchronous work inside; a long `/repair` made `/health` time out, the CLI concluded there was no server, and fell into the start/replace path.) The SQLite connection used by an endpoint is opened inside that endpoint call (one connection per request), never shared across threads.
 - **Health Monitoring**: On every CLI execution, PING the `/health` endpoint and use the response to decide whether the server is our own and running the latest code (see below).
 
@@ -501,7 +502,7 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 
 > **Multi-account usage on a single PC**: When running multiple Claude Code accounts on one machine and connecting them to the same N3MC server (same `server_port` and DB path), each account's `config.json` is auto-generated independently, resulting in different `owner_id` / `local_id` values. In the Free edition this does not affect ranking, but after upgrading to Pro, memories from other accounts will have `B_local=0.8` decay applied. To treat all accounts' memories equally, copy the first account's `config.json` to the other accounts so that `owner_id` / `local_id` are unified.
 
-> **Team sharing: not supported.** The CLI always connects to `127.0.0.1:<server_port>` (there is no setting for a remote server address), the server has no authentication or encryption, and it rejects requests whose `Host` header is not local (§3 "Resident FastAPI Server"). Keep `bind_host` at its default. Sharing one memory DB across a team would need a different design.
+> **Team sharing: not supported.** The CLI always connects to `127.0.0.1:<server_port>` (there is no setting for a remote server address), the server has no authentication or encryption, and it rejects requests whose `Host` header is not local or that carry an `Origin` header (§3 "Resident FastAPI Server"). Keep `bind_host` at its default. Sharing one memory DB across a team would need a different design.
 
 > **Database migration (advanced)**: The current specification assumes SQLite + sqlite-vec, but for larger teams, migration to PostgreSQL + pgvector is technically feasible. Consult Claude Code for schema compatibility, connection pooling, and migration procedures.
 
@@ -1281,7 +1282,7 @@ The CLI sends HTTP requests to the FastAPI server. All endpoints are issued to `
 | `POST` | `/gc` | — | **Pro only.** Free returns 403 |
 | `POST` | `/import` | — | **Pro only.** Free returns 403 |
 
-Every endpoint also returns 403 when the `Host` header is not local (§3 "Resident FastAPI Server").
+Every endpoint also returns 403 when the `Host` header is not local, or when the request carries an `Origin` header (§3 "Resident FastAPI Server").
 
 - Duplicate handling in `/buffer`: skip **only exactly identical text** (`check_exact_duplicate`). With a `turn_id`, compare **only within the same `turn_id`**; without a `turn_id` (manual `--buffer`), compare across all records. Check for an exact match before computing the embedding. **No similarity-based (cos_sim) deduplication is performed** (removed in v1.4.0; §5.4).
 
@@ -1541,7 +1542,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.9.0 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.9.1 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
@@ -1722,7 +1723,7 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestBehaviorMd` | Leaves the file alone when the marker matches; backs up and replaces a previous template (**v1.6.0**: including the `v2` template, hash `5af3c015c06c62c1`; the new file starts with `<!-- n3mc-behavior v3 -->` and contains the Weak Matches section); does not replace a hand-edited file and emits a notice. **v1.5.0**: the notice key contains a hash of the path and the message contains the path; two hand-edited files give two notices; the notice is cleared when the file's first line becomes the current marker |
 | `TestServerDecision` | Healthy / different `code_version` / another folder / no `root` and unverifiable; uses `/shutdown` first; 403 when `root` differs; does not wait on a dead PID file |
 | `TestServerStart` (v1.5.0) | A child that exits during the wait stops the wait at once and emits `server_start_failed` naming `server.log`; within 5 minutes of a failure no new start is attempted; a later successful start clears the notice and the marker; a PID-file process still starting after 60 s is neither replaced nor duplicated; `Popen` gets the detach flags for the platform and stderr goes to `server.log` (process creation replaced by a fake) |
-| `TestServerApi` (v1.5.0) | A request with `Host: evil.example` gets 403 on every endpoint, `127.0.0.1:<port>` and `localhost:<port>` pass; `/buffer`, `/search`, `/repair`, `/list` are plain `def` functions; `/repair` with `{"max_records": 200}` processes at most 200 records and `--hook-submit` sends that limit; with `HTTP_PROXY` pointing to another local server, `_get` still reaches the N3MC server and nothing reaches the proxy (F16) |
+| `TestServerApi` (v1.5.0) | A request with `Host: evil.example` gets 403 on every endpoint, `127.0.0.1:<port>` and `localhost:<port>` pass; `/buffer`, `/search`, `/repair`, `/list` are plain `def` functions; `/repair` with `{"max_records": 200}` processes at most 200 records and `--hook-submit` sends that limit; with `HTTP_PROXY` pointing to another local server, `_get` still reaches the N3MC server and nothing reaches the proxy (F16). **v1.9.1**: a request with `Origin: http://evil.example`, and one with `Origin: null`, gets 403 on every endpoint even with `Host: 127.0.0.1:<port>`; the same request without `Origin` passes; the requests `_post` and `_get` send carry no `Origin` header |
 | `TestForeignServer` | With another folder's server on the port: saves go directly to our own DB, no search, `--repair` does nothing |
 | `TestConfig` | Does not overwrite an unreadable `config.json`; ignores only the mistyped key; notices clear once fixed; `code_version` changes only when the contents of `config.json` change. **v1.5.0**: `2000.0` for `search_query_max_chars`, `0` for `half_life_days`, `70000` / `-1` for `server_port`, `1.5` for `min_score` are ignored with `config_type` (**v1.6.0**: so are `-1` and `1.5` for `min_results`, while `0` is accepted; **C-06**: `1366` for `search_result_limit` is ignored with `config_type`, while `1365` is accepted and a vector search with `k = 4095` works); a missing file is created with exclusive creation and a concurrent creator's file is read, not overwritten (one `owner_id`); updates go through a temporary file and `os.replace` |
 | `TestHookSubmit` | Input starting with `<task-notification>` is neither saved nor searched and does not change `turn_id`; Stop does not clear `turn_id`. **v1.5.0**: the previous Claude response is read from a sample `transcript_path` JSONL (the last text block only; `tool_result`-only user lines, `isMeta` lines, the `[Request interrupted by user]` marker, slash-command lines, `thinking`, `tool_use` and `isSidechain` lines skipped; the current prompt skipped (the trailing line only: an interrupted prompt sent again does not bring back the reply before it); an interrupted reply is found) and saved under the previous `turn_id`; when Stop already saved it nothing is duplicated; a missing or broken transcript is logged as `transcript_unreadable` and the hook still searches and saves the prompt; an image-only prompt writes a new `turn_id` |

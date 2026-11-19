@@ -121,8 +121,8 @@ What does go over the network:
 
 | File | Description |
 |---|---|
-| `N3MemoryCore_v1.9.0_Free_JP.md` | Free edition (Japanese) |
-| `N3MemoryCore_v1.9.0_Free_EN.md` | Free edition (English) |
+| `N3MemoryCore_v1.9.1_Free_JP.md` | Free edition (Japanese) |
+| `N3MemoryCore_v1.9.1_Free_EN.md` | Free edition (English) |
 
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
@@ -319,7 +319,7 @@ owner_id  (one N3MC server / data owner)
 N3MemoryCore is built from a specification, so extending it is as simple as asking Claude Code.
 
 - **MCP server** — Expose N3MC as an MCP server so other AI tools can access the memory
-- **PostgreSQL migration** — Move from SQLite to PostgreSQL + pgvector for team-scale deployments
+- **PostgreSQL migration** — Move from SQLite to PostgreSQL + pgvector (a ready-made edition for one person on one PC is N3MC Pro on PostgreSQL, `n3mc-pro-postgres`)
 - **Custom search logic** — Tune bias coefficients and ranking formulas
 - **Alternative embedding models** — Swap in a different model to suit your use case
 - **Keyword-search tokenizer** — The default FTS5 `trigram` tokenizer was chosen because it works both for languages written without spaces (Japanese, Chinese, …) and for languages like English (the PyPI package is used in every country). Adapt the final tokenizer to your own language and environment (e.g. `porter unicode61` to fold English word forms, or a morphological analyzer for higher Japanese precision). Claude Code can do it for you, including rebuilding the existing DB's FTS index

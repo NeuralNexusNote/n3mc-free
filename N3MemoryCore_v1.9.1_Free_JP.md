@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.9.0 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.9.1 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -121,7 +121,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.9.0_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.9.1_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -190,7 +190,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n3memorycore-free"
-version = "1.9.0"
+version = "1.9.1"
 description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -355,6 +355,7 @@ from .core.processor import (
 - **起動タイミング**: `n3mc` のいずれかのサブコマンド（または `python -m n3memorycore.n3memory`）の実行時、下の「サーバーの確認と入れ替え（`ensure_server`）」に従い、必要なら `python -m n3memorycore.n3memory --run-server` として自動的にバックグラウンド起動せよ。PID ファイルの書き込みはアトミック操作（例: `open(..., 'x')` 排他作成フラグ）を使用し、複数プロセスの同時起動を防止すること。
 - **通信方式**: HTTP over TCP (`http://127.0.0.1:{port}`)。**プロキシを通さない**（2026-11-18 の最終レビュー、F16）：`_post` / `_get` は、`urllib.request.urlopen` ではなく `urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=…)` で要求を開く。既定の opener は `HTTP_PROXY` やシステムのプロキシ設定に従う。プロキシがあり、`NO_PROXY` に `127.0.0.1` がないと（社内の PC ではふつうにある）、要求がすべてプロキシに送られ、サーバーがないと判断され、フックのたびにサーバーの起動を待ち、検索は「still starting」になり、保存はベクトルなしの直接保存になっていた。
 - **Host ヘッダーの確認（v1.5.0）**: すべてのエンドポイントは、リクエストの `Host` ヘッダーが `127.0.0.1:<port>` または `localhost:<port>` でなければ 403 を返す。そうしないと、ユーザーのブラウザで開いた Web ページが DNS リバインディング（127.0.0.1 に解決される名前）でサーバーに届き、`GET /list` を読めてしまう。CLI は常に `Host: 127.0.0.1:<port>` を送る。FastAPI の `TestClient` は `testserver` を送るので、テストではヘッダーを明示するか、確認を差し替える。
+- **`Origin` ヘッダー付きのリクエストを断る（v1.9.1）**: リクエストに `Origin` ヘッダーがあれば、値に関係なく（`null` を含む）、すべてのエンドポイントは 403 を返す。`Origin` のないリクエストには、上の `Host` の確認がそのまま働く。ブラウザは、Web ページが別のサイトに送るリクエスト（`fetch`、フォームの POST）に `Origin` を付ける。サーバーは `127.0.0.1` で認証なしに待ち受けるので、ユーザーが開いたページからリクエストを送れてしまい、`Host` の確認では止まらない（その `Host` は `127.0.0.1:<port>` になる）。CLI、フック、テストのクライアントは `Origin` を送らないので、それらの動きは変わらない。この確認は `Host` の確認と同じ場所で、どのエンドポイントの処理よりも前に行う。
 - **エンドポイントでイベントループを止めない（v1.5.0）**: 埋め込みや DB を扱うエンドポイント（`/buffer`・`/search`・`/repair`・`/list`）は `async def` ではなく普通の `def` で定義し、FastAPI のスレッドプールで動かす。これで長い `/repair` の間も `/health` が応答し続ける。（v1.4.0 では中で同期処理をする `async def` だったため、長い `/repair` の間 `/health` がタイムアウトし、CLI がサーバーなしと判断して起動・入れ替えの処理に入っていた。）エンドポイントが使う SQLite 接続はそのエンドポイントの呼び出しの中で開き（リクエストごとに 1 接続）、スレッドをまたいで共有しない。
 - **死活監視**: CLI実行のたびに `/health` エンドポイントへPINGし、応答の中身でサーバーが自分のものか・最新のコードか を判定せよ（下記）。
 
@@ -501,7 +502,7 @@ PRAGMA wal_autocheckpoint = 1000;
 
 > **複数アカウント運用時の注意**: 1台の PC で複数の Claude Code アカウントを運用し、同じ N3MC サーバー（同じ `server_port`・同じ DB パス）に接続する場合、各アカウントの `config.json` は個別に自動生成されるため `owner_id` / `local_id` が異なる。Free 版ではランキングに影響しないが、Pro 版にアップグレードすると他アカウントの記憶に `B_local=0.8` の減衰が適用される。全アカウントの記憶を同等に扱いたい場合は、1つ目のアカウントの `config.json` を他のアカウントにコピーして `owner_id` / `local_id` を統一すること。
 
-> **チーム共有: 非対応。** CLI は常に `127.0.0.1:<server_port>` に接続する（リモートのサーバーアドレスを指定する設定はない）。サーバーには認証も暗号化もなく、`Host` ヘッダーがローカルでないリクエストは拒否する（§3「常駐型 FastAPI サーバー」）。`bind_host` は既定のままにすること。チームで 1 つの記憶 DB を共有するには別の設計が必要になる。
+> **チーム共有: 非対応。** CLI は常に `127.0.0.1:<server_port>` に接続する（リモートのサーバーアドレスを指定する設定はない）。サーバーには認証も暗号化もなく、`Host` ヘッダーがローカルでないリクエストと、`Origin` ヘッダー付きのリクエストは拒否する（§3「常駐型 FastAPI サーバー」）。`bind_host` は既定のままにすること。チームで 1 つの記憶 DB を共有するには別の設計が必要になる。
 
 > **DB 変更（応用）**: 現仕様は SQLite + sqlite-vec を前提としているが、チーム規模が大きい場合は PostgreSQL + pgvector への移行も技術的に可能である。スキーマ互換性・接続プール・マイグレーション手順については Claude Code に相談すること。
 
@@ -1279,7 +1280,7 @@ CLI は FastAPI サーバーへ HTTP リクエストを送信する。全エン�
 | `POST` | `/gc` | — | **Pro のみ。** Free は 403 を返す |
 | `POST` | `/import` | — | **Pro のみ。** Free は 403 を返す |
 
-どのエンドポイントも、`Host` ヘッダーがローカルでなければ 403 を返す（§3「常駐型 FastAPI サーバー」）。
+どのエンドポイントも、`Host` ヘッダーがローカルでないとき、またはリクエストに `Origin` ヘッダーがあるときは 403 を返す（§3「常駐型 FastAPI サーバー」）。
 
 - `/buffer` の重複の扱い: **完全に同じ文だけ**を飛ばす（`check_exact_duplicate`）。`turn_id` があるときは**同じ `turn_id` の中だけ**で比べ、`turn_id` がないとき（手動の `--buffer`）は全体で比べる。完全一致を先に調べてから埋め込みを計算する。**類似度（cos_sim）による重複排除は行わない**（v1.4.0 で廃止。§5.4）。
 
@@ -1539,7 +1540,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.9.0 Evidence Report]）
+## 6. 自律評価（[N3MC v1.9.1 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **実装完了の定義**: 以下のテスト 1〜7 を自律実施 → `n3mc --init` 実行（「次のセッションから保存できます。」が表示される）→ 満点（⭐⭐⭐⭐⭐）で報告するまでが「実装完了」。テスト 8〜10 はセッション中の実動作（`--search` 実行・フック発火・会話ターン）で自動的に確認される。3ステップすべてが完了して初めて実装完了とみなす。
@@ -1718,7 +1719,7 @@ python -m pytest tests/ -v
 | `TestBehaviorMd` | 目印が同じなら触れない、過去のひな形なら控えを取って置き換える（**v1.6.0**: `v2` のひな形、ハッシュ `5af3c015c06c62c1` も含む。新しいファイルの 1 行目は `<!-- n3mc-behavior v3 -->` で、Weak Matches の節がある）、手で編集したものは置き換えず知らせを出す。**v1.5.0**: 知らせのキーにパスのハッシュが入り、メッセージにパスが入る、手で編集したファイルが 2 つあれば知らせも 2 つ、ファイルの 1 行目が今の目印になったら知らせが消える |
 | `TestServerDecision` | 正常／`code_version` 違い／別のフォルダ／`root` なしで確かめられない、`/shutdown` を先に使う、`root` が違えば 403、死んだ PID ファイルは待たない |
 | `TestServerStart`（v1.5.0） | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え） |
-| `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る。`HTTP_PROXY` を別のローカルのサーバーに向けても、`_get` は N3MC のサーバーに届き、プロキシには何も届かない（F16） |
+| `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る。`HTTP_PROXY` を別のローカルのサーバーに向けても、`_get` は N3MC のサーバーに届き、プロキシには何も届かない（F16）。**v1.9.1**: `Origin: http://evil.example` のリクエストと `Origin: null` のリクエストは、`Host: 127.0.0.1:<port>` でも、どのエンドポイントでも 403。同じリクエストから `Origin` を外すと通る。`_post` と `_get` が送るリクエストには `Origin` ヘッダーがない |
 | `TestForeignServer` | 別のフォルダのサーバーのとき、保存は自分の DB に直接、検索はしない、`--repair` は何もしない |
 | `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける。**C-06**: `search_result_limit` の `1366` も `config_type` で無視し、`1365` は受け付ける。`k = 4095` のベクトル検索は動く）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
 | `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない。**v1.5.0**: 前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす（末尾の 1 行だけ。止めた質問を送り直しても、その前の返答は返らない）。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く |
