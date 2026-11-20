@@ -396,7 +396,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 #### サーバーの起動（`_start_server`、v1.5.0）
 
 1. 下の「Clean CLI」のとおり `subprocess.Popen` で `python -m n3memorycore.n3memory --run-server` を起動する。stdout と stdin は `DEVNULL`、**stderr は `.memory/server.log` に追記する**（ファイルが 1 MB を超えていたら起動前に切り詰める）。サーバーはフックのプロセスから**切り離し**、フックが終わっても動き続けるようにする: Windows では `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW`、それ以外では `start_new_session=True`。
-2. `/health` を 0.5 秒ごとに最大 60 秒見る。**待っている間に子プロセスが終了したら（`proc.poll() is not None`）、すぐに待つのをやめる** — ポートを N3MC 以外のプログラムが使っている、依存パッケージがない、DB を開けない、などの場合。
+2. `/health` を 0.5 秒ごとに最大 60 秒見る。**待っている間に子プロセスが終了したら（`proc.poll() is not None`）、すぐに待つのをやめる** — ポートを N3MC 以外のプログラムが使っている、依存パッケージがない、DB を開けない、などの場合。**応答は、`ensure_server` と同じ確認を通ったときだけ使う**（2026-11-20 の 2 回目のレビュー）：`root` がこのフォルダであること（「ok」、または「stale」— このフォルダの、コードの違うサーバーで、次の呼び出しが入れ替える）。別のフォルダのサーバーが答えたとき（同じ `server_port` の 2 つのフォルダを同時に起動し、もう一方が先にポートを取った）や、`root` を返さないサーバーのときは、決して使わない。`_FOREIGN_SERVER_ROOT` を設定し、上の表と同じ `port_conflict` を出し、サーバーなしで進む（保存は `_buffer_direct`、検索はしない）。この決まりの前は、どんな応答でも待ちを終え、その呼び出しの検索と保存が別のフォルダの記憶に向かった。
 3. そうして早く終了したときは、知らせ `server_start_failed`（"The N3MC memory server could not start (exit code <n>). See <path of server.log> for the reason."）を出し、時刻を `.memory/server_start_failed`（マーカーファイル）に書き、PID ファイルが終了したその子プロセスの PID を持っていれば消し、サーバーなしで進める（直接保存 / `memory search unavailable`）。`Popen` そのものが例外を出したときも、サーバーなしで進む（stderr に 1 行。知らせとマーカーは書かない）。
 4. `.memory/server_start_failed` が作られてから 5 分未満の間は、サーバーの起動を試み直さず、そのままサーバーなしの処理に進む。これにより、壊れた環境でフックのたびに最大 60 秒かかることを防ぐ。サーバーが応答したらマーカーを消し、知らせも消す。
 5. 60 秒たっても子プロセスが生きていれば、まだ起動中（モデルのダウンロード）なので、そのまま動かしておき、上の「起動中」の決まりに従う。
@@ -1410,7 +1410,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   2. `python -m n3memorycore.n3memory --stop` — AI 行動指針の用意と旧 memory_context の片付け（§4「`--stop` フック仕様」参照）。
 
   1ターンあたりの合計サブプロセス数: `UserPromptSubmit` × 1（`--hook-submit`）+ `Stop` × 2（`--save-claude-turn` + `--stop`）= 3 回。
-- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する（`memories_fts` に入れ、`memories_fts_bi` の行もなければそこにも入れる）。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。
+- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する（`memories_fts` に入れ、`memories_fts_bi` の行もなければそこにも入れる）。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。**修復が 2 つ同時に動くとき（2026-11-20 の 2 回目のレビュー）**：埋め込みは書き込みのトランザクションの外で計算する（F11）ので、2 つの修復（2 つのチャット、フックと `--repair`）が同じ行を選ぶことがある。各バッチの書き込みは `BEGIN IMMEDIATE` の中で行い、行ごとに、その中で `memories_fts` の行と `memories_vec` の行がもうあるかを確かめ直し、まだないものだけを入れる。これがないと、後の修復が `UNIQUE constraint failed on memories_vec primary key` で失敗した（再現。記録は失われなかった）。
 ### 5.3 AI 行動指針
 
 - **【AI行動指針】全自動保存**: 全会話はフック（UserPromptSubmit / Stop）により自動保存される。Claude が自分で判断して `--buffer` を手動呼び出しする必要はない。**空でないユーザー発言・Claude 回答はすべて、一字一句、切り捨てなしで記録される。** 長さフィルタ（旧 `len(text) >= 10` / `>= 3`）は**廃止**、スキップパターンフィルタ（旧 `_SKIP_PATTERNS`、「ok / yes / thanks」定型応答フィルタ）も**廃止**。`ok` や `yes` のような短い応答も他と同様に記録される。
@@ -1685,7 +1685,7 @@ python -m pytest tests/ -v
 | `TestHealth` | `health_ok` | サーバー状態 |
 | `TestBuffer` | `save_content`, `empty_content_skipped`, `agent_name_saved`, `exact_dedup`, `code_block_purified` | 保存API |
 | `TestSearch` | `empty_db_search`, `save_then_search`, `empty_query`, `score_returned` | 検索API |
-| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API。埋め込みを計算できないとき `count` は 0。`/repair` がバッチを埋め込んでいる間（1 件 0.2 秒の代役のモデル）に、別の接続が 0.5 秒以内に `BEGIN IMMEDIATE` を取れる。`BUSY_TIMEOUT_SECONDS` は 10（F11） |
+| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API。埋め込みを計算できないとき `count` は 0。`/repair` がバッチを埋め込んでいる間（1 件 0.2 秒の代役のモデル）に、別の接続が 0.5 秒以内に `BEGIN IMMEDIATE` を取れる。`BUSY_TIMEOUT_SECONDS` は 10（F11）。**2026-11-20（2 回目のレビュー）**：最初の修復が埋め込みを計算している間に、2 つ目の修復が同じ行を修復しても、どちらもエラーなく終わり、ベクトルは 1 つだけ残る。`_start_server` は、`/health` が別のフォルダを返すサーバーを使わない（`port_conflict`、False を返す） |
 | `TestList` | `list_returns_records`, `list_after_save` | 一覧API |
 | `TestDelete` | `delete_returns_403`, `delete_nonexistent_also_403`, `delete_detail_is_pro` | Pro 専用エンドポイント → 403 |
 | `TestGC` | `gc_returns_403`, `gc_detail_is_pro` | Pro 専用エンドポイント → 403 |

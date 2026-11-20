@@ -969,3 +969,51 @@ class TestReviewFixes20261120:
         setattr(Proc, method, lambda self, kind="tcp": [conn])
         monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=Proc))
         assert nm._listen_ports(4242) == [18520]
+
+
+class TestReviewFixes20261120Second:
+    """Fixes from the second review of 2026-11-20 (Free P1, P2)."""
+
+    def test_start_does_not_use_another_folders_server(self, monkeypatch):
+        """P1: two folders share server_port and start together; the other one answers first."""
+        class Alive:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(nm.subprocess, "Popen", lambda *a, **k: Alive())
+        monkeypatch.setattr(nm, "_health", lambda port=None: {"status": "ok", "root": "C:/other", "pid": 1})
+        assert nm._start_server() is False
+        assert nm._FOREIGN_SERVER_ROOT == "C:/other" and "port_conflict" in nm._read_notices()
+
+    def test_start_accepts_own_server(self, monkeypatch):
+        class Alive:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(nm, "_code_version", lambda: "abc")
+        monkeypatch.setattr(nm.subprocess, "Popen", lambda *a, **k: Alive())
+        monkeypatch.setattr(nm, "_health", lambda port=None: {"status": "ok", "root": nm.HOME_DIR,
+                                                               "code_version": "abc", "pid": 4242})
+        assert nm._start_server() is True
+
+    def test_two_repairs_of_the_same_row_both_finish(self, monkeypatch, conn, cfg):
+        """P2: a second repair indexes the row while the first computes its embedding."""
+        add(conn, cfg, "vectorless record for two repairs", embed=False)
+        real = nm.embed_passage
+        inner = []
+
+        def embed(text, model):
+            if not inner:
+                inner.append(None)
+                inner[0] = nm.repair_records(cfg)  # the other chat's repair runs to the end here
+            return real(text, model)
+
+        monkeypatch.setattr(nm, "embed_passage", embed)
+        assert nm.repair_records(cfg) == 0  # nothing left to do, and no UNIQUE error
+        assert inner == [1]
+        assert conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 1
+        assert db.find_unindexed_memories(conn) == []

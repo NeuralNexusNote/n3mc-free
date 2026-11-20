@@ -653,9 +653,15 @@ def _start_server():
         return False
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
-        if _health() is not None:
-            _clear_server_notices()
-            return True
+        health = _health()
+        if health is not None:
+            # The same check as ensure_server: when two data folders share server_port and start
+            # at the same time, the other folder's server may answer first. Never use it.
+            if _health_decision(health) in ("ok", "stale"):
+                _clear_server_notices()
+                return True
+            _set_foreign(health)
+            return False
         rc = proc.poll()
         if rc not in (None, 0):
             _notify("server_start_failed",
@@ -751,6 +757,14 @@ def ensure_server():
     if decision == "legacy":
         if _is_own_server_process(health) and _stop_stale_server(health, quiet=True):
             return _ensure_when_no_response()
+    _set_foreign(health)
+    return False
+
+
+def _set_foreign(health):
+    """Another folder's server holds the port: remember its root and emit port_conflict."""
+    global _FOREIGN_SERVER_ROOT
+    if _health_decision(health) == "legacy":
         _FOREIGN_SERVER_ROOT = "(unknown: the server did not report its folder)"
     else:
         _FOREIGN_SERVER_ROOT = health.get("root")
@@ -758,7 +772,6 @@ def ensure_server():
             f"Another program's server (data folder: {_FOREIGN_SERVER_ROOT}) is using port "
             f"{_PORT}. Memories are saved directly and search is unavailable. Give each N3MC "
             "folder its own server_port in config.json.")
-    return False
 
 
 # ================================================================ record handling
@@ -934,8 +947,17 @@ def repair_records(cfg, max_records=None):
                         _embed_failure_note(e)
                         break
             repaired = 0
+            # Write under the write lock and check again: another repair (a second chat, the hook)
+            # may have indexed the same rows while this one computed the embeddings.
+            if conn.in_transaction:
+                conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
             for r in rows:
                 did = False
+                r["has_fts"] = conn.execute("SELECT 1 FROM memories_fts WHERE rowid = ?",
+                                            (r["rowid"],)).fetchone() is not None
+                r["has_vec"] = conn.execute("SELECT 1 FROM memories_vec WHERE rowid = ?",
+                                            (r["rowid"],)).fetchone() is not None
                 if not r["has_fts"]:
                     conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
                                  (r["rowid"], strip_fts_punctuation(r["content"])))
