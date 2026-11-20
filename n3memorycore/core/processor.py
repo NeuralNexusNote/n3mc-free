@@ -351,6 +351,21 @@ def _result_row(c, filter_score, score, cos, kw, weak=False):
     }
 
 
+def _experimental(cfg, key, default, typ):
+    """An experimental setting (not in the spec, so load_config does not check its type).
+
+    A value of the wrong type falls back to the default instead of failing every search."""
+    v = cfg.get(key, default)
+    if typ is bool:
+        return v if isinstance(v, bool) else default
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return default
+    try:
+        return typ(v)
+    except (ValueError, OverflowError):
+        return default
+
+
 def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None):
     """Vector + FTS5 hybrid search. Returns {'results', 'pairs', 'pairs_omitted'}."""
     empty = {"results": [], "pairs": {}, "pairs_omitted": {}}
@@ -375,9 +390,9 @@ def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None):
 
     # Experimental settings (2026-11-20, eval P2 / P3; not in the spec). The defaults keep the
     # spec's behaviour.
-    stop = bool(cfg.get("fts_stopwords", False))
-    norm_floor = float(cfg.get("kw_norm_floor", 1.0))
-    min_terms = int(cfg.get("kw_only_min_terms", 0))
+    stop = _experimental(cfg, "fts_stopwords", False, bool)
+    norm_floor = _experimental(cfg, "kw_norm_floor", 1.0, float)
+    min_terms = _experimental(cfg, "kw_only_min_terms", 0, int)
     q_terms = (fts_terms(query, stop), bigram_terms(query, stop)) if min_terms > 1 else None
 
     tiny = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] <= 2
@@ -427,7 +442,7 @@ def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None):
 
     # Experimental (2026-11-20, not in the spec): "top_matches_max" caps the strong rows only.
     # 0 (the default) means no cap of its own: search_result_limit applies as before.
-    strong_cap = min(limit, int(cfg.get("top_matches_max", 0)) or limit)
+    strong_cap = min(limit, _experimental(cfg, "top_matches_max", 0, int) or limit)
     capped, per_turn = [], {}
     for r in results:
         tid = r.get("turn_id")
