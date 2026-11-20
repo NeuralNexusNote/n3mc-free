@@ -877,3 +877,95 @@ class TestExperimentalTopMatchesCap:
         assert len(strong(cfg)) == 8
         assert len(strong(dict(cfg, top_matches_max=3))) == 3
         assert len(strong(dict(cfg, top_matches_max=3, search_result_limit=2))) == 2
+
+
+class TestReviewFixes20261120:
+    """Fixes from the 2026-11-20 code review (M1, L1-L3)."""
+
+    def test_moved_server_is_stopped_on_its_old_port(self, monkeypatch):
+        """M1: server_port changed while the server ran -> stop it on the old port, start anew."""
+        monkeypatch.setattr(nm, "_PORT", 18600)
+        with open(nm.PID_FILE, "w") as f:
+            f.write("4242")
+        alive = {"v": True}
+        monkeypatch.setattr(nm, "_pid_is_own_server", lambda pid: pid == 4242 and alive["v"])
+        monkeypatch.setattr(nm, "_listen_ports", lambda pid: [18520])
+
+        def health(port=None):
+            if port == 18520 and alive["v"]:
+                return {"status": "ok", "root": nm.HOME_DIR, "pid": 4242}
+            return None
+
+        sent = []
+
+        def shutdown(root, port=None):
+            sent.append(port)
+            alive["v"] = False
+
+        monkeypatch.setattr(nm, "_health", health)
+        monkeypatch.setattr(nm, "_request_shutdown", shutdown)
+        started = []
+        monkeypatch.setattr(nm, "_start_server", lambda: started.append(1) or True)
+        assert nm.ensure_server() is True
+        assert sent == [18520] and started and not os.path.exists(nm.PID_FILE)
+
+    def test_server_of_another_folder_on_old_port_is_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(nm, "_PORT", 18600)
+        with open(nm.PID_FILE, "w") as f:
+            f.write("4242")
+        monkeypatch.setattr(nm, "_pid_is_own_server", lambda pid: True)
+        monkeypatch.setattr(nm, "_listen_ports", lambda pid: [18520])
+        monkeypatch.setattr(nm, "_health", lambda port=None: (
+            {"status": "ok", "root": "C:/other", "pid": 4242} if port == 18520 else None))
+        sent = []
+        monkeypatch.setattr(nm, "_request_shutdown", lambda root, port=None: sent.append(port))
+        assert nm._stop_moved_server(4242) is False and sent == []
+
+    def test_middleware_uses_the_port_the_server_listens_on(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        monkeypatch.setattr(nm, "_SERVER_PORT", 18520)
+        cfg = nm.load_config()
+        monkeypatch.setattr(nm, "load_config", lambda: dict(cfg, server_port=18600))
+        c = TestClient(nm.create_app(), base_url="http://127.0.0.1:18520")
+        assert c.get("/health").status_code == 200
+        assert c.get("/health", headers={"Host": "127.0.0.1:18600"}).status_code == 403
+
+    def test_run_server_does_not_run_its_own_integrity_check(self, monkeypatch):
+        """L1: lifespan runs the one full integrity_check; run_server opens without a check."""
+        pragmas = []
+        monkeypatch.setattr(nm, "_claim_pid_file", lambda: True)
+        monkeypatch.setattr(nm, "_connect_checked", lambda p=None: pragmas.append(p) or db.get_connection(nm.DB_PATH))
+        monkeypatch.setattr(nm, "get_model", lambda name: None)
+        import types
+        import sys
+        monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace(run=lambda *a, **k: None))
+        assert nm.run_server() == 0
+        assert "integrity_check" not in pragmas
+
+    def test_blank_since_is_reported_as_since(self, capsys):
+        """L2."""
+        assert nm.cmd_list(" ", None) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("--since:") and "--until" not in err
+
+    def test_experimental_settings_of_wrong_type_fall_back(self, conn, cfg):
+        """L3: a string in an experimental setting must not break every search."""
+        add(conn, cfg, "坂本龍馬は土佐藩出身の志士である")
+        bad = dict(cfg, kw_only_min_terms="abc", kw_norm_floor="x", top_matches_max="3", fts_stopwords="yes")
+        res = search(conn, bad, "坂本龍馬は土佐藩出身の志士である")
+        assert res["results"] and res["results"][0]["content"].startswith("坂本龍馬")
+
+    @pytest.mark.parametrize("method", ["net_connections", "connections"])
+    def test_listen_ports_works_with_old_and_new_psutil(self, monkeypatch, method):
+        """psutil 6.0 renamed Process.connections() to net_connections(); psutil>=5.9 is allowed."""
+        import sys
+        import types
+        conn = types.SimpleNamespace(status="LISTEN", laddr=types.SimpleNamespace(port=18520))
+
+        class Proc:
+            def __init__(self, pid):
+                pass
+
+        setattr(Proc, method, lambda self, kind="tcp": [conn])
+        monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=Proc))
+        assert nm._listen_ports(4242) == [18520]

@@ -112,6 +112,7 @@ _FOREIGN_SERVER_ROOT = None
 _SERVER_STARTING = False
 _QUICK_CHECK_DONE = False
 _SERVER_CODE_VERSION = None
+_SERVER_PORT = None  # set by run_server: the port this server process listens on
 _EPHEMERAL_IDS = {}
 _SAVE_FAILED_CLEARED = False
 
@@ -460,8 +461,8 @@ def _db():
 
 # ===================================================================== HTTP client
 
-def _http(method, path, body=None, timeout=30):
-    url = f"http://127.0.0.1:{_PORT}{path}"
+def _http(method, path, body=None, timeout=30, port=None):
+    url = f"http://127.0.0.1:{port or _PORT}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
@@ -471,21 +472,21 @@ def _http(method, path, body=None, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _post(path, body, timeout=30):
-    return _http("POST", path, body, timeout)
+def _post(path, body, timeout=30, port=None):
+    return _http("POST", path, body, timeout, port)
 
 
-def _get(path, timeout=30):
-    return _http("GET", path, None, timeout)
+def _get(path, timeout=30, port=None):
+    return _http("GET", path, None, timeout, port)
 
 
-def _request_shutdown(root):
-    _post("/shutdown", {"root": root}, timeout=5)
+def _request_shutdown(root, port=None):
+    _post("/shutdown", {"root": root}, timeout=5, port=port)
 
 
-def _health():
+def _health(port=None):
     try:
-        h = _get("/health", timeout=5)
+        h = _get("/health", timeout=5, port=port)
         return h if isinstance(h, dict) and h.get("status") == "ok" else None
     except Exception:
         return None
@@ -672,10 +673,50 @@ def _start_server():
     return False
 
 
+def _listen_ports(pid):
+    """TCP ports the process ``pid`` is listening on (empty when psutil cannot tell)."""
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        # psutil 6.0 renamed Process.connections() to net_connections(); psutil>=5.9 is allowed.
+        getter = getattr(proc, "net_connections", None) or proc.connections
+        conns = getter(kind="tcp")
+    except Exception:
+        return []
+    return sorted({c.laddr.port for c in conns if c.status == "LISTEN" and c.laddr})
+
+
+def _stop_moved_server(pid):
+    """The PID-file server listens on another port (server_port was changed): stop it there.
+
+    It is stopped only through /shutdown, after that port's /health reports this data folder.
+    True when it stopped (the PID file is then removed)."""
+    for port in _listen_ports(pid):
+        if port == _PORT:
+            continue
+        h = _health(port)
+        if not h or "root" not in h or _norm(h["root"]) != _norm(HOME_DIR):
+            continue
+        try:
+            _request_shutdown(HOME_DIR, port)
+        except Exception:
+            return False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if _health(port) is None and not _pid_is_own_server(pid):
+                _remove_pid_file_if(pid)
+                return True
+            time.sleep(0.3)
+        return False
+    return False
+
+
 def _ensure_when_no_response():
     global _SERVER_STARTING
     pid = _read_pid_file() if os.path.exists(PID_FILE) else None
     if os.path.exists(PID_FILE):
+        if pid and _pid_is_own_server(pid) and _stop_moved_server(pid):
+            return _start_server()
         if pid and _pid_is_own_server(pid):
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
@@ -1054,7 +1095,10 @@ def create_app():
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
-        port = load_config()["server_port"]
+        # The port this server listens on, not the one config.json says now:
+        # after server_port changes, the old server must still answer /health
+        # and /shutdown on its own port so the CLI can stop it.
+        port = _SERVER_PORT or load_config()["server_port"]
         if "origin" in request.headers:
             return JSONResponse({"detail": "forbidden"}, status_code=403)
         if request.headers.get("host") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
@@ -1174,8 +1218,9 @@ def _claim_pid_file():
 
 
 def run_server():
-    global _SERVER_CODE_VERSION
+    global _SERVER_CODE_VERSION, _SERVER_PORT
     cfg = load_config()
+    _SERVER_PORT = cfg["server_port"]
     if cfg["bind_host"] != "127.0.0.1":
         _err(f"N3MC WARNING: bind_host is {cfg['bind_host']}. The server has no authentication; "
              "anyone who can reach this address can read your memories. Use 127.0.0.1.")
@@ -1184,7 +1229,8 @@ def run_server():
     atexit.register(lambda: _remove_pid_file_if(os.getpid()))
     try:
         _SERVER_CODE_VERSION = _code_version()
-        conn = _connect_checked("integrity_check")
+        # No check here: lifespan runs the one full integrity_check at startup.
+        conn = _connect_checked(None)
         try:
             init_db(conn)
         finally:
@@ -1374,16 +1420,20 @@ def _emit(text):
 
 def _checked_range(since, until):
     """(since, until, 0) or (None, None, 2) after one stderr line (shared by --search / --list)."""
+    # Parse each bound on its own so the error names the flag that failed
+    # (not guessed from the message text: "--since ' '" used to be reported as --until).
+    for flag, value, is_until in (("--since", since, False), ("--until", until, True)):
+        if value:
+            try:
+                _parse_time_bound(value, is_until)
+            except ValueError as e:
+                _err(f"{flag}: cannot read '{e}' (use 2026-11-13 or 2026-11-13T09:00)")
+                return None, None, 2
     try:
         s, u = _time_range(since, until)
         return s, u, 0
     except ValueError as e:
-        msg = str(e)
-        if msg.startswith("--since is later"):
-            _err(msg)
-        else:
-            flag = "--since" if since and msg == since else "--until"
-            _err(f"{flag}: cannot read '{msg}' (use 2026-11-13 or 2026-11-13T09:00)")
+        _err(str(e))
         return None, None, 2
 
 
