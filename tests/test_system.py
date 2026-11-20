@@ -954,3 +954,18 @@ class TestReviewFixes20261120:
         bad = dict(cfg, kw_only_min_terms="abc", kw_norm_floor="x", top_matches_max="3", fts_stopwords="yes")
         res = search(conn, bad, "坂本龍馬は土佐藩出身の志士である")
         assert res["results"] and res["results"][0]["content"].startswith("坂本龍馬")
+
+    @pytest.mark.parametrize("method", ["net_connections", "connections"])
+    def test_listen_ports_works_with_old_and_new_psutil(self, monkeypatch, method):
+        """psutil 6.0 renamed Process.connections() to net_connections(); psutil>=5.9 is allowed."""
+        import sys
+        import types
+        conn = types.SimpleNamespace(status="LISTEN", laddr=types.SimpleNamespace(port=18520))
+
+        class Proc:
+            def __init__(self, pid):
+                pass
+
+        setattr(Proc, method, lambda self, kind="tcp": [conn])
+        monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=Proc))
+        assert nm._listen_ports(4242) == [18520]
