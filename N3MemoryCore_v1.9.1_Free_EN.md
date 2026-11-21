@@ -253,7 +253,7 @@ exclude = ["tests*"]
 
 ### ID Hierarchy
 
-N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
+N3MemoryCore uses 6 ID fields to identify the origin and context of each record:
 
 | ID | Stored in | Generated | Granularity | Purpose |
 |---|---|---|---|---|
@@ -261,17 +261,22 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 | `owner_id` | `config.json` | First startup (UUIDv4) | **Owner / N3MC server** | Identifies the N3MC FastAPI instance / data owner — used for shared/multi-user scenarios and import provenance |
 | `session_id` | Supplied by host (hook stdin JSON) or in-memory fallback | Per conversation | **Task / project / conversation** | Groups memories that belong to one task, project, or conversation thread so they surface together. Claude Code supplies a `session_id` field (its conversation session ID) in the UserPromptSubmit / Stop hook stdin JSON; the hook forwards it to `/buffer` and `/search`. Other hosts can pass their own identifier the same way (n3memory-lite task numbers, an Ollama-style chat picker, etc.). When the host does not supply a `session_id` — or for direct CLI calls outside a hook — fall back to a UUIDv4 generated at `n3memory.py` startup (per-process). Drives the `b_session` ranking bias in Free and Pro |
 | `local_id` | `config.json` / API | First startup (UUIDv4), or per request | **Agent / install** | UUIDv4 identifier for the speaking agent (one Claude Code install = one `local_id`; different agents on the same DB get different UUIDs). Stored on every record. **In Free, `b_local` is unused (always 1.0)** — the per-agent ranking multiplier is a Pro feature; see "Search ranking bias" below |
+| `turn_id` | DB record | When the user's message is saved (UUIDv4) | **One exchange** | Ties one user message to the reply that answers it: `--hook-submit` makes it, saves the `[user]` chunks with it and writes it to `turn_id_<session>.txt`; `--save-claude-turn` reads it and puts it on the `[claude]` chunks (§5 "Q-A Pairing Contract"). Used for the Q-A exchanges in the search output, `--show-turn`, `--recall-thread` and the cap of 2 chunks per exchange. NULL for a manual `--buffer` |
 | `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for the agent (e.g. `"claude-code"`). The `--buffer --agent-id <name>` option sets **this** field (the option name is kept for compatibility, §3.7); it never sets `local_id` |
 
 **Hierarchy relationship:**
 
 ```
-owner_id  (one N3MC server / data owner)
-  └── session_id  (one task / project / conversation)
-        └── local_id  (the speaking agent within that session)
-              ├── agent_name  (its display name: "claude-code", etc.)
-              └── id  (one memory record)
+owner_id  (the data folder ~/.n3mc and its owner: config.json, first startup)
+  └── local_id  (the install: config.json, first startup; the same in every session)
+        └── session_id  (one Claude Code conversation, from the hook; else a per-process UUIDv4)
+              └── turn_id  (one exchange: one user message and the reply to it)
+                    └── id  (one record = one chunk, UUIDv7)
+
+agent_name  (a display label, outside the hierarchy: "claude-code" for the hooks)
 ```
+
+`local_id` is not a per-session agent: it is written to `config.json` once, and the hooks and the CLI never send one, so every record of an install carries the same value (an API client may pass its own `local_id` per request). A long message becomes several `id` records that share one `turn_id`. In Free, one install has one DB, so `owner_id` and `local_id` each keep one value; they tell records apart only when records from another DB are brought in (Pro).
 
 **Search ranking bias (Free edition):**
 - `session_id` match → `b_session = 1.0` (mismatch or NULL: `0.6`) — **groups conversation by task / project**, so memories from the ongoing exchange rank above unrelated past sessions. This is Free's primary ranking signal beyond similarity and freshness.
