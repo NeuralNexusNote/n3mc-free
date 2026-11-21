@@ -93,13 +93,15 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 >
 > Write this message for a beginner: one action per step, plain words, and say clearly that the sign-out (or restart) is required.
 >
-> Do not install Python yourself; installing software is left to the user.
+> Do not install Python itself: after it is installed, Claude Code does not see it until the user signs out of Windows (or restarts the PC), so this session could not go on. The Python packages (the `pip install` below) and, on Windows, the Visual C++ runtime (below) are installed automatically: neither needs a restart.
 
 > **📦 Auto-install**: Run the following `pip install` automatically as part of setup. Do not ask the user to run it manually.
 
 ```bash
 pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
+
+> **⚠️ Windows: Visual C++ runtime (install automatically, do not ask)**: `sentence-transformers` uses PyTorch, which on Windows needs the Microsoft Visual C++ Redistributable (x64). Without it, importing `torch` fails (for example `OSError: [WinError 126]` or `[WinError 1114]` naming `c10.dll`). After the `pip install` above, check `reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Installed`. If the key is missing or not `0x1`, install it without asking: `winget install --id Microsoft.VCRedist.2015+.x64 --silent --accept-package-agreements --accept-source-agreements`. Windows shows its administrator prompt (UAC); tell the user in one line to approve it. Do the same if `import torch` later fails with one of the errors above. If `winget` is not available, show the user the official installer https://aka.ms/vs/17/release/vc_redist.x64.exe and wait. No restart or sign-out is needed. This is a runtime, not a compiler: it does not help when a dependency fails to build from source.
 
 > Then run `pip install -e . --no-deps` at the repository root, also automatically. This is what creates the console scripts (`n3mc`, `n3mc-hook`, `n3mc-stop-hook`). Without it `n3mc --init` (the definition of done in §6) cannot run, and the hooks fall back to the `python -m` form.
 

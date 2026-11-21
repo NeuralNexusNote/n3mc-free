@@ -93,13 +93,15 @@ Claude Codeに「一生モノの資産」となる長期記憶を実装せよ。
 >
 > このメッセージは初心者向けに書け。1 つの手順に 1 つの操作、やさしい言葉で書き、サインアウト(または再起動)が必要なことをはっきり伝えよ。
 >
-> Python を自分でインストールしてはならない。ソフトウェアのインストールは利用者に任せる。
+> Python 本体を自分でインストールしてはならない。入れたあとは、利用者が Windows からサインアウトする(または PC を再起動する)まで Claude Code から見えず、このセッションのまま続けられないためである。Python のパッケージ(下の `pip install`)と、Windows の Visual C++ ランタイム(下記)は自動で入れる。どちらも再起動は要らない。
 
 > **📦 自動インストール**: 以下の `pip install` はセットアップの一部として自動実行せよ。ユーザーに手動実行を求めてはならない。
 
 ```bash
 pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
+
+> **⚠️ Windows: Visual C++ ランタイム(確認せず自動で入れる)**: `sentence-transformers` は PyTorch を使い、Windows の PyTorch には Microsoft Visual C++ 再頒布可能パッケージ(x64)が要る。無いと `torch` の読み込みに失敗する(たとえば `c10.dll` を示す `OSError: [WinError 126]` や `[WinError 1114]`)。上の `pip install` のあとで `reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Installed` で確かめよ。キーが無いか、値が `0x1` でなければ、利用者に聞かずに `winget install --id Microsoft.VCRedist.2015+.x64 --silent --accept-package-agreements --accept-source-agreements` で入れよ。Windows が管理者の確認(UAC)を出すので、許可するよう利用者に 1 行で伝えよ。あとで `import torch` が上のエラーで失敗したときも同じようにせよ。`winget` が無いときは、公式のインストーラー https://aka.ms/vs/17/release/vc_redist.x64.exe を示して待て。再起動もサインアウトも要らない。これは実行用のランタイムで、コンパイラではない。依存パッケージをソースから作るのに失敗したときの助けにはならない。
 
 > 続けて、リポジトリのルートで `pip install -e . --no-deps` を自動実行せよ。コンソールスクリプト（`n3mc`・`n3mc-hook`・`n3mc-stop-hook`）はこれで作られる。省くと `n3mc --init`（§6 の実装完了の定義）が実行できず、フックは `python -m` 形式の登録にフォールバックする。
 
