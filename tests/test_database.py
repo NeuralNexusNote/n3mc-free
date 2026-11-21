@@ -85,6 +85,23 @@ class TestUnindexed:
         add(conn, cfg, "a")
         assert db.find_unindexed_memories(conn) == []
 
+    def test_same_rows_as_double_left_join(self, conn, cfg):
+        """Rows missing a vector, an FTS row, or both are found, in rowid order and up to `limit`,
+        exactly as the double LEFT JOIN finds them (2026-11-22: the query no longer joins vec0 per row)."""
+        rids = [add(conn, cfg, f"record {i}", embed=(i % 3 != 0)) for i in range(12)]
+        rowid = {r: conn.execute("SELECT rowid FROM memories WHERE id=?", (r,)).fetchone()[0] for r in rids}
+        for r in rids[1::4]:
+            conn.execute("DELETE FROM memories_fts WHERE rowid=?", (rowid[r],))
+        conn.commit()
+        want = [dict(r) for r in conn.execute(
+            "SELECT m.rowid AS rowid, m.id AS id, m.content AS content, "
+            "(mv.rowid IS NULL) AS no_vec, (mf.rowid IS NULL) AS no_fts FROM memories m "
+            "LEFT JOIN memories_vec mv ON mv.rowid = m.rowid LEFT JOIN memories_fts mf ON mf.rowid = m.rowid "
+            "WHERE mv.rowid IS NULL OR mf.rowid IS NULL ORDER BY m.rowid")]
+        assert {w["no_vec"] for w in want} == {0, 1} and {w["no_fts"] for w in want} == {0, 1}
+        assert db.find_unindexed_memories(conn) == want
+        assert db.find_unindexed_memories(conn, 3) == want[:3]
+
 
 class TestFTS:
     def test_punctuation_removal(self):

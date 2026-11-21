@@ -273,13 +273,18 @@ def get_memories_by_turn_id(conn, turn_id):
 
 
 def find_unindexed_memories(conn, limit=200):
-    """Rows missing from memories_vec or memories_fts (double LEFT JOIN). OFFSET is always 0."""
+    """Rows missing from memories_vec or memories_fts (both indexes checked). OFFSET is always 0.
+
+    The same result as a double LEFT JOIN, written as NOT IN over each index's rowids: a LEFT JOIN
+    looks up memories_vec (vec0) once per memories row, about 0.5 ms each on a file DB, so the check
+    grew with the DB (about 0.5 s at 1,600 records, 10 s at 20,000) and ran before every prompt
+    (--hook-submit calls /repair). Each NOT IN subquery is read once."""
     rows = conn.execute(
+        "SELECT rowid, id, content, no_vec, no_fts FROM ("
         "SELECT m.rowid AS rowid, m.id AS id, m.content AS content, "
-        "(mv.rowid IS NULL) AS no_vec, (mf.rowid IS NULL) AS no_fts "
-        "FROM memories m LEFT JOIN memories_vec mv ON mv.rowid = m.rowid "
-        "LEFT JOIN memories_fts mf ON mf.rowid = m.rowid "
-        "WHERE mv.rowid IS NULL OR mf.rowid IS NULL ORDER BY m.rowid LIMIT ?",
+        "(m.rowid NOT IN (SELECT rowid FROM memories_vec)) AS no_vec, "
+        "(m.rowid NOT IN (SELECT rowid FROM memories_fts)) AS no_fts "
+        "FROM memories m) WHERE no_vec OR no_fts ORDER BY rowid LIMIT ?",
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
