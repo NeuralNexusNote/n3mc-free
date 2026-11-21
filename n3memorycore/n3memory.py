@@ -3,6 +3,22 @@
 Commands: --init --buffer --search --list --recall-thread --show-turn --stop --repair
 --reembed --hook-submit --save-claude-turn --run-server
 """
+import os as _os
+import sys as _sys
+
+if __name__ == "__main__":
+    # Safe import path. Started as `python -m <package>.<module>`, Python has put the current folder
+    # first on sys.path, so a file there named like a module imported below would run inside this
+    # program. Drop that entry, unless this package itself lives in the current folder (a source
+    # checkout run in place). Nothing else may be imported before this block.
+    try:
+        _cwd = _os.path.normcase(_os.path.abspath(_os.getcwd()))
+        _pkg_parent = _os.path.normcase(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        if _sys.path and _os.path.normcase(_os.path.abspath(_sys.path[0])) == _cwd and _pkg_parent != _cwd:
+            del _sys.path[0]
+    except Exception:  # noqa: BLE001
+        pass
+
 import argparse
 import atexit
 import hashlib
@@ -41,6 +57,9 @@ try:
     from uuid_extensions import uuid7 as _uuid7
 except ImportError:  # pragma: no cover
     _uuid7 = None
+
+
+from .paths import python_cmd  # noqa: E402
 
 
 def _new_id():
@@ -646,7 +665,7 @@ def _start_server():
     try:
         log = open(SERVER_LOG, "ab")
         proc = subprocess.Popen(
-            [sys.executable, "-m", "n3memorycore.n3memory", "--run-server"],
+            [*python_cmd(), "-m", "n3memorycore.n3memory", "--run-server"],
             stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kwargs)
     except Exception as e:
         _err(f"N3MC: could not start the memory server: {e}")

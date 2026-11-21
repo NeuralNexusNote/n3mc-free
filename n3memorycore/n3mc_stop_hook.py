@@ -5,6 +5,22 @@ Step 0: audit.log. Then, synchronously and in order:
   2. ``n3mc --stop``              behavior-file upkeep and housekeeping
 The exit status is that of --save-claude-turn.
 """
+import os as _os
+import sys as _sys
+
+if __name__ == "__main__":
+    # Safe import path. Started as `python -m <package>.<module>`, Python has put the current folder
+    # first on sys.path, so a file there named like a module imported below would run inside this
+    # program. Drop that entry, unless this package itself lives in the current folder (a source
+    # checkout run in place). Nothing else may be imported before this block.
+    try:
+        _cwd = _os.path.normcase(_os.path.abspath(_os.getcwd()))
+        _pkg_parent = _os.path.normcase(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        if _sys.path and _os.path.normcase(_os.path.abspath(_sys.path[0])) == _cwd and _pkg_parent != _cwd:
+            del _sys.path[0]
+    except Exception:  # noqa: BLE001
+        pass
+
 import sys
 
 # Must run before the first stdin read, or non-ASCII input is mangled on Windows (cp932).
@@ -22,6 +38,9 @@ import subprocess
 from datetime import datetime, timezone
 
 from .paths import AUDIT_LOG
+
+
+from .paths import python_cmd  # noqa: E402
 
 
 def _write_audit(hook, raw):
@@ -47,10 +66,10 @@ def main():
     raw = sys.stdin.read()
     _write_audit("Stop", raw)
     saved = subprocess.run(
-        [sys.executable, "-m", "n3memorycore.n3memory", "--save-claude-turn"],
+        [*python_cmd(), "-m", "n3memorycore.n3memory", "--save-claude-turn"],
         input=raw, text=True, encoding="utf-8", errors="replace",
     )
-    subprocess.run([sys.executable, "-m", "n3memorycore.n3memory", "--stop"])
+    subprocess.run([*python_cmd(), "-m", "n3memorycore.n3memory", "--stop"])
     return saved.returncode
 
 

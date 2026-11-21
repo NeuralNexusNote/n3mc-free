@@ -718,7 +718,7 @@ if os.name == "nt":
 else:
     kwargs["start_new_session"] = True
 proc = subprocess.Popen(
-    [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
+    [*python_cmd(), '-m', 'n3memorycore.n3memory', '--run-server'],   # python_cmd(): 下の「安全なインポートパス」
     stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kwargs,
 )
 ```
@@ -728,6 +728,56 @@ proc = subprocess.Popen(
 
 - `-m n3memorycore.n3memory` 形式が必須。これによりパッケージの相対インポートが解決される。サーバーを絶対ファイルパスで起動してはならない。
 - 呼び出し側（settings.json の hooks 等）でリダイレクトを付与する必要はない。
+
+**安全なインポートパス（2026-11-21）**: `python -m <モジュール>` は、今のフォルダを `sys.path` の先頭に置く。フックと §4 のコマンドは、利用者が Claude Code で開いているフォルダで動く。下の 2 つの決まりがないと、そのフォルダにある、N3MC が import するモジュールと同じ名前のファイル（たとえば、利用者がクローンしたばかりのリポジトリの中の `shlex.py` や `fastapi.py`）が import され、N3MC の中で動く。
+
+**決まり 1 — 入口のモジュールは、今のフォルダを外す。** パッケージの中で、プログラムの入口になりうるモジュール（`if __name__ == "__main__":` で終わるもの。ここでは `n3memory.py`、`n3mc_hook.py`、`n3mc_stop_hook.py`）は、次のブロックを**最初の文**として持つ。docstring の直後、ほかのどの import よりも前に置く（フックのモジュールでは、UTF-8 のブロックをこのあとに置く）。
+
+```python
+import os as _os
+import sys as _sys
+
+if __name__ == "__main__":
+    # Safe import path. Started as `python -m <package>.<module>`, Python has put the current folder
+    # first on sys.path, so a file there named like a module imported below would run inside this
+    # program. Drop that entry, unless this package itself lives in the current folder (a source
+    # checkout run in place). Nothing else may be imported before this block.
+    try:
+        _cwd = _os.path.normcase(_os.path.abspath(_os.getcwd()))
+        _pkg_parent = _os.path.normcase(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        if _sys.path and _os.path.normcase(_os.path.abspath(_sys.path[0])) == _cwd and _pkg_parent != _cwd:
+            del _sys.path[0]
+    except Exception:  # noqa: BLE001
+        pass
+```
+
+- モジュールがプログラムとして動いたとき（`python -m …`）だけ働く。コンソールスクリプトやテストから import されたときは、何もしない。ライブラリは、自分を import したプログラムの `sys.path` を変えてはならない。
+- ブロックが動く時点で、`os` と `sys` は読み込み済みである。import しても、ファイルを読まない。
+- パッケージ自身が今のフォルダにあるとき（インストールせずに、ソースのフォルダでそのまま動かすとき）は、外さない。外すと、パッケージが見つからなくなる。
+
+**決まり 2 — 子プロセスは `python_cmd()` で起動する。** `paths.py` に次の関数を置く。
+
+```python
+def python_cmd():
+    """The command that starts a child Python: [sys.executable], plus -P on Python 3.11 and later so
+    that the child does not put the current folder on sys.path (see the safe-path block at the top of
+    the entry modules). -P is left out when this package itself lives in the current folder (a source
+    checkout run in place), because the child could then not find the package."""
+    import sys
+    cmd = [sys.executable]
+    try:
+        cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+        pkg_parent = os.path.normcase(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if sys.version_info >= (3, 11) and pkg_parent != cwd:
+            cmd.append("-P")
+    except Exception:  # noqa: BLE001
+        pass
+    return cmd
+```
+
+子の Python のプロセス（上のコードのサーバーと、フックのモジュールからの呼び出し）は、すべて `[*python_cmd(), '-m', …]` で起動する。`[sys.executable, '-m', …]` で起動してはならない。`-P`（Python 3.11 から）は、今のフォルダを `sys.path` に足すこと自体をやめさせる。今のフォルダに、このパッケージと同じ名前のフォルダがある場合にも効く。
+
+**この決まりで防げないもの**: 今のフォルダにある、このパッケージ自身と同じ名前（`n3memorycore`）のフォルダやファイル。そのフォルダで `python -m …` と打ってプログラムに入るとき（§4 のコマンドと、`python -m` の形で登録されたフック）は、もう一方のパッケージが import されるので、ブロックに届かない。Python 3.10 では、子プロセスも同じである（`-P` がない）。そのフォルダに置かれた `runpy.py` も動く。コンソールスクリプトから入るか、Python 3.11 以降で `python -P -m …` を使えば、起きない。（2026-11-21 に確認: 今のフォルダに `shlex.py` を置くと、この決まりの前は `python -m n3memorycore.n3memory` がそのファイルを動かし、決まりを入れたあとは動かさない。そこに `n3memorycore/` というフォルダがあれば、今も動く。）
 
 **文字コード（UTF-8）**: `n3memorycore/n3memory.py` の `main()` 先頭、**および `n3memorycore/n3mc_hook.py` と `n3memorycore/n3mc_stop_hook.py` のモジュール先頭**（`sys.stdin.read()` や `subprocess.run` の呼び出しより前）で以下を実行し、Windows cp932 環境での文字化けをプログラム内部で解決せよ。
 
@@ -1622,6 +1672,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 n3mc-free/
 └── tests/
     ├── conftest.py          # 共通フィクスチャ：隔離DB、設定、ダミーベクトル
+    ├── test_safe_path.py    # 安全なインポートパス: 今のフォルダのファイルが N3MC の中で動かない（モデル不要）
     ├── test_database.py     # Layer 1: DB単体テスト（CRUD、スキーマ、トランザクション）
     ├── test_dedup_concurrent.py # Layer 1: 同じターンの同じ文を同時に 2 回保存する（R04。モデル不要）
     ├── test_processor.py    # Layer 2: ランキング数学、purify `[code omitted]` 置換検証、Refresh
@@ -1737,6 +1788,20 @@ python -m pytest tests/ -v
 | `TestModelRetry`（v1.5.0） | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |
 | `TestPackaging`（v1.5.0） | `psutil` が `pyproject.toml` の `dependencies` に入っている |
 | `TestWeakMatches`（v1.6.0） | 下限を通った結果が 1 件で `min_results: 3` なら弱い候補が 2 件足され、`filter_score` の順に並び、`/search` で `"weak": true` が付き、普通の行の後に来る、`vector_min_cos` 未満の候補は実際の cos で足される（`filter_score` もその cos で計算）、`min_results: 0` では何も足さない、十分な件数が通ったときは足さない、`search_result_limit` が `min_results` より小さければ合計はその上限まで、結果の行と同じ content の候補や、すでに 2 件ある `turn_id` の候補は飛ばす、`filter_score` が `1e-6` 未満の候補（直交するベクトル）は足さない、弱い候補は `pairs` に使わない、空のクエリでは弱い候補も返さない |
+
+### 安全なインポートパス: `test_safe_path.py`（2026-11-21。モデル不要）
+
+プロセスを起動するテストは、どれも一時的なデータフォルダと一時的なホームフォルダを渡す。
+
+| Test | 確かめること |
+|---|---|
+| `test_there_are_entry_modules` | メインのモジュールが、`if __name__ == "__main__":` で終わるモジュールの 1 つである。そうしたモジュールが 3 つ以上ある |
+| `test_entry_module_starts_with_the_safe_path_block`（入口のモジュールごとに 1 回） | docstring のあとの最初の文が、`import os as _os`、`import sys as _sys`、`sys.path[0]` を消す `if __name__ == "__main__":` のブロックである |
+| `test_files_in_the_current_folder_do_not_run` | `argparse.py`・`shlex.py`・`queue.py`・`fastapi.py`・`pydantic.py`・`sqlite_vec.py`・`numpy.py`・`uvicorn.py`（どれも、目印のファイルを書いて `ImportError` を出す）を置いたフォルダで、`python -m n3memorycore.n3memory --help` が使い方を出し、0 で終わり、目印を残さない |
+| `test_without_the_block_they_would_run` | 同じフォルダで `python -c "import shlex"` を実行すると、目印が書かれる（上のテストが空振りでないことの確認） |
+| `test_a_source_checkout_run_in_place_still_works` | リポジトリのルートから、`PYTHONPATH` なしで、`python -m n3memorycore.n3memory --help` が 0 で終わる |
+| `test_children_are_started_with_dash_P_outside_a_checkout` | `python_cmd()` は、ほかのフォルダでは Python 3.11 以降で `[sys.executable, "-P"]`（3.10 では `[sys.executable]`）、リポジトリのルートでは `[sys.executable]` になる |
+| `test_no_child_is_started_without_python_cmd` | パッケージのどのモジュールにも `[sys.executable,` がない |
 
 ### 実行方法
 
