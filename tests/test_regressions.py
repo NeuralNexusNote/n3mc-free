@@ -658,7 +658,9 @@ class TestTimeBounds:
 
     def test_garbage_exits_2_with_one_line(self, capsys):
         assert n3m.cmd_search("x", since="yesterday") == 2
-        assert "cannot read 'yesterday'" in capsys.readouterr().err
+        assert "--since: cannot read 'yesterday' (use 2026-11-13 or 2026-11-13T09:00)" in capsys.readouterr().err
+        assert n3m.cmd_list(until="2026-13-01") == 2
+        assert "--until: cannot read '2026-13-01'" in capsys.readouterr().err
         assert n3m.cmd_list(since="2026-12-01", until="2026-11-01") == 2
 
 

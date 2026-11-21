@@ -1702,12 +1702,19 @@ def _fmt_line(r):
 
 
 def _bounds(since, until):
-    try:
-        s = _parse_time_bound(since, False) if since else None
-        u = _parse_time_bound(until, True) if until else None
-    except ValueError as e:
-        print(f"--since/--until: {e}", file=sys.stderr)
-        return None
+    s = u = None
+    for flag, value, upper in (("--since", since, False), ("--until", until, True)):
+        if not value:
+            continue
+        try:
+            parsed = _parse_time_bound(value, upper)
+        except ValueError as e:
+            print(f"{flag}: {e}", file=sys.stderr)
+            return None
+        if upper:
+            u = parsed
+        else:
+            s = parsed
     if s and u and s > u:
         print("--since is later than --until", file=sys.stderr)
         return None
