@@ -876,3 +876,19 @@ class TestWeakMatches:
     def test_empty_query_returns_nothing(self, conn, cfg):
         add(conn, cfg, "something")
         assert search(conn, cfg, "")["results"] == []
+
+
+class TestPidFileRemoval:
+    def test_own_pid_file_is_deleted_and_a_foreign_one_is_kept(self):
+        open(n3m.PID_FILE, "w").write(str(os.getpid()))
+        n3m._remove_own_pid_file()
+        assert not os.path.exists(n3m.PID_FILE)  # (an open handle would make this fail on Windows)
+        open(n3m.PID_FILE, "w").write("999999")
+        n3m._remove_own_pid_file()
+        assert os.path.exists(n3m.PID_FILE)
+
+    def test_exit_server_removes_the_pid_file(self, monkeypatch):
+        open(n3m.PID_FILE, "w").write(str(os.getpid()))
+        monkeypatch.setattr(n3m._os, "_exit", lambda code: None)
+        n3m._exit_server()
+        assert not os.path.exists(n3m.PID_FILE)

@@ -746,13 +746,20 @@ def create_app():
     return app
 
 
-def _exit_server():
+def _remove_own_pid_file():
+    """Delete the PID file if it holds this process's PID. The file is closed before it is deleted
+    (Windows cannot delete a file that is still open)."""
     try:
         with open(PID_FILE, "r", encoding="utf-8") as f:
-            if f.read().strip() == str(_os.getpid()):
-                _os.unlink(PID_FILE)
+            mine = f.read().strip() == str(_os.getpid())
+        if mine:
+            _os.unlink(PID_FILE)
     except OSError:
         pass
+
+
+def _exit_server():
+    _remove_own_pid_file()
     _os._exit(0)
 
 
@@ -786,12 +793,7 @@ def cmd_run_server():
     try:
         uvicorn.run(create_app(), host=cfg["bind_host"], port=cfg["server_port"], log_level="error")
     finally:
-        try:
-            with open(PID_FILE, "r", encoding="utf-8") as f:
-                if f.read().strip() == str(_os.getpid()):
-                    _os.unlink(PID_FILE)
-        except OSError:
-            pass
+        _remove_own_pid_file()
     return 0
 
 
