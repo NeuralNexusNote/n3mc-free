@@ -36,3 +36,20 @@ def claude_paths(cwd=None):
         "rules_dir": rules_dir,
         "behavior_md": os.path.join(rules_dir, "n3mc-behavior.md"),
     }
+
+
+def python_cmd():
+    """The command that starts a child Python: [sys.executable], plus -P on Python 3.11 and later so
+    that the child does not put the current folder on sys.path (see the safe-path block at the top of
+    the entry modules). -P is left out when this package itself lives in the current folder (a source
+    checkout run in place), because the child could then not find the package."""
+    import sys
+    cmd = [sys.executable]
+    try:
+        cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+        pkg_parent = os.path.normcase(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if sys.version_info >= (3, 11) and pkg_parent != cwd:
+            cmd.append("-P")
+    except Exception:  # noqa: BLE001
+        pass
+    return cmd

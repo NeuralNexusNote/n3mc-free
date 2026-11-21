@@ -720,7 +720,7 @@ if os.name == "nt":
 else:
     kwargs["start_new_session"] = True
 proc = subprocess.Popen(
-    [sys.executable, '-m', 'n3memorycore.n3memory', '--run-server'],
+    [*python_cmd(), '-m', 'n3memorycore.n3memory', '--run-server'],   # python_cmd(): "Safe import path" below
     stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kwargs,
 )
 ```
@@ -730,6 +730,56 @@ proc = subprocess.Popen(
 
 - The `-m n3memorycore.n3memory` form is required so the package's relative imports resolve. Do **not** spawn the server by absolute file path.
 - The caller (e.g., hooks in `settings.json`) does not need to add any redirects.
+
+**Safe import path (2026-11-21)**: `python -m <module>` puts the current folder first on `sys.path`. The hooks and the commands of §4 run in the folder the user has open in Claude Code. Without the two rules below, a file in that folder with the name of any module N3MC imports (for example `shlex.py` or `fastapi.py` in a repository the user has just cloned) is imported, and runs, inside N3MC.
+
+**Rule 1 — entry modules drop the current folder.** Every module of the package that can be the program's entry — the ones that end with `if __name__ == "__main__":`; here `n3memory.py`, `n3mc_hook.py` and `n3mc_stop_hook.py` — has the following block as its **first statements**, right after the docstring and before any other import (in the hook modules, the UTF-8 block comes after it):
+
+```python
+import os as _os
+import sys as _sys
+
+if __name__ == "__main__":
+    # Safe import path. Started as `python -m <package>.<module>`, Python has put the current folder
+    # first on sys.path, so a file there named like a module imported below would run inside this
+    # program. Drop that entry, unless this package itself lives in the current folder (a source
+    # checkout run in place). Nothing else may be imported before this block.
+    try:
+        _cwd = _os.path.normcase(_os.path.abspath(_os.getcwd()))
+        _pkg_parent = _os.path.normcase(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        if _sys.path and _os.path.normcase(_os.path.abspath(_sys.path[0])) == _cwd and _pkg_parent != _cwd:
+            del _sys.path[0]
+    except Exception:  # noqa: BLE001
+        pass
+```
+
+- It acts only when the module is the program (`python -m …`). Imported by a console script or by a test, it does nothing: a library must not change the `sys.path` of the program that imports it.
+- `os` and `sys` are already loaded when the block runs, so importing them reads no file.
+- The entry is kept when the package itself lives in the current folder (a source checkout run in place, not installed): without it the package could not be found.
+
+**Rule 2 — children are started with `python_cmd()`.** `paths.py` has:
+
+```python
+def python_cmd():
+    """The command that starts a child Python: [sys.executable], plus -P on Python 3.11 and later so
+    that the child does not put the current folder on sys.path (see the safe-path block at the top of
+    the entry modules). -P is left out when this package itself lives in the current folder (a source
+    checkout run in place), because the child could then not find the package."""
+    import sys
+    cmd = [sys.executable]
+    try:
+        cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+        pkg_parent = os.path.normcase(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if sys.version_info >= (3, 11) and pkg_parent != cwd:
+            cmd.append("-P")
+    except Exception:  # noqa: BLE001
+        pass
+    return cmd
+```
+
+Every child Python process — the server in the code above and the calls of the hook modules — is started as `[*python_cmd(), '-m', …]`, never as `[sys.executable, '-m', …]`. `-P` (Python 3.11) keeps Python from adding the current folder at all, which also covers a folder there that has the name of this package.
+
+**What the rules do not cover**: a folder or file in the current folder with the name of this package itself (`n3memorycore`), when the program is entered by `python -m …` typed in that folder (the commands of §4, and a hook registered in the `python -m` form). The block is never reached, because the other package is the one that is imported. On Python 3.10 the same holds for the children (there is no `-P`), and a `runpy.py` in that folder runs as well. Entering through the console scripts, or with `python -P -m …` on Python 3.11 and later, avoids it. (Checked 2026-11-21: with `shlex.py` in the current folder, `python -m n3memorycore.n3memory` ran that file before these rules and does not run it with them; a folder `n3memorycore/` there still runs.)
 
 **Character Encoding (UTF-8)**: At the start of `main()` in `n3memorycore/n3memory.py`, **AND at module top of `n3memorycore/n3mc_hook.py` and `n3memorycore/n3mc_stop_hook.py`** (before any `sys.stdin.read()` or `subprocess.run` invocation), execute the following to resolve character corruption in Windows cp932 environments from within the program itself:
 
@@ -1626,6 +1676,7 @@ Tests live at the repository root (NOT inside the package). Imports resolve via 
 n3mc-free/
 └── tests/
     ├── conftest.py          # Shared fixtures: isolated DB, config, dummy vectors
+    ├── test_safe_path.py    # Safe import path: files in the current folder do not run inside N3MC (no model needed)
     ├── test_database.py     # Layer 1: DB unit tests (CRUD, schema, transactions)
     ├── test_dedup_concurrent.py # Layer 1: two saves of the same text for the same turn at once (R04; no model needed)
     ├── test_processor.py    # Layer 2: Ranking math, purify `[code omitted]` substitution, Refresh
@@ -1741,6 +1792,20 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestModelRetry` (v1.5.0) | After a failed model load, `get_model()` does not try again for 60 seconds (load function replaced by a fake); `$N3MC_EMBED_MODEL` has no effect |
 | `TestPackaging` (v1.5.0) | `psutil` is listed in `pyproject.toml` `dependencies` |
 | `TestWeakMatches` (v1.6.0) | With one result passing the floors and `min_results: 3`, two weak rows are added, ordered by `filter_score`, marked `"weak": true` in `/search` and placed after the normal row; a candidate below `vector_min_cos` is added with its actual cos (its `filter_score` uses that cos); `min_results: 0` adds nothing; nothing is added when enough results pass; `search_result_limit` smaller than `min_results` caps the total; a weak candidate identical to a result row, or from a `turn_id` that already has 2 rows, is skipped; a candidate with `filter_score` below `1e-6` (an orthogonal vector) is never added; weak rows are not used for `pairs`; an empty query returns no weak rows |
+
+### Safe import path: `test_safe_path.py` (2026-11-21; no model needed)
+
+Every test that starts a process gives it a temporary data folder and a temporary home folder.
+
+| Test | What it checks |
+|---|---|
+| `test_there_are_entry_modules` | The main module is one of the modules that end with `if __name__ == "__main__":`, and there are at least 3 of them |
+| `test_entry_module_starts_with_the_safe_path_block` (once per entry module) | After the docstring, the first statements are `import os as _os`, `import sys as _sys` and the `if __name__ == "__main__":` block that deletes `sys.path[0]` |
+| `test_files_in_the_current_folder_do_not_run` | In a folder that holds `argparse.py`, `shlex.py`, `queue.py`, `fastapi.py`, `pydantic.py`, `sqlite_vec.py`, `numpy.py` and `uvicorn.py` (each writes a marker file and raises `ImportError`), `python -m n3memorycore.n3memory --help` prints the usage, exits 0 and leaves no marker |
+| `test_without_the_block_they_would_run` | In the same folder, `python -c "import shlex"` writes the marker (so the test above is real) |
+| `test_a_source_checkout_run_in_place_still_works` | From the repository root, without `PYTHONPATH`, `python -m n3memorycore.n3memory --help` exits 0 |
+| `test_children_are_started_with_dash_P_outside_a_checkout` | `python_cmd()` is `[sys.executable, "-P"]` in another folder on Python 3.11 and later (`[sys.executable]` on 3.10), and `[sys.executable]` in the repository root |
+| `test_no_child_is_started_without_python_cmd` | No module of the package contains `[sys.executable,` |
 
 ### Running
 
