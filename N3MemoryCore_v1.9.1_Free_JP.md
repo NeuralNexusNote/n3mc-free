@@ -137,6 +137,7 @@ n3mc-free/                       # リポジトリルート
 ├── tests/                       # pytest スイート（§7 参照）
 │   ├── __init__.py
 │   ├── conftest.py
+│   ├── test_safe_path.py        # 安全なインポートパス: 今のフォルダのファイルが N3MC の中で動かない（モデル不要、§7）
 │   ├── test_api.py
 │   ├── test_database.py
 │   ├── test_dedup_concurrent.py # 同じターンの同じ文を同時に 2 回保存する（R04。モデル不要、§7 Layer 1）
@@ -876,11 +877,11 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 `/repair` 内の一括マイグレーション（ベクトル再インデックス・FTS 句読点クリーニング）は **200 件ずつバッチ処理**で実行する。大規模 DB でのメモリ枯渇を防止するため、`fetchall()` ではなく `LIMIT 200` でフェッチする。**`OFFSET` は常に `0` に固定すること**——修復済みレコードは `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` の結果セットから自動的に消えるため、`OFFSET` をバッチごとに加算すると残りの未修復レコードをスキップしてしまう（例：400 件未修復 → 200 件修復 → `OFFSET 200` で 0 件ヒット → 残り 200 件が永久に未修復になる）。各バッチで 1 件も修復できなかった場合（埋め込みモデル利用不可等）は無限ループを防ぐために即時終了する。
 
-**埋め込みの間は書き込みのロックを持たない（2026-11-18 の最終レビュー、F11）**：ベクトルの修復は、バッチ全体の埋め込みを先に、トランザクションの外で計算し（開いているものは先にコミットする）、そのあとでバッチの `memories_vec` / `memories_fts` / `memories_fts_bi` の行を入れてコミットする — `--reembed` と同じ順序。（それまでは、最初の `INSERT … memories_vec` が書き込みのトランザクションを開き、バッチの残り — 最大 200 件 — を埋め込む間ずっと開いたままだった。その間に届いた `/buffer` は busy timeout まで待って `database is locked` で失敗し、`_buffer_direct` への切り替えも同じく失敗して、質問が保存されなかった。60 件と、1 件 0.25 秒の代役のモデルで再現した。）
+**埋め込みの間は書き込みのロックを持たない（2026-11-18 の最終レビュー、F11）**：ベクトルの修復は、バッチ全体の埋め込みを先に、トランザクションの外で計算し（開いているものは先にコミットする）、そのあとでバッチの `memories_vec` / `memories_fts` / `memories_fts_bi` の行を入れてコミットする — `--reembed` と同じ順序。（それまでは、最初の `INSERT … memories_vec` が書き込みのトランザクションを開き、バッチの残り — 最大 200 件 — を埋め込む間ずっと開いたままだった。その間に届いた `/buffer` は busy timeout まで待って `database is locked` で失敗し、`_buffer_direct` への切り替えも同じく失敗して、質問が保存されなかった。60 件と、1 件 0.25 秒の代役のモデルで再現した。）**書き込む前にもう一度確かめる（2026-11-20）**: 埋め込みのあと、`BEGIN IMMEDIATE` で書き込みのロックを取ってから、バッチの行ごとに、`memories` の行がまだあって同じ記録であること（`id` か `content` が同じ）、`memories_fts` / `memories_fts_bi` / `memories_vec` にその rowid の行がまだないことを確かめ、足りないものだけを書く。ほかの呼び出し（別のウィンドウのフック、手動の `--repair`）が埋め終えた行や、消された行は飛ばす。（それまでは、2 つの呼び出しが同じ未修復の行を読むと、あとの方が `UNIQUE constraint failed on memories_vec primary key` で止まった（2026-11-20、N3MC Pro の生成コードのレビューで再現）。）
 
 **フックからの呼び出しごとの上限（v1.5.0）**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。
 
-ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。
+ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。**続きから始める（2026-11-20）**: 終えた最後の rowid を `meta` のキー `fts_punct_cursor` に、各回の書き直しと同じトランザクションで書く。次の呼び出しは rowid 0 からではなく、その次から始める（`max_records` 付きの呼び出しが続いても、プロセスを起動し直しても進む）。最後まで読み終えたら `fts_punct_cleaned` を書き、`fts_punct_cursor` を消す。（それまでは、上限付きの呼び出しが毎回 rowid 0 から始まり、201 行目に届かず、マーカーも書かれなかった（2026-11-20、N3MC Pro の生成コードのレビューで再現）。）
 
 ### 索引の情報（`meta` 表）と `--reembed`（v1.8.0）
 
@@ -896,6 +897,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 | `embed_dim` | `memories_vec` の次元（`768`） | 同上 |
 | `embed_model_at` | `embed_model` を書いた時刻（UTC の ISO 8601） | 同上 |
 | `fts_punct_cleaned` | FTS の句読点クリーニングが終わったら `1` | `/repair` |
+| `fts_punct_cursor` | FTS の句読点クリーニングが終えた最後の rowid。終わったら消す（2026-11-20） | `/repair` |
 | `fts_bigram` | 古い行の `memories_fts_bi` を埋め終わったら `1` | `/repair` |
 | `reembed_model`、`reembed_cursor` | 終わっていない `--reembed` の進み具合 | `--reembed`（終わったら消す） |
 
@@ -1685,7 +1687,7 @@ n3mc-free/
     └── test_index_meta.py             # Layer 5: meta 表、モデルの食い違いの通知、--reembed（v1.8.0。モデル不要）
 ```
 
-**本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。
+**本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。 **HOME を差し替えると Hugging Face のキャッシュの場所も変わり、`TestEmbedding` などが埋め込みモデル（約 470 MB）をテストごとに一時フォルダへダウンロードし直す。** fixture で `HF_HOME` を、差し替える前の本物のキャッシュ（`HF_HOME` が設定済みならその値、なければ `~/.cache/huggingface`）に固定すること。
 
 標準的なフィクスチャインポート:
 

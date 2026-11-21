@@ -137,6 +137,7 @@ n3mc-free/                       # Repository root
 ├── tests/                       # pytest suite (see §7)
 │   ├── __init__.py
 │   ├── conftest.py
+│   ├── test_safe_path.py        # Safe import path: files in the current folder do not run inside N3MC (no model needed, §7)
 │   ├── test_api.py
 │   ├── test_database.py
 │   ├── test_dedup_concurrent.py # two saves of the same text for the same turn at once (R04; no model needed, §7 Layer 1)
@@ -878,11 +879,11 @@ At server startup (`lifespan`), run the full `PRAGMA integrity_check` exactly on
 
 Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) execute in **batches of 200**. To prevent OOM on large DBs, fetch using `LIMIT 200` instead of `fetchall()`. **Always keep `OFFSET` at `0`** — repaired records automatically drop out of the `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` result set, so incrementing `OFFSET` across batches would skip the remaining unrepaired records (e.g., 400 unrepaired → 200 repaired → `OFFSET 200` returns 0 rows → remaining 200 permanently skipped). Exit immediately if a batch produces zero progress (e.g., embedding model unavailable) to prevent infinite loops.
 
-**No write lock while embedding (final review of 2026-11-18, F11)**: the vector repair computes the embeddings of the whole batch first, outside any transaction (an open one is committed before), and only then inserts the batch's `memories_vec` / `memories_fts` / `memories_fts_bi` rows and commits — the same order as `--reembed`. (Until then the first `INSERT … memories_vec` opened the write transaction, which stayed open while the rest of the batch — up to 200 records — was embedded; a `/buffer` that arrived meanwhile waited for the busy timeout and failed with `database is locked`, and so did its `_buffer_direct` fallback, so the prompt was not saved. Reproduced with 60 records and a stand-in model of 0.25 s per record.)
+**No write lock while embedding (final review of 2026-11-18, F11)**: the vector repair computes the embeddings of the whole batch first, outside any transaction (an open one is committed before), and only then inserts the batch's `memories_vec` / `memories_fts` / `memories_fts_bi` rows and commits — the same order as `--reembed`. (Until then the first `INSERT … memories_vec` opened the write transaction, which stayed open while the rest of the batch — up to 200 records — was embedded; a `/buffer` that arrived meanwhile waited for the busy timeout and failed with `database is locked`, and so did its `_buffer_direct` fallback, so the prompt was not saved. Reproduced with 60 records and a stand-in model of 0.25 s per record.) **Check again before writing (2026-11-20)**: after the embeddings, take the write lock with `BEGIN IMMEDIATE`, and for each row of the batch check that the `memories` row still exists and is the same record (same `id` or `content`) and that `memories_fts` / `memories_fts_bi` / `memories_vec` still have no row for that rowid; write only what is missing. Rows another call (a hook in another window, a manual `--repair`) has filled meanwhile, and rows deleted meanwhile, are skipped. (Before, when two calls read the same unrepaired row, the later one stopped with `UNIQUE constraint failed on memories_vec primary key` (2026-11-20, reproduced in the review of N3MC Pro's generated code).)
 
 **Per-call limit for hooks (v1.5.0)**: `/repair` accepts an optional body `{"max_records": int}`. `--hook-submit` sends `{"max_records": 200}` (one batch), so a large backlog — e.g. many records saved through `_buffer_direct` while another folder's server held the port — is worked off a batch per turn instead of blocking one prompt for minutes. `n3mc --repair` sends no limit and processes everything. The one-time migrations (FTS punctuation cleaning, vector re-index) follow the same limit; their markers are written only when the migration has finished.
 
-The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`.
+The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`. **Carry on where the last call stopped (2026-11-20)**: write the last rowid done to the `meta` key `fts_punct_cursor` in the same transaction as each batch's rewrites; the next call starts after it, not at rowid 0 (so calls with `max_records` keep moving on, also across restarts). When the last row has been read, write `fts_punct_cleaned` and delete `fts_punct_cursor`. (Before, every call with a limit started again at rowid 0, never reached row 201, and never wrote the marker (2026-11-20, reproduced in the review of N3MC Pro's generated code).)
 
 ### Index metadata (`meta` table) and `--reembed` (v1.8.0)
 
@@ -898,6 +899,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 | `embed_dim` | dimension of `memories_vec` (`768`) | same |
 | `embed_model_at` | when `embed_model` was written (UTC ISO 8601) | same |
 | `fts_punct_cleaned` | `1` when the FTS punctuation cleaning has finished | `/repair` |
+| `fts_punct_cursor` | The last rowid the FTS punctuation cleaning has done; deleted when it finishes (2026-11-20) | `/repair` |
 | `fts_bigram` | `1` when `memories_fts_bi` has been filled for older rows | `/repair` |
 | `reembed_model`, `reembed_cursor` | progress of an unfinished `--reembed` | `--reembed` (removed when it finishes) |
 
@@ -1689,7 +1691,7 @@ n3mc-free/
     └── test_index_meta.py             # Layer 5: meta table, model mismatch notice, --reembed (v1.8.0; no model needed)
 ```
 
-**Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
+**Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520). **Replacing HOME also moves the Hugging Face cache, so `TestEmbedding` and the like would download the embedding model (about 470 MB) again into a temporary folder for every test.** Pin `HF_HOME` in the fixture to the real cache from before the replacement (the value of `HF_HOME` if it is set, otherwise `~/.cache/huggingface`).
 
 Standard fixture import style:
 
