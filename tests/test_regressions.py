@@ -483,7 +483,7 @@ class TestConfig:
                     "pair_top_n": 5})
         open(n3m.CONFIG_FILE, "w").write(json.dumps(cfg))
         out = n3m._load_config()
-        assert out["vector_min_cos"] == 0.85 and out["search_query_max_chars"] == 2000 and out["half_life_days"] == 90
+        assert out["vector_min_cos"] == n3m.DEFAULT_CONFIG["vector_min_cos"] and out["search_query_max_chars"] == 2000 and out["half_life_days"] == 90
         assert out["server_port"] == 18520 and out["min_score"] == 0.2 and out["min_results"] == 3
         assert out["search_result_limit"] == 20 and out["pair_top_n"] == 5
         assert json.load(open(n3m.CONFIG_FILE))["vector_min_cos"] == "0.83"  # file not rewritten
@@ -894,3 +894,102 @@ class TestPidFileRemoval:
         monkeypatch.setattr(n3m._os, "_exit", lambda code: None)
         n3m._exit_server()
         assert not os.path.exists(n3m.PID_FILE)
+
+
+def _vec_at(cos, axis=1):
+    """A unit vector whose cosine with e0 is `cos` (the rest goes on another axis)."""
+    v = [0.0] * 768
+    v[0] = cos
+    v[axis] = (1 - cos * cos) ** 0.5
+    return v
+
+
+def _e0(_text):
+    v = [0.0] * 768
+    v[0] = 1.0
+    return v
+
+
+def _add_vec(conn, cfg, content, cos, axis=1, turn_id=None):
+    rid = n3m._new_id()
+    db.insert_memory(conn, rid, content, NOW.isoformat(), cfg["owner_id"], cfg["local_id"], "claude-code",
+                     None, turn_id=turn_id, embedding=_vec_at(cos, axis))
+    return rid
+
+
+class TestSearchImprovements2026_11_22:
+    """Search improvements of 2026-11-22 (not in the spec). Each one can be turned off in config.json."""
+
+    def test_defaults(self):
+        d = n3m.DEFAULT_CONFIG
+        assert d["vector_min_cos"] == 0.82 and d["fts_stopwords"] is True and d["kw_only_min_terms"] == 3
+        assert d["top_matches_max"] == 5 and d["cross_lang_min_cos"] == 0.80
+
+    def test_stopwords_dropped_from_terms(self):
+        assert db.fts_terms("Who is the CEO of the company?", True) == ["CEO", "company"]
+        assert "the" in db.fts_terms("Who is the CEO of the company?", False)
+        assert db.bigram_terms("What is the CEO doing", True) == ["CEO", "doing"]
+        assert db.fts_terms("who is the", True) == ["who", "the"]  # only function words: kept as typed
+        assert db.fts_terms("東京タワーの高さ", True) == db.fts_terms("東京タワーの高さ", False)
+
+    def test_function_words_alone_do_not_match(self, conn, cfg):
+        add(conn, cfg, "The release is on Friday and the notes are in the wiki.", embed=False)
+        c = {**cfg, "min_results": 0}
+        assert search(conn, c, "Who is the CEO of the company?")["results"] == []
+        off = {**c, "fts_stopwords": False, "kw_only_min_terms": 0}
+        assert search(conn, off, "Who is the CEO of the company?")["results"]
+
+    def test_keyword_only_rows_need_enough_terms(self, conn, cfg):
+        add(conn, cfg, "zebra crossing near the park", embed=False)
+        add(conn, cfg, "zebra crossing station lights timing", embed=False)
+        c = {**cfg, "relative_min_score_ratio": 0, "min_score": 0}
+        r = search(conn, c, "zebra crossing station lights")["results"]
+        strong = [x["content"] for x in r if not x["weak"]]
+        assert strong == ["zebra crossing station lights timing"]
+        assert any(x["weak"] and x["content"].startswith("zebra crossing near") for x in r)
+        off = search(conn, {**c, "kw_only_min_terms": 0}, "zebra crossing station lights")["results"]
+        assert len([x for x in off if not x["weak"]]) == 2
+
+    def test_top_matches_max_caps_strong_rows_only(self, conn, cfg):
+        for i in range(8):
+            _add_vec(conn, cfg, f"record {i}", 0.95, axis=1 + i)
+        c = {**cfg, "top_matches_max": 3}
+        r = p.hybrid_search(conn, "anything", c, embed_fn=_e0)["results"]
+        assert len([x for x in r if not x["weak"]]) == 3
+        r = p.hybrid_search(conn, "anything", {**c, "top_matches_max": 0}, embed_fn=_e0)["results"]
+        assert len([x for x in r if not x["weak"]]) == 8
+
+    def test_is_cjk_text(self):
+        assert p._is_cjk_text("[claude 1/2] ログの保存期間は 3 年です")
+        assert not p._is_cjk_text("[user] How long are logs kept?")
+        assert not p._is_cjk_text("The file 設定.json was renamed to config.json in the repository")
+        assert not p._is_cjk_text("")
+
+    def test_best_other_language_row_is_rescued(self, conn, cfg):
+        _add_vec(conn, cfg, "[claude] The backup runs at 03:30 every night.", 0.81, axis=1)
+        _add_vec(conn, cfg, "[claude] The staging host moved last week.", 0.80, axis=2)
+        _add_vec(conn, cfg, "[claude] ログは 3 年残します。", 0.81, axis=3)
+        c = {**cfg, "min_results": 0}
+        strong = [x["content"] for x in p.hybrid_search(conn, "バックアップは何時に動く？", c, embed_fn=_e0)["results"]]
+        assert strong == ["[claude] The backup runs at 03:30 every night."]  # only the best, only the other script
+        assert p.hybrid_search(conn, "バックアップは何時に動く？", {**c, "cross_lang_min_cos": 0},
+                               embed_fn=_e0)["results"] == []
+        assert p.hybrid_search(conn, "バックアップは何時に動く？", {**c, "cross_lang_min_cos": 0.82},
+                               embed_fn=_e0)["results"] == []
+
+    def test_spec_settings_restore_the_spec_behaviour(self, conn, cfg):
+        add(conn, cfg, "zebra here", embed=False)
+        spec = {**cfg, "vector_min_cos": 0.85, "fts_stopwords": False, "kw_only_min_terms": 0,
+                "top_matches_max": 0, "cross_lang_min_cos": 0, "min_results": 0}
+        r = search(conn, spec, "zebra crossing station lights")["results"]
+        assert [x["content"] for x in r if not x["weak"]] == ["zebra here"]
+
+    def test_new_keys_are_type_checked(self):
+        n3m._load_config()
+        cfg = json.load(open(n3m.CONFIG_FILE))
+        cfg.update({"fts_stopwords": "yes", "kw_only_min_terms": -1, "top_matches_max": 2.5,
+                    "cross_lang_min_cos": 1.5})
+        open(n3m.CONFIG_FILE, "w").write(json.dumps(cfg))
+        out = n3m._load_config()
+        assert out["fts_stopwords"] is True and out["kw_only_min_terms"] == 3
+        assert out["top_matches_max"] == 5 and out["cross_lang_min_cos"] == 0.80

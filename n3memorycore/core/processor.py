@@ -10,7 +10,7 @@ from .database import (
     get_connection, init_db, insert_memory, search_vector, search_fts, search_fts_bigram,
     get_all_memories, delete_memory, count_memories, check_exact_duplicate,
     find_unindexed_memories, serialize_vector, get_memories_by_turn_id, strip_fts_punctuation,
-    deserialize_vector,
+    deserialize_vector, fts_terms, bigram_terms, bigram_text,
 )
 
 DEFAULT_MODEL = "intfloat/multilingual-e5-base"
@@ -239,6 +239,30 @@ def _as_row(rec, cos, kw, session_id, cfg, now):
     }
 
 
+def _matched_terms(content, terms):
+    """How many distinct query terms (trigram terms, bigram terms) occur in ``content``."""
+    tri, bi = terms
+    low = strip_fts_punctuation(content).lower()
+    toks = set(bigram_text(content).lower().split())
+    hit = {t.lower() for t in tri if t.lower() in low}
+    hit |= {t.lower() for t in bi if t.lower() in toks}
+    return len(hit)
+
+
+_CJK_RE = re.compile(r'[぀-ヿ㐀-鿿가-힯]')
+_PREFIX_RE = re.compile(r'^\[(?:user|claude)(?: \d+/\d+)?\] ')
+
+
+def _is_cjk_text(text):
+    """True when the text (without its [user] / [claude i/N] tag) has CJK characters in a fifth or
+    more of its letters."""
+    body = _PREFIX_RE.sub('', text or '')
+    letters = [ch for ch in body if ch.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for ch in letters if _CJK_RE.match(ch)) * 5 >= len(letters)
+
+
 def _sort_key(r):
     return (r["score"], r["timestamp"], r["id"])
 
@@ -374,12 +398,19 @@ def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None, emb
         print(f"Warning: vector search degraded (embed_query failed: {e})", file=sys.stderr)
 
     # --- keyword candidates (per table normalisation)
+    # Search improvements of 2026-11-22 (not in the spec; each can be turned off in config.json):
+    # fts_stopwords drops English function words from the keyword terms; kw_only_min_terms keeps a
+    # row that only the keywords found (cosine under vector_min_cos) out of Top matches unless it
+    # contains that many distinct query terms (it can still come back as a weak match).
+    stop = bool(cfg.get("fts_stopwords", False))
+    min_terms = int(cfg.get("kw_only_min_terms", 0) or 0)
+    q_terms = (fts_terms(query, stop), bigram_terms(query, stop)) if min_terms > 1 else None
     small = count_memories(conn) <= 2
     kw = {}   # id -> relevance
     recs = {}
     for fn in (search_fts, search_fts_bigram):
         try:
-            hits = fn(conn, query, limit=3 * limit, since=since, until=until)
+            hits = fn(conn, query, limit=3 * limit, since=since, until=until, stopwords=stop)
         except Exception as e:  # noqa: BLE001
             print(f"N3MC: keyword search failed ({type(e).__name__}: {e}); continuing without it", file=sys.stderr)
             continue
@@ -395,15 +426,30 @@ def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None, emb
         actual_cos[rec["id"]] = c
 
     floor = cfg["vector_min_cos"]
+    # cross_lang_min_cos (2026-11-22, not in the spec; 0 = off): the best vector hit written in the
+    # other script (CJK vs. not) counts as a vector match from this cosine on, below vector_min_cos.
+    # A query and a record in different languages score lower with e5 than a same-language pair.
+    cross_floor = float(cfg.get("cross_lang_min_cos", 0) or 0)
+    cross_best = None
+    if cross_floor and actual_cos:
+        q_cjk = _is_cjk_text(query)
+        other = [(c, rid) for rid, c in actual_cos.items()
+                 if c < floor and _is_cjk_text(recs[rid]["content"]) != q_cjk]
+        if other:
+            c_top, rid_top = max(other)
+            if c_top >= cross_floor:
+                cross_best = rid_top
     main, pool = [], []
     for rid, rec in recs.items():
         c_act = actual_cos.get(rid, 0.0)
         k = kw.get(rid, 0.0)
         pool.append(_as_row(rec, c_act, k, session_id, cfg, now))
-        c_main = c_act if c_act >= floor else 0.0
+        c_main = c_act if (c_act >= floor or rid == cross_best) else 0.0
         in_vec = c_main > 0.0
         if not in_vec and rid not in kw:
             continue
+        if not in_vec and q_terms and _matched_terms(rec["content"], q_terms) < min_terms:
+            continue  # keyword-only with too few query terms: stays a weak-match candidate
         main.append(_as_row(rec, c_main, k, session_id, cfg, now))
 
     # step 2: min_score on filter_score
@@ -425,7 +471,9 @@ def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None, emb
             results = [r for r in results if r.get("_version_group") or r["filter_score"] >= ratio * top]
     # step 5
     results = _collapse_identical_content(results)
-    # step 6
+    # step 6 (top_matches_max, 2026-11-22, not in the spec: a cap on Top matches only; 0 = none, the
+    # vector candidates and the weak matches still use search_result_limit)
+    strong_cap = min(limit, int(cfg.get("top_matches_max", 0) or 0) or limit)
     capped, per_turn = [], {}
     for r in results:
         t = r.get("turn_id")
@@ -434,7 +482,7 @@ def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None, emb
                 continue
             per_turn[t] = per_turn.get(t, 0) + 1
         capped.append(r)
-        if len(capped) >= limit:
+        if len(capped) >= strong_cap:
             break
     results = capped
     # step 7: weak fill

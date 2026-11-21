@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
     "search_result_limit": 20,
     "min_score": 0.2,
     "search_query_max_chars": 2000,
-    "vector_min_cos": 0.85,
+    "vector_min_cos": 0.82,
     "relative_min_score_ratio": 0.6,
     "min_results": 3,
     "pair_top_n": 3,
@@ -88,14 +88,21 @@ DEFAULT_CONFIG = {
     "reply_sim_alpha": 0.3,
     "reply_sim_floor": 0.80,
     "reply_sim_span": 0.15,
+    # Search improvements of 2026-11-22 (not in the spec; measured with eval/rag_eval_set.json and
+    # a copy of a real DB, docs/REVIEW_SCORECARD_20261122_JP.md). vector_min_cos above was 0.85.
+    "fts_stopwords": True,
+    "kw_only_min_terms": 3,
+    "top_matches_max": 5,
+    "cross_lang_min_cos": 0.80,
 }
 
 _INT_RANGES = {
     "server_port": (1, 65535), "search_result_limit": (1, 1365),
     "pair_top_n": (1, None), "pair_max_chars": (1, None), "search_query_max_chars": (1, None),
     "version_min_chars": (1, None), "min_results": (0, None),
+    "kw_only_min_terms": (0, None), "top_matches_max": (0, None),
 }
-_UNIT_KEYS = {"min_score", "vector_min_cos", "relative_min_score_ratio", "version_sim_threshold",
+_UNIT_KEYS = {"min_score", "vector_min_cos", "cross_lang_min_cos", "relative_min_score_ratio", "version_sim_threshold",
               "reply_sim_alpha", "reply_sim_floor"}
 
 _SYSTEM_PROMPT_PREFIXES = ("<task-notification>", "<agent-message from=", "<system-reminder>")
