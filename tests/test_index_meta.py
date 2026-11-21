@@ -116,3 +116,41 @@ def test_reembed_refuses_a_different_dimension(conn, cfg, monkeypatch, capsys):
     monkeypatch.setattr(n3m, "embed_passage", lambda t, name=None: [0.1] * 1024)
     assert n3m.cmd_reembed() == 1
     assert "1024-dimensional" in capsys.readouterr().err and _vec(conn, 1) == before
+
+
+def test_punct_cleanup_resumes_from_the_cursor_across_limited_calls(conn, cfg):
+    for i in range(450):
+        db.insert_memory(conn, f"i{i}", f"「記録」{i}", "2026-01-01T00:00:00+00:00", cfg["owner_id"],
+                         embedding=fake_embed(f"r{i}"))
+    conn.execute("UPDATE memories_fts SET content = '「' || content || '」'")  # every FTS row is dirty
+    conn.commit()
+    n3m._repair(conn, cfg, max_records=200)
+    assert db.get_meta(conn, "fts_punct_cursor") == "200" and db.get_meta(conn, "fts_punct_cleaned") is None
+    n3m._repair(conn, cfg, max_records=200)
+    assert db.get_meta(conn, "fts_punct_cursor") == "400"
+    n3m._repair(conn, cfg, max_records=200)
+    assert db.get_meta(conn, "fts_punct_cleaned") == "1" and db.get_meta(conn, "fts_punct_cursor") is None
+    assert conn.execute("SELECT COUNT(*) FROM memories_fts WHERE content LIKE '「%'").fetchone()[0] == 0
+
+
+def test_repair_skips_rows_deleted_or_filled_in_while_embedding(conn, cfg, monkeypatch):
+    add(conn, cfg, "will be deleted", embed=False)
+    add(conn, cfg, "filled by someone else", embed=False)
+    gone = conn.execute("SELECT id FROM memories WHERE content='will be deleted'").fetchone()[0]
+    other_rowid = conn.execute("SELECT rowid FROM memories WHERE content='filled by someone else'").fetchone()[0]
+
+    def embed_and_race(text, name=None):
+        c2 = db.get_connection()
+        if text == "will be deleted":
+            db.delete_memory(c2, gone)
+        else:
+            c2.execute("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                       (other_rowid, db.serialize_vector(fake_embed("x"))))
+            c2.commit()
+        c2.close()
+        return fake_embed(text)
+
+    monkeypatch.setattr(n3m, "embed_passage", embed_and_race)
+    n3m._repair(conn, cfg)  # must not raise UNIQUE constraint failed
+    assert conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1

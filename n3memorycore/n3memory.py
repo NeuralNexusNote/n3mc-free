@@ -523,9 +523,10 @@ def _repair(conn, cfg, max_records=None):
     else:
         _clear_notice("embed_model_mismatch")
     processed = 0
-    # --- one-time FTS punctuation clean-up (keyset batches)
+    # --- one-time FTS punctuation clean-up (keyset batches, resumable through meta.fts_punct_cursor)
     if get_meta(conn, "fts_punct_cleaned") is None:
-        last, finished = 0, True
+        last = int(get_meta(conn, "fts_punct_cursor", 0))
+        finished = True
         while True:
             rows = conn.execute(
                 "SELECT m.rowid AS rid, m.content AS c, f.content AS fc FROM memories m "
@@ -540,12 +541,14 @@ def _repair(conn, cfg, max_records=None):
                     changed += 1
                 last = r["rid"]
                 processed += 1
+            set_meta(conn, "fts_punct_cursor", last)  # same transaction as the rewrites of this batch
             conn.commit()
             if budget is not None and processed >= budget:
                 finished = False
                 break
         if finished:
             set_meta(conn, "fts_punct_cleaned", "1")
+            delete_meta(conn, "fts_punct_cursor")
             conn.commit()
     # --- one-time bigram index fill
     if get_meta(conn, "fts_bigram") is None:
@@ -582,13 +585,17 @@ def _repair(conn, cfg, max_records=None):
         try:
             for r in batch:
                 rid, did = r["rowid"], False
+                cur = conn.execute("SELECT id, content FROM memories WHERE rowid=?", (rid,)).fetchone()
+                if cur is None or not (cur["id"] == r["id"] or cur["content"] == r["content"]):
+                    continue  # deleted, or the rowid now belongs to another record
                 if conn.execute("SELECT 1 FROM memories_fts WHERE rowid=?", (rid,)).fetchone() is None:
                     conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
                                  (rid, strip_fts_punctuation(r["content"])))
                     did = True
-                    if conn.execute("SELECT 1 FROM memories_fts_bi WHERE rowid=?", (rid,)).fetchone() is None:
-                        conn.execute("INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
-                                     (rid, bigram_text(r["content"])))
+                if conn.execute("SELECT 1 FROM memories_fts_bi WHERE rowid=?", (rid,)).fetchone() is None:
+                    conn.execute("INSERT INTO memories_fts_bi(rowid, content) VALUES (?, ?)",
+                                 (rid, bigram_text(r["content"])))
+                    did = True
                 v = vecs.get(rid)
                 if v is not None and conn.execute("SELECT 1 FROM memories_vec WHERE rowid=?", (rid,)).fetchone() is None:
                     conn.execute("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
