@@ -88,8 +88,8 @@ DEFAULT_CONFIG = {
     "reply_sim_alpha": 0.3,
     "reply_sim_floor": 0.80,
     "reply_sim_span": 0.15,
-    # Search improvements of 2026-11-22 (not in the spec; measured with eval/rag_eval_set.json and
-    # a copy of a real DB, docs/REVIEW_SCORECARD_20261122_JP.md). vector_min_cos above was 0.85.
+    # Search improvements of 2026-11-22 (not in the spec; measured on the project's own test set and
+    # a copy of a real DB). vector_min_cos above was 0.85.
     "fts_stopwords": True,
     "kw_only_min_terms": 3,
     "top_matches_max": 5,
