@@ -36,7 +36,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cross_lang_min_cos` (0.80). See README "Search settings on by default". A
   `config.json` written before keeps its `vector_min_cos`; the new keys are
   added with their defaults. Writing the spec values restores the spec's search.
-  On the test set in `eval/`: right record first 31 → 38 of 50 questions,
+  On the project's test set: right record first 31 → 38 of 50 questions,
   unanswerable questions with an unrelated record 9 → 2 of 15; same-language
   right record within the first 3: 39 → 37 of 40.
 
@@ -756,8 +756,6 @@ lost data in specific Japanese / cp932 code paths.
 - **`scripts/smoke_ja.py`** — Encoding smoke-test with `--quick` mode
   (<3 s, `/health` + `/buffer` roundtrip) and full mode (adds surrogate
   Stop-hook test + pytest encoding suite).
-- **`docs/manual_smoke_ja.md`** — Operator-facing smoke procedure for
-  release / post-edit verification.
 - Specification files renamed from `v1.1.0` to `v1.2.0`:
   `N3MemoryCore_v1.2.0_Free_JP.md`, `N3MemoryCore_v1.2.0_Free_EN.md`.
 

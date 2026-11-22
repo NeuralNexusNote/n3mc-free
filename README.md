@@ -272,10 +272,10 @@ lacks one of them, it is added with the default below on the next run.
 | `top_matches_max` | `5` | At most 5 records under Top matches, so the recalled context stays short | `0` (then up to `search_result_limit`) |
 | `cross_lang_min_cos` | `0.80` | A Japanese question can find an English record and the other way round: the closest record written in the other script counts as a match from this similarity on | `0` |
 
-On the project's test set (65 questions, `eval/`), these settings and
+On the project's test set (65 questions), these settings and
 `vector_min_cos` 0.82 put the right record first for 38 of 50 questions instead
 of 31, and an unrelated record came up for 2 of 15 questions with no answer
-instead of 9. Details: `docs/REVIEW_SCORECARD_20261122_JP.md` (Japanese).
+instead of 9.
 
 These settings are not in the specification (`N3MemoryCore_v1.9.1_Free_*.md`),
 so code generated again from it does not have them. For the specification's
