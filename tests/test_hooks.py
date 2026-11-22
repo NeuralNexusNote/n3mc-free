@@ -1,7 +1,9 @@
 """Layer 4: hook-side logic (chunking, images, complete recording, --stop)."""
 import io
 import json
+import os
 import sys
+import time
 
 from n3memorycore import n3memory as n3m
 from n3memorycore.core import database as db
@@ -115,6 +117,31 @@ class TestStopIdempotency:
         monkeypatch.chdir(tmp_path)
         assert n3m.cmd_stop() == 0
         assert not (tmp_path / ".claude" / "CLAUDE.md").exists()
+
+    def test_home_folder_untouched(self, tmp_path, monkeypatch):
+        """With the current folder = the home folder, --stop creates nothing in .claude/rules/ and leaves
+        .claude/CLAUDE.md byte for byte (2026-11-22); the housekeeping still runs."""
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        claude_md = home / ".claude" / "CLAUDE.md"
+        import_line = f"@{n3m.CONTEXT_FILE}\n"
+        claude_md.write_bytes(("# mine\r\n" + import_line).encode("utf-8"))
+        before = claude_md.read_bytes()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.chdir(home)
+        old = os.path.join(n3m.MEMORY_DIR, "turn_id_old.txt")
+        open(old, "w").write("x")
+        t = time.time() - 31 * 86400
+        os.utime(old, (t, t))
+        assert n3m._cwd_is_home()
+        assert n3m.cmd_stop() == 0
+        assert not (home / ".claude" / "rules").exists()
+        assert claude_md.read_bytes() == before
+        assert not os.path.exists(old)
+        monkeypatch.chdir(tmp_path)  # any other folder: the rules file is written as before
+        n3m.cmd_stop()
+        assert (tmp_path / ".claude" / "rules" / "n3mc-behavior.md").exists()
 
     def test_rules_file_created(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
