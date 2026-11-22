@@ -125,17 +125,15 @@ There are two free N3MemoryCore builds. **If this is your first time, start with
 
 | | **N3MC Free** (this repository) | **[N3MC MCP Lite](https://github.com/NeuralNexusNote/n3mcmcp-lite)** |
 |---|---|---|
-| Works with | Claude Code only | MCP clients: Claude Code, Claude Desktop, Cursor, Windsurf, … |
-| What gets saved | Every message and reply, automatically (hooks) | What the AI decides to save (`save_memory`) |
+| Works with | Claude Code only | Claude Code (hooks), and the Claude desktop app and other MCP clients (MCP) |
+| What gets saved | Every message and reply, automatically (hooks) | In Claude Code, every message and reply (hooks); in other applications, what the AI decides to save (`save_memory`) |
 | How long it is kept | No expiry | 7 days, then deleted automatically |
-| What you need | Python 3.10+ | Python 3.10+, Docker (Redis Stack), and the MCP client settings |
-| Setup | `pip install n3memorycore-free`, then `n3mc --init` | Start Redis Stack, install, then register the server in your MCP client |
-| Good for | Beginners; long-term memory for Claude Code | Users who know MCP and Docker; short-lived working memory for a project |
+| What you need | Python 3.10+ | Python 3.10+ and Docker (Redis Stack) |
+| Setup | `pip install n3memorycore-free`, then `n3mc --init` | Start Redis Stack, then `pip install n3memorycore-mcp-lite` and `n3mc-lite --init` (or the Claude Code plugin); other applications register the MCP entry |
+| Good for | Beginners; long-term memory for Claude Code | Users who can run Docker; short-lived working memory for a project, shared with the Claude desktop app |
 
 - **Choose Free** if you use Claude Code and want it to remember your conversations without extra software.
-- **Choose Lite** if you use another MCP client (Claude Desktop, Cursor, …), or you want memory that forgets by itself after a short project, and you are comfortable starting Docker and editing MCP settings.
-
-> The Lite column describes the published Lite 1.x. **Lite v2.0.0** (specified, not released yet) changes it: in Claude Code it saves every message and reply through hooks, like Free, and other applications such as the Claude desktop app keep using MCP; it still needs Docker (Redis Stack) and forgets after 7 days.
+- **Choose Lite** if you also use the Claude desktop app or another MCP client (Cursor, …), or you want memory that forgets by itself after a short project, and you are comfortable starting Docker.
 
 **Free is not the right tool if:**
 
