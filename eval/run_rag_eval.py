@@ -50,8 +50,8 @@ def build(m, data, conn, cfg):
     def save_turn(q, a):
         tid = str(uuid.uuid4())
         for role, text in (("user", q), ("claude", a)):
-            for rec in add_chunk_prefixes(chunk_text(text, 400, 40), role):
-                m._do_buffer(conn, cfg, rec, "claude-code", session_id="eval-store", turn_id=tid)
+            for rec in add_chunk_prefixes(role, chunk_text(text, 400, 40)):
+                m._store_record(conn, cfg, rec, "claude-code", None, "eval-store", tid)
         return tid
 
     for f in data["facts"]:
@@ -87,7 +87,7 @@ def evaluate(data, conn, cfg, turns, verbose=False):
             ver_ok = exp in pos and (old not in pos or pos[exp] < pos[old])
         ok_turns = {exp, turns.get(q["expect"] + "@old")}
         noise = sum(r.get("turn_id") not in ok_turns for r in strong)
-        ctx = len(render_memory_context(res, q["q"]))
+        ctx = len(render_memory_context(q["q"], res["results"], res["pairs"], res["pairs_omitted"]))
         rows.append({"q": q["q"], "kind": q["kind"], "rank": rank, "reach": reach, "ctx": ctx,
                      "ver_ok": ver_ok, "n_strong": len(strong), "noise": noise,
                      "top": (turn_name.get(strong[0].get("turn_id"), "distractor"),
@@ -104,7 +104,7 @@ def evaluate(data, conn, cfg, turns, verbose=False):
             return r.get("turn_id") in rel_turns or any(t in r["content"] for t in rel_text)
         unrel = [r for r in strong if not related(r)]
         fa.append({"q": q["q"], "n_strong": len(strong), "noise": len(unrel),
-                   "ctx": len(render_memory_context(res, q["q"])),
+                   "ctx": len(render_memory_context(q["q"], res["results"], res["pairs"], res["pairs_omitted"])),
                    "top": strong[0]["content"][:50] if strong else None,
                    "unrel_top": unrel[0]["content"][:50] if unrel else None})
 
@@ -170,8 +170,8 @@ def main():
 
     with open(os.path.join(HERE, "rag_eval_set.json"), encoding="utf-8") as f:
         data = json.load(f)
-    cfg = m.load_config()
-    conn = m._db()
+    cfg = m.get_config()
+    conn = m._open_db()
     turns_file = os.path.join(home, "eval_turns.json")
     if a.home and os.path.exists(turns_file):
         with open(turns_file, encoding="utf-8") as f:

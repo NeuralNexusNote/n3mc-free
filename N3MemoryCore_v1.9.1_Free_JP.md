@@ -93,13 +93,15 @@ Claude Codeに「一生モノの資産」となる長期記憶を実装せよ。
 >
 > このメッセージは初心者向けに書け。1 つの手順に 1 つの操作、やさしい言葉で書き、サインアウト(または再起動)が必要なことをはっきり伝えよ。
 >
-> Python を自分でインストールしてはならない。ソフトウェアのインストールは利用者に任せる。
+> Python 本体を自分でインストールしてはならない。入れたあとは、利用者が Windows からサインアウトする(または PC を再起動する)まで Claude Code から見えず、このセッションのまま続けられないためである。Python のパッケージ(下の `pip install`)と、Windows の Visual C++ ランタイム(下記)は自動で入れる。どちらも再起動は要らない。
 
 > **📦 自動インストール**: 以下の `pip install` はセットアップの一部として自動実行せよ。ユーザーに手動実行を求めてはならない。
 
 ```bash
 pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
+
+> **⚠️ Windows: Visual C++ ランタイム(確認せず自動で入れる)**: `sentence-transformers` は PyTorch を使い、Windows の PyTorch には Microsoft Visual C++ 再頒布可能パッケージ(x64)が要る。無いと `torch` の読み込みに失敗する(たとえば `c10.dll` を示す `OSError: [WinError 126]` や `[WinError 1114]`)。上の `pip install` のあとで `reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Installed` で確かめよ。キーが無いか、値が `0x1` でなければ、利用者に聞かずに `winget install --id Microsoft.VCRedist.2015+.x64 --silent --accept-package-agreements --accept-source-agreements` で入れよ。Windows が管理者の確認(UAC)を出すので、許可するよう利用者に 1 行で伝えよ。あとで `import torch` が上のエラーで失敗したときも同じようにせよ。`winget` が無いときは、公式のインストーラー https://aka.ms/vs/17/release/vc_redist.x64.exe を示して待て。再起動もサインアウトも要らない。これは実行用のランタイムで、コンパイラではない。依存パッケージをソースから作るのに失敗したときの助けにはならない。
 
 > 続けて、リポジトリのルートで `pip install -e . --no-deps` を自動実行せよ。コンソールスクリプト（`n3mc`・`n3mc-hook`・`n3mc-stop-hook`）はこれで作られる。省くと `n3mc --init`（§6 の実装完了の定義）が実行できず、フックは `python -m` 形式の登録にフォールバックする。
 
@@ -137,6 +139,7 @@ n3mc-free/                       # リポジトリルート
 ├── tests/                       # pytest スイート（§7 参照）
 │   ├── __init__.py
 │   ├── conftest.py
+│   ├── test_safe_path.py        # 安全なインポートパス: 今のフォルダのファイルが N3MC の中で動かない（モデル不要、§7）
 │   ├── test_api.py
 │   ├── test_database.py
 │   ├── test_dedup_concurrent.py # 同じターンの同じ文を同時に 2 回保存する（R04。モデル不要、§7 Layer 1）
@@ -250,7 +253,7 @@ exclude = ["tests*"]
 
 ### ID 階層構造
 
-N3MemoryCore は 5 つの ID フィールドで各レコードの出所と文脈を識別する：
+N3MemoryCore は 6 つの ID フィールドで各レコードの出所と文脈を識別する：
 
 | ID | 保存場所 | 生成タイミング | 粒度 | 用途 |
 |---|---|---|---|---|
@@ -258,17 +261,22 @@ N3MemoryCore は 5 つの ID フィールドで各レコードの出所と文脈
 | `owner_id` | `config.json` | 初回起動時 (UUIDv4) | **所有者 / N3MC サーバー** | N3MC FastAPI インスタンス／データ所有者の識別 — 共有・マルチユーザーシナリオやインポート時の出所保持に使用 |
 | `session_id` | ホストから供給（フック stdin JSON） または メモリ内フォールバック | 会話単位 | **タスク / プロジェクト / 会話** | 1 つのタスク・プロジェクト・会話スレッドに属する記憶をまとめて浮上させるためのグルーピングキー。Claude Code は UserPromptSubmit / Stop フックの stdin JSON に `session_id` フィールド（会話セッション ID）を供給するため、フックはこれを `/buffer` `/search` に転送する。他のホスト（独自タスク番号、Ollama 風 UI 等）も自前のセッション識別子を API で渡せる。ホストが `session_id` を供給しない場合、または CLI 直接呼び出し（フックを介さない）の場合は、`n3memory.py` 起動時に生成された UUIDv4 にプロセス単位でフォールバックする。Free 版・Pro 版ともに `b_session` ランキングバイアスを駆動する |
 | `local_id` | `config.json` / API | 初回起動時 (UUIDv4)、またはリクエストごと | **エージェント / インストール** | 発話するエージェントの UUIDv4 識別子（1 つの Claude Code インストール = 1 つの `local_id`、同一 DB 上の異なるエージェントは別 UUID を持つ）。レコードに保存される。**Free 版では `b_local` は無効（常に 1.0）** — エージェント単位のランキング乗数は Pro 機能。下記「検索ランキングバイアス」を参照 |
+| `turn_id` | DB レコード | 利用者の発言を保存するとき (UUIDv4) | **1 往復** | 利用者の発言 1 つと、それに答える返答を結ぶ。`--hook-submit` が作り、`[user]` のチャンクに付けて `turn_id_<session>.txt` に書く。`--save-claude-turn` がそれを読んで `[claude]` のチャンクに付ける（§5「Q-A ペアリング契約」）。検索結果の Q-A の往復、`--show-turn`、`--recall-thread`、1 往復 2 チャンクまでの上限に使う。手動の `--buffer` では NULL |
 | `agent_name` | DB レコード | バッファ呼び出し時 (任意文字列) | **エージェント表示名** | エージェントの人間可読なラベル（例：`"claude-code"`）。`--buffer --agent-id <name>` オプションが設定するのは**この**フィールド（オプション名は互換のため残している。§3.7）。`local_id` を設定することはない |
 
 **階層関係：**
 
 ```
-owner_id  (1 つの N3MC サーバー / データ所有者)
-  └── session_id  (1 つのタスク / プロジェクト / 会話)
-        └── local_id  (そのセッション内で発話するエージェント)
-              ├── agent_name  (その表示名: "claude-code" 等)
-              └── id  (1 件の記憶レコード)
+owner_id  (データフォルダ ~/.n3mc とその持ち主: config.json、初回起動時)
+  └── local_id  (インストール: config.json、初回起動時。どのセッションでも同じ)
+        └── session_id  (Claude Code の 1 つの会話。フックが渡す。ないときはプロセスごとの UUIDv4)
+              └── turn_id  (1 往復: 利用者の発言 1 つと、その返答)
+                    └── id  (1 件のレコード = 1 チャンク、UUIDv7)
+
+agent_name  (表示用のラベル。階層の外にある。フックは "claude-code")
 ```
+
+`local_id` はセッションごとのエージェントではない。`config.json` に 1 回だけ書かれ、フックと CLI は送らないので、1 つのインストールのレコードはすべて同じ値を持つ（API の呼び出し側は、要求ごとに自分の `local_id` を渡せる）。長い発言は、同じ `turn_id` を持つ複数の `id` のレコードになる。Free では 1 つのインストールに DB が 1 つなので、`owner_id` と `local_id` はそれぞれ 1 つの値のままである。レコードを見分けるのに役立つのは、ほかの DB のレコードを取り込むとき（Pro）だけである。
 
 **検索ランキングバイアス（Free 版）：**
 - `session_id` 一致 → `b_session = 1.0`（不一致または NULL: `0.6`）— **タスク／プロジェクト単位で会話をまとめる**ことで、進行中のやり取りに属する記憶が無関係な過去セッションの記憶より上位に来る。Free 版では類似度・新鮮度に次ぐ主要ランキングシグナル。
@@ -876,11 +884,11 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 `/repair` 内の一括マイグレーション（ベクトル再インデックス・FTS 句読点クリーニング）は **200 件ずつバッチ処理**で実行する。大規模 DB でのメモリ枯渇を防止するため、`fetchall()` ではなく `LIMIT 200` でフェッチする。**`OFFSET` は常に `0` に固定すること**——修復済みレコードは `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` の結果セットから自動的に消えるため、`OFFSET` をバッチごとに加算すると残りの未修復レコードをスキップしてしまう（例：400 件未修復 → 200 件修復 → `OFFSET 200` で 0 件ヒット → 残り 200 件が永久に未修復になる）。各バッチで 1 件も修復できなかった場合（埋め込みモデル利用不可等）は無限ループを防ぐために即時終了する。
 
-**埋め込みの間は書き込みのロックを持たない（2026-11-18 の最終レビュー、F11）**：ベクトルの修復は、バッチ全体の埋め込みを先に、トランザクションの外で計算し（開いているものは先にコミットする）、そのあとでバッチの `memories_vec` / `memories_fts` / `memories_fts_bi` の行を入れてコミットする — `--reembed` と同じ順序。（それまでは、最初の `INSERT … memories_vec` が書き込みのトランザクションを開き、バッチの残り — 最大 200 件 — を埋め込む間ずっと開いたままだった。その間に届いた `/buffer` は busy timeout まで待って `database is locked` で失敗し、`_buffer_direct` への切り替えも同じく失敗して、質問が保存されなかった。60 件と、1 件 0.25 秒の代役のモデルで再現した。）
+**埋め込みの間は書き込みのロックを持たない（2026-11-18 の最終レビュー、F11）**：ベクトルの修復は、バッチ全体の埋め込みを先に、トランザクションの外で計算し（開いているものは先にコミットする）、そのあとでバッチの `memories_vec` / `memories_fts` / `memories_fts_bi` の行を入れてコミットする — `--reembed` と同じ順序。（それまでは、最初の `INSERT … memories_vec` が書き込みのトランザクションを開き、バッチの残り — 最大 200 件 — を埋め込む間ずっと開いたままだった。その間に届いた `/buffer` は busy timeout まで待って `database is locked` で失敗し、`_buffer_direct` への切り替えも同じく失敗して、質問が保存されなかった。60 件と、1 件 0.25 秒の代役のモデルで再現した。）**書き込む前にもう一度確かめる（2026-11-20）**: 埋め込みのあと、`BEGIN IMMEDIATE` で書き込みのロックを取ってから、バッチの行ごとに、`memories` の行がまだあって同じ記録であること（`id` か `content` が同じ）、`memories_fts` / `memories_fts_bi` / `memories_vec` にその rowid の行がまだないことを確かめ、足りないものだけを書く。ほかの呼び出し（別のウィンドウのフック、手動の `--repair`）が埋め終えた行や、消された行は飛ばす。（それまでは、2 つの呼び出しが同じ未修復の行を読むと、あとの方が `UNIQUE constraint failed on memories_vec primary key` で止まった（2026-11-20、N3MC Pro の生成コードのレビューで再現）。）
 
 **フックからの呼び出しごとの上限（v1.5.0）**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。
 
-ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。
+ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。**続きから始める（2026-11-20）**: 終えた最後の rowid を `meta` のキー `fts_punct_cursor` に、各回の書き直しと同じトランザクションで書く。次の呼び出しは rowid 0 からではなく、その次から始める（`max_records` 付きの呼び出しが続いても、プロセスを起動し直しても進む）。最後まで読み終えたら `fts_punct_cleaned` を書き、`fts_punct_cursor` を消す。（それまでは、上限付きの呼び出しが毎回 rowid 0 から始まり、201 行目に届かず、マーカーも書かれなかった（2026-11-20、N3MC Pro の生成コードのレビューで再現）。）
 
 ### 索引の情報（`meta` 表）と `--reembed`（v1.8.0）
 
@@ -896,6 +904,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 | `embed_dim` | `memories_vec` の次元（`768`） | 同上 |
 | `embed_model_at` | `embed_model` を書いた時刻（UTC の ISO 8601） | 同上 |
 | `fts_punct_cleaned` | FTS の句読点クリーニングが終わったら `1` | `/repair` |
+| `fts_punct_cursor` | FTS の句読点クリーニングが終えた最後の rowid。終わったら消す（2026-11-20） | `/repair` |
 | `fts_bigram` | 古い行の `memories_fts_bi` を埋め終わったら `1` | `/repair` |
 | `reembed_model`、`reembed_cursor` | 終わっていない `--reembed` の進み具合 | `--reembed`（終わったら消す） |
 
@@ -1460,7 +1469,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   2. `python -m n3memorycore.n3memory --stop` — AI 行動指針の用意と旧 memory_context の片付け（§4「`--stop` フック仕様」参照）。
 
   1ターンあたりの合計サブプロセス数: `UserPromptSubmit` × 1（`--hook-submit`）+ `Stop` × 2（`--save-claude-turn` + `--stop`）= 3 回。
-- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを double LEFT JOIN で確認）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する（`memories_fts` に入れ、`memories_fts_bi` の行もなければそこにも入れる）。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。**修復が 2 つ同時に動くとき（2026-11-20 の 2 回目のレビュー）**：埋め込みは書き込みのトランザクションの外で計算する（F11）ので、2 つの修復（2 つのチャット、フックと `--repair`）が同じ行を選ぶことがある。各バッチの書き込みは `BEGIN IMMEDIATE` の中で行い、行ごとに、その中で `memories_fts` の行と `memories_vec` の行がもうあるかを確かめ直し、まだないものだけを入れる。これがないと、後の修復が `UNIQUE constraint failed on memories_vec primary key` で失敗した（再現。記録は失われなかった）。
+- **【実装仕様】未ベクトル化データの検出**: `memories` テーブルに存在するが `memories_vec` **または** `memories_fts` に存在しないレコードを未インデックスデータとして検出する（両インデックスを確認する。`m.rowid NOT IN (SELECT rowid FROM memories_vec)` と書き、`memories_fts` も同じ形にする。**`memories_vec` との LEFT JOIN にはしない**。結合の中では、sqlite-vec は vec0 の表を `memories` の 1 行ごとに引く。ファイルの DB では 1 件あたり約 0.5 ms かかるので、確認の時間が件数に比例して伸びた(1,600 件で 0.5 秒、2 万件で約 10 秒)。`--hook-submit` は発言のたびに `/repair` を呼ぶので、直すものがなくても毎回の発言がそれだけ待たされた(2026-11-22 に発見)。`NOT IN` の副問い合わせは 1 回だけ読まれる。1,600 件で 3.6 ms になり、見つかる行は結合と同じ）。vec が欠損するレコードに対して埋め込みを生成し、fts が欠損するレコードに対して FTS に再挿入する（`memories_fts` に入れ、`memories_fts_bi` の行もなければそこにも入れる）。また、初回実行時のみ FTS 句読点クリーニング（§3「FTS 句読点除去」参照）を実行する。修復件数が1件以上の場合のみ警告を出力する。**件数（2026-11-16 に発見）**: `/repair` の応答の `count` と警告の件数は、この呼び出しで実際に変更したレコードの数（FTS の行を清掃または再挿入した、ベクトルを追加した）。調べたが変更しなかったレコード（埋め込みを計算できず、FTS の行はすでにある）は数えない。この決まりの前は調べたレコードをすべて数えていたため、埋め込みモデルが使えない間、呼び出しのたびに `Repaired N record(s)` と報告しながら 1 件も修復していなかった。**修復が 2 つ同時に動くとき（2026-11-20 の 2 回目のレビュー）**：埋め込みは書き込みのトランザクションの外で計算する（F11）ので、2 つの修復（2 つのチャット、フックと `--repair`）が同じ行を選ぶことがある。各バッチの書き込みは `BEGIN IMMEDIATE` の中で行い、行ごとに、その中で `memories_fts` の行と `memories_vec` の行がもうあるかを確かめ直し、まだないものだけを入れる。これがないと、後の修復が `UNIQUE constraint failed on memories_vec primary key` で失敗した（再現。記録は失われなかった）。
 ### 5.3 AI 行動指針
 
 - **【AI行動指針】全自動保存**: 全会話はフック（UserPromptSubmit / Stop）により自動保存される。Claude が自分で判断して `--buffer` を手動呼び出しする必要はない。**空でないユーザー発言・Claude 回答はすべて、一字一句、切り捨てなしで記録される。** 長さフィルタ（旧 `len(text) >= 10` / `>= 3`）は**廃止**、スキップパターンフィルタ（旧 `_SKIP_PATTERNS`、「ok / yes / thanks」定型応答フィルタ）も**廃止**。`ok` や `yes` のような短い応答も他と同様に記録される。
@@ -1685,7 +1694,7 @@ n3mc-free/
     └── test_index_meta.py             # Layer 5: meta 表、モデルの食い違いの通知、--reembed（v1.8.0。モデル不要）
 ```
 
-**本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。
+**本物のデータを守る（必須）**: `conftest.py` に autouse の fixture を置き、`n3memory` モジュールの `HOME_DIR`・`MEMORY_DIR`・`DB_PATH`・`PID_FILE`・`AUDIT_LOG`・`NOTICES_FILE`・`CONFIG_FILE`・`TURN_ID_FILE`・`SERVER_LOG` とサーバー起動のマーカー — **およびフックのモジュール**（`n3mc_hook`・`n3mc_stop_hook`）**の `AUDIT_LOG`** — を一時フォルダに向け、`--init` が使うユーザーの `~/.claude/settings.json` を一時ファイルに向け（例: テストで `HOME` / `USERPROFILE` を設定する）、`_request_shutdown` と HTTP の送信（`_post`・`_get`）を本物のサーバーに届かない偽物に差し替えること。テストが本物の `~/.n3mc` の `notices.json`・`audit.log` に書いたり、本物のサーバー（18520）に `/shutdown` を送ったりしてはならない。 **HOME を差し替えると Hugging Face のキャッシュの場所も変わり、`TestEmbedding` などが埋め込みモデル（約 470 MB）をテストごとに一時フォルダへダウンロードし直す。** fixture で `HF_HOME` を、差し替える前の本物のキャッシュ（`HF_HOME` が設定済みならその値、なければ `~/.cache/huggingface`）に固定すること。
 
 標準的なフィクスチャインポート:
 

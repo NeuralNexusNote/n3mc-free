@@ -93,13 +93,15 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 >
 > Write this message for a beginner: one action per step, plain words, and say clearly that the sign-out (or restart) is required.
 >
-> Do not install Python yourself; installing software is left to the user.
+> Do not install Python itself: after it is installed, Claude Code does not see it until the user signs out of Windows (or restarts the PC), so this session could not go on. The Python packages (the `pip install` below) and, on Windows, the Visual C++ runtime (below) are installed automatically: neither needs a restart.
 
 > **📦 Auto-install**: Run the following `pip install` automatically as part of setup. Do not ask the user to run it manually.
 
 ```bash
 pip install fastapi uvicorn pydantic sqlite-vec sentence-transformers uuid7 psutil
 ```
+
+> **⚠️ Windows: Visual C++ runtime (install automatically, do not ask)**: `sentence-transformers` uses PyTorch, which on Windows needs the Microsoft Visual C++ Redistributable (x64). Without it, importing `torch` fails (for example `OSError: [WinError 126]` or `[WinError 1114]` naming `c10.dll`). After the `pip install` above, check `reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Installed`. If the key is missing or not `0x1`, install it without asking: `winget install --id Microsoft.VCRedist.2015+.x64 --silent --accept-package-agreements --accept-source-agreements`. Windows shows its administrator prompt (UAC); tell the user in one line to approve it. Do the same if `import torch` later fails with one of the errors above. If `winget` is not available, show the user the official installer https://aka.ms/vs/17/release/vc_redist.x64.exe and wait. No restart or sign-out is needed. This is a runtime, not a compiler: it does not help when a dependency fails to build from source.
 
 > Then run `pip install -e . --no-deps` at the repository root, also automatically. This is what creates the console scripts (`n3mc`, `n3mc-hook`, `n3mc-stop-hook`). Without it `n3mc --init` (the definition of done in §6) cannot run, and the hooks fall back to the `python -m` form.
 
@@ -137,6 +139,7 @@ n3mc-free/                       # Repository root
 ├── tests/                       # pytest suite (see §7)
 │   ├── __init__.py
 │   ├── conftest.py
+│   ├── test_safe_path.py        # Safe import path: files in the current folder do not run inside N3MC (no model needed, §7)
 │   ├── test_api.py
 │   ├── test_database.py
 │   ├── test_dedup_concurrent.py # two saves of the same text for the same turn at once (R04; no model needed, §7 Layer 1)
@@ -250,7 +253,7 @@ exclude = ["tests*"]
 
 ### ID Hierarchy
 
-N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
+N3MemoryCore uses 6 ID fields to identify the origin and context of each record:
 
 | ID | Stored in | Generated | Granularity | Purpose |
 |---|---|---|---|---|
@@ -258,17 +261,22 @@ N3MemoryCore uses 5 ID fields to identify the origin and context of each record:
 | `owner_id` | `config.json` | First startup (UUIDv4) | **Owner / N3MC server** | Identifies the N3MC FastAPI instance / data owner — used for shared/multi-user scenarios and import provenance |
 | `session_id` | Supplied by host (hook stdin JSON) or in-memory fallback | Per conversation | **Task / project / conversation** | Groups memories that belong to one task, project, or conversation thread so they surface together. Claude Code supplies a `session_id` field (its conversation session ID) in the UserPromptSubmit / Stop hook stdin JSON; the hook forwards it to `/buffer` and `/search`. Other hosts can pass their own identifier the same way (n3memory-lite task numbers, an Ollama-style chat picker, etc.). When the host does not supply a `session_id` — or for direct CLI calls outside a hook — fall back to a UUIDv4 generated at `n3memory.py` startup (per-process). Drives the `b_session` ranking bias in Free and Pro |
 | `local_id` | `config.json` / API | First startup (UUIDv4), or per request | **Agent / install** | UUIDv4 identifier for the speaking agent (one Claude Code install = one `local_id`; different agents on the same DB get different UUIDs). Stored on every record. **In Free, `b_local` is unused (always 1.0)** — the per-agent ranking multiplier is a Pro feature; see "Search ranking bias" below |
+| `turn_id` | DB record | When the user's message is saved (UUIDv4) | **One exchange** | Ties one user message to the reply that answers it: `--hook-submit` makes it, saves the `[user]` chunks with it and writes it to `turn_id_<session>.txt`; `--save-claude-turn` reads it and puts it on the `[claude]` chunks (§5 "Q-A Pairing Contract"). Used for the Q-A exchanges in the search output, `--show-turn`, `--recall-thread` and the cap of 2 chunks per exchange. NULL for a manual `--buffer` |
 | `agent_name` | DB record | Per buffer call (free-form string) | **Agent display name** | Human-readable label for the agent (e.g. `"claude-code"`). The `--buffer --agent-id <name>` option sets **this** field (the option name is kept for compatibility, §3.7); it never sets `local_id` |
 
 **Hierarchy relationship:**
 
 ```
-owner_id  (one N3MC server / data owner)
-  └── session_id  (one task / project / conversation)
-        └── local_id  (the speaking agent within that session)
-              ├── agent_name  (its display name: "claude-code", etc.)
-              └── id  (one memory record)
+owner_id  (the data folder ~/.n3mc and its owner: config.json, first startup)
+  └── local_id  (the install: config.json, first startup; the same in every session)
+        └── session_id  (one Claude Code conversation, from the hook; else a per-process UUIDv4)
+              └── turn_id  (one exchange: one user message and the reply to it)
+                    └── id  (one record = one chunk, UUIDv7)
+
+agent_name  (a display label, outside the hierarchy: "claude-code" for the hooks)
 ```
+
+`local_id` is not a per-session agent: it is written to `config.json` once, and the hooks and the CLI never send one, so every record of an install carries the same value (an API client may pass its own `local_id` per request). A long message becomes several `id` records that share one `turn_id`. In Free, one install has one DB, so `owner_id` and `local_id` each keep one value; they tell records apart only when records from another DB are brought in (Pro).
 
 **Search ranking bias (Free edition):**
 - `session_id` match → `b_session = 1.0` (mismatch or NULL: `0.6`) — **groups conversation by task / project**, so memories from the ongoing exchange rank above unrelated past sessions. This is Free's primary ranking signal beyond similarity and freshness.
@@ -878,11 +886,11 @@ At server startup (`lifespan`), run the full `PRAGMA integrity_check` exactly on
 
 Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) execute in **batches of 200**. To prevent OOM on large DBs, fetch using `LIMIT 200` instead of `fetchall()`. **Always keep `OFFSET` at `0`** — repaired records automatically drop out of the `WHERE mv.rowid IS NULL OR mf.rowid IS NULL` result set, so incrementing `OFFSET` across batches would skip the remaining unrepaired records (e.g., 400 unrepaired → 200 repaired → `OFFSET 200` returns 0 rows → remaining 200 permanently skipped). Exit immediately if a batch produces zero progress (e.g., embedding model unavailable) to prevent infinite loops.
 
-**No write lock while embedding (final review of 2026-11-18, F11)**: the vector repair computes the embeddings of the whole batch first, outside any transaction (an open one is committed before), and only then inserts the batch's `memories_vec` / `memories_fts` / `memories_fts_bi` rows and commits — the same order as `--reembed`. (Until then the first `INSERT … memories_vec` opened the write transaction, which stayed open while the rest of the batch — up to 200 records — was embedded; a `/buffer` that arrived meanwhile waited for the busy timeout and failed with `database is locked`, and so did its `_buffer_direct` fallback, so the prompt was not saved. Reproduced with 60 records and a stand-in model of 0.25 s per record.)
+**No write lock while embedding (final review of 2026-11-18, F11)**: the vector repair computes the embeddings of the whole batch first, outside any transaction (an open one is committed before), and only then inserts the batch's `memories_vec` / `memories_fts` / `memories_fts_bi` rows and commits — the same order as `--reembed`. (Until then the first `INSERT … memories_vec` opened the write transaction, which stayed open while the rest of the batch — up to 200 records — was embedded; a `/buffer` that arrived meanwhile waited for the busy timeout and failed with `database is locked`, and so did its `_buffer_direct` fallback, so the prompt was not saved. Reproduced with 60 records and a stand-in model of 0.25 s per record.) **Check again before writing (2026-11-20)**: after the embeddings, take the write lock with `BEGIN IMMEDIATE`, and for each row of the batch check that the `memories` row still exists and is the same record (same `id` or `content`) and that `memories_fts` / `memories_fts_bi` / `memories_vec` still have no row for that rowid; write only what is missing. Rows another call (a hook in another window, a manual `--repair`) has filled meanwhile, and rows deleted meanwhile, are skipped. (Before, when two calls read the same unrepaired row, the later one stopped with `UNIQUE constraint failed on memories_vec primary key` (2026-11-20, reproduced in the review of N3MC Pro's generated code).)
 
 **Per-call limit for hooks (v1.5.0)**: `/repair` accepts an optional body `{"max_records": int}`. `--hook-submit` sends `{"max_records": 200}` (one batch), so a large backlog — e.g. many records saved through `_buffer_direct` while another folder's server held the port — is worked off a batch per turn instead of blocking one prompt for minutes. `n3mc --repair` sends no limit and processes everything. The one-time migrations (FTS punctuation cleaning, vector re-index) follow the same limit; their markers are written only when the migration has finished.
 
-The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`.
+The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`. **Carry on where the last call stopped (2026-11-20)**: write the last rowid done to the `meta` key `fts_punct_cursor` in the same transaction as each batch's rewrites; the next call starts after it, not at rowid 0 (so calls with `max_records` keep moving on, also across restarts). When the last row has been read, write `fts_punct_cleaned` and delete `fts_punct_cursor`. (Before, every call with a limit started again at rowid 0, never reached row 201, and never wrote the marker (2026-11-20, reproduced in the review of N3MC Pro's generated code).)
 
 ### Index metadata (`meta` table) and `--reembed` (v1.8.0)
 
@@ -898,6 +906,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 | `embed_dim` | dimension of `memories_vec` (`768`) | same |
 | `embed_model_at` | when `embed_model` was written (UTC ISO 8601) | same |
 | `fts_punct_cleaned` | `1` when the FTS punctuation cleaning has finished | `/repair` |
+| `fts_punct_cursor` | The last rowid the FTS punctuation cleaning has done; deleted when it finishes (2026-11-20) | `/repair` |
 | `fts_bigram` | `1` when `memories_fts_bi` has been filled for older rows | `/repair` |
 | `reembed_model`, `reembed_cursor` | progress of an unfinished `--reembed` | `--reembed` (removed when it finishes) |
 
@@ -1462,7 +1471,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   2. `python -m n3memorycore.n3memory --stop` — prepares the AI behavioral guidelines and cleans up the old memory_context (see §4 "`--stop` Hook Specification").
 
   Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (`--save-claude-turn` + `--stop`) = 3 calls.
-- **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (double LEFT JOIN checking both indexes). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records (into `memories_fts`, and into `memories_fts_bi` when its row is missing too). Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired. **`count` (found 2026-11-16)**: the `count` of the `/repair` response and of the warning is the number of records this call actually changed — an FTS row cleaned or re-inserted, or a vector added. A record that was looked at but not changed (its embedding could not be computed and its FTS row was already there) is not counted. Before this rule the code counted every record it looked at, so while the embedding model was unavailable each call reported `Repaired N record(s)` and repaired none. **Two repairs at once (second review of 2026-11-20)**: the embeddings are computed outside any write transaction (F11), so two repairs (two chats, a hook and `--repair`) may pick the same rows. Write each batch inside `BEGIN IMMEDIATE` and, for every row, check again there whether its `memories_fts` row and its `memories_vec` row already exist; insert only what is still missing. Without this the second repair failed with `UNIQUE constraint failed on memories_vec primary key` (reproduced; nothing was lost).
+- **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (both indexes checked, written as `m.rowid NOT IN (SELECT rowid FROM memories_vec)` and the same for `memories_fts`; **do not LEFT JOIN `memories_vec`**: in a join, sqlite-vec looks up the vec0 table once per `memories` row, about 0.5 ms per record on a file DB, so the check grew with the DB — 0.5 s at 1,600 records, about 10 s at 20,000 — and, because `--hook-submit` calls `/repair` before every prompt, every prompt waited that long even with nothing to repair (found 2026-11-22). Each `NOT IN` subquery is read once: 3.6 ms at 1,600 records, the same rows as the join). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records (into `memories_fts`, and into `memories_fts_bi` when its row is missing too). Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired. **`count` (found 2026-11-16)**: the `count` of the `/repair` response and of the warning is the number of records this call actually changed — an FTS row cleaned or re-inserted, or a vector added. A record that was looked at but not changed (its embedding could not be computed and its FTS row was already there) is not counted. Before this rule the code counted every record it looked at, so while the embedding model was unavailable each call reported `Repaired N record(s)` and repaired none. **Two repairs at once (second review of 2026-11-20)**: the embeddings are computed outside any write transaction (F11), so two repairs (two chats, a hook and `--repair`) may pick the same rows. Write each batch inside `BEGIN IMMEDIATE` and, for every row, check again there whether its `memories_fts` row and its `memories_vec` row already exist; insert only what is still missing. Without this the second repair failed with `UNIQUE constraint failed on memories_vec primary key` (reproduced; nothing was lost).
 ### 5.3 AI Behavioral Guidelines
 
 - **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. **Every non-empty user message and every non-empty Claude response is recorded in FULL, character-for-character, with no truncation.** There is no length filter (the previous `len(text) >= 10` / `>= 3` thresholds are REMOVED) and no skip-pattern filter (the previous `_SKIP_PATTERNS` "ok / yes / thanks" routine-response filter is REMOVED). Short acknowledgements such as `ok` or `yes` are now recorded like any other input.
@@ -1689,7 +1698,7 @@ n3mc-free/
     └── test_index_meta.py             # Layer 5: meta table, model mismatch notice, --reembed (v1.8.0; no model needed)
 ```
 
-**Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
+**Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520). **Replacing HOME also moves the Hugging Face cache, so `TestEmbedding` and the like would download the embedding model (about 470 MB) again into a temporary folder for every test.** Pin `HF_HOME` in the fixture to the real cache from before the replacement (the value of `HF_HOME` if it is set, otherwise `~/.cache/huggingface`).
 
 Standard fixture import style:
 

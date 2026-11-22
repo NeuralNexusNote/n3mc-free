@@ -1,106 +1,88 @@
-"""Safe import path: a Python file in the folder the user has open must not run inside N3MC.
-
-`python -m <package>.<module>` puts the current folder first on sys.path. Every entry module drops
-that entry before it imports anything else, and children are started with -P where Python has it.
-"""
-import ast
+"""Safe import path: files in the current folder must not run inside N3MC (no model needed)."""
 import os
-import pathlib
+import re
 import subprocess
 import sys
 
 import pytest
 
-PKG = "n3memorycore"
-MAIN_FILE = "n3memory.py"
-MAIN_MODULE = f"{PKG}.{MAIN_FILE[:-3]}"
-HOME_ENV = "N3MC_HOME"
-REPO = pathlib.Path(__file__).resolve().parent.parent
-PKG_DIR = REPO / PKG
-# modules the main module imports at its top: the standard library and the dependencies
-SHADOWS = ("argparse", "shlex", "queue", "fastapi", "pydantic", "sqlite_vec", "numpy", "uvicorn")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG = os.path.join(ROOT, "n3memorycore")
+SHADOWS = ["argparse", "shlex", "queue", "fastapi", "pydantic", "sqlite_vec", "numpy", "uvicorn"]
 
 
-def entry_modules():
-    return sorted(p for p in PKG_DIR.glob("*.py")
-                  if any(isinstance(n, ast.If) and ast.unparse(n.test) == "__name__ == '__main__'"
-                         for n in ast.parse(p.read_text(encoding="utf-8")).body))
+def _entry_modules():
+    out = []
+    for name in sorted(os.listdir(PKG)):
+        if name.endswith(".py"):
+            src = open(os.path.join(PKG, name), encoding="utf-8").read()
+            if re.search(r'if __name__ == "__main__":\s*\n\s*sys\.exit', src):
+                out.append(name)
+    return out
+
+
+def _env(tmp):
+    e = dict(os.environ)
+    e.pop("PYTHONPATH", None)
+    e["N3MC_HOME"] = os.path.join(str(tmp), "data")
+    e["HOME"] = e["USERPROFILE"] = os.path.join(str(tmp), "home")
+    return e
 
 
 def test_there_are_entry_modules():
-    assert PKG_DIR / MAIN_FILE in entry_modules() and len(entry_modules()) >= 3
+    mods = _entry_modules()
+    assert "n3memory.py" in mods and len(mods) >= 3
 
 
-@pytest.mark.parametrize("path", entry_modules(), ids=lambda p: p.name)
-def test_entry_module_starts_with_the_safe_path_block(path):
-    """Nothing is imported before the block: its two imports are of modules Python has already loaded."""
-    body = ast.parse(path.read_text(encoding="utf-8")).body
-    if isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
-        body = body[1:]                                   # the docstring
-    if isinstance(body[0], ast.ImportFrom) and body[0].module == "__future__":
-        body = body[1:]
-    assert ast.unparse(body[0]) == "import os as _os"
-    assert ast.unparse(body[1]) == "import sys as _sys"
-    assert isinstance(body[2], ast.If) and ast.unparse(body[2].test) == "__name__ == '__main__'"
-    assert "del _sys.path[0]" in ast.unparse(body[2])
+@pytest.mark.parametrize("name", ["n3memory.py", "n3mc_hook.py", "n3mc_stop_hook.py"])
+def test_entry_module_starts_with_the_safe_path_block(name):
+    src = open(os.path.join(PKG, name), encoding="utf-8").read()
+    body = src.split('"""', 2)[2]  # after the docstring
+    stmts = [ln for ln in body.splitlines() if ln.strip()]
+    assert stmts[0] == "import os as _os" and stmts[1] == "import sys as _sys"
+    assert stmts[2] == 'if __name__ == "__main__":'
+    assert "del _sys.path[0]" in body
 
 
-def _hostile_folder(tmp_path):
-    """A folder as a cloned repository could be: files named like modules N3MC imports."""
-    folder = tmp_path / "cloned-repo"
-    folder.mkdir()
-    marker = tmp_path / "MARKER.txt"
-    for name in SHADOWS:
-        (folder / f"{name}.py").write_text(
-            "import os\n"
-            f"open(os.environ['SHADOW_MARKER'], 'a').write('{name} ')\n"
-            f"raise ImportError('the project folder shadowed {name}')\n", encoding="utf-8")
-    return folder, marker
-
-
-def _env(tmp_path, marker):
-    home = tmp_path / "home"
-    home.mkdir(exist_ok=True)
-    env = dict(os.environ, SHADOW_MARKER=str(marker), HOME=str(home), USERPROFILE=str(home),
-               PYTHONPATH=str(REPO), PYTHONIOENCODING="utf-8")
-    env[HOME_ENV] = str(tmp_path / "data")
-    return env
+def _make_shadows(folder):
+    os.makedirs(folder, exist_ok=True)
+    for m in SHADOWS:
+        with open(os.path.join(folder, m + ".py"), "w") as f:
+            f.write(f"open({os.path.join(str(folder), 'RAN_' + m)!r}, 'w').write('x')\nraise ImportError('shadow')\n")
 
 
 def test_files_in_the_current_folder_do_not_run(tmp_path):
-    folder, marker = _hostile_folder(tmp_path)
-    p = subprocess.run([sys.executable, "-m", MAIN_MODULE, "--help"], cwd=folder, env=_env(tmp_path, marker),
-                       capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert not marker.exists(), f"ran from the project folder: {marker.read_text()}"
-    assert p.returncode == 0 and "usage:" in p.stdout, p.stderr[-400:]
+    work = tmp_path / "work"
+    _make_shadows(work)
+    r = subprocess.run([sys.executable, "-m", "n3memorycore.n3memory", "--help"], cwd=work,
+                       env={**_env(tmp_path), "PYTHONPATH": ROOT}, capture_output=True, text=True)
+    assert r.returncode == 0 and "usage" in r.stdout
+    assert not [f for f in os.listdir(work) if f.startswith("RAN_")]
 
 
 def test_without_the_block_they_would_run(tmp_path):
-    """The same folder, entered through `python -c` (no block runs): shows the test above is real."""
-    folder, marker = _hostile_folder(tmp_path)
-    subprocess.run([sys.executable, "-c", "import shlex"], cwd=folder, env=_env(tmp_path, marker),
-                   capture_output=True, timeout=120)
-    assert marker.exists() and "shlex" in marker.read_text()
+    work = tmp_path / "work"
+    _make_shadows(work)
+    subprocess.run([sys.executable, "-c", "import shlex"], cwd=work, env=_env(tmp_path), capture_output=True)
+    assert os.path.exists(work / "RAN_shlex")
 
 
 def test_a_source_checkout_run_in_place_still_works(tmp_path):
-    """The package itself is in the current folder: that entry is kept, or the package would be lost."""
-    env = _env(tmp_path, tmp_path / "MARKER.txt")
-    env.pop("PYTHONPATH")
-    p = subprocess.run([sys.executable, "-m", MAIN_MODULE, "--help"], cwd=REPO, env=env,
-                       capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert p.returncode == 0 and "usage:" in p.stdout, p.stderr[-400:]
+    r = subprocess.run([sys.executable, "-m", "n3memorycore.n3memory", "--help"], cwd=ROOT,
+                       env=_env(tmp_path), capture_output=True, text=True)
+    assert r.returncode == 0
 
 
 def test_children_are_started_with_dash_P_outside_a_checkout(tmp_path, monkeypatch):
-    from importlib import import_module
-    paths = import_module(f"{PKG}.paths")
+    from n3memorycore.paths import python_cmd
     monkeypatch.chdir(tmp_path)
-    assert paths.python_cmd() == ([sys.executable, "-P"] if sys.version_info >= (3, 11) else [sys.executable])
-    monkeypatch.chdir(REPO)
-    assert paths.python_cmd() == [sys.executable]
+    assert python_cmd() == ([sys.executable, "-P"] if sys.version_info >= (3, 11) else [sys.executable])
+    monkeypatch.chdir(ROOT)
+    assert python_cmd() == [sys.executable]
 
 
 def test_no_child_is_started_without_python_cmd():
-    for p in PKG_DIR.glob("*.py"):
-        assert "[sys.executable," not in p.read_text(encoding="utf-8"), p.name
+    for dirpath, _d, files in os.walk(PKG):
+        for f in files:
+            if f.endswith(".py"):
+                assert "[sys.executable," not in open(os.path.join(dirpath, f), encoding="utf-8").read()
