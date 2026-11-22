@@ -709,10 +709,52 @@ class TestDbCorrupt:
         assert n3m._buffer_direct("[user] after corruption")["status"] == "ok"
 
 
+class TestSaveFailedNotice:
+    """A save through the server that ends ok / skipped clears save_failed (2026-11-22, F2)."""
+
+    def _keys(self):
+        if not os.path.exists(n3m.NOTICES_FILE):
+            return set()
+        return set(json.load(open(n3m.NOTICES_FILE, encoding="utf-8")))
+
+    @pytest.mark.parametrize("status", ["ok", "skipped"])
+    def test_server_save_clears_save_failed(self, monkeypatch, status):
+        n3m._notify("save_failed", "A record could not be saved (test).")
+        assert "save_failed" in self._keys()
+        monkeypatch.setattr(n3m, "_use_server", lambda: True)
+        monkeypatch.setattr(n3m, "_post", lambda path, body, *a, **k: {"status": status, "count": 1})
+        assert n3m._save_record("[user] hello", turn_id="T1")["status"] == status
+        assert "save_failed" not in self._keys()
+
+
 class TestInit:
     def _settings(self):
         import pathlib
         return pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
+
+    def _own(self, s, event):
+        return [h for e in s["hooks"][event] for h in e["hooks"]]
+
+    def test_hooks_carry_timeout_120(self):
+        """Both entries carry "timeout": 120 and a re-run adds nothing (2026-11-22, F1)."""
+        n3m.cmd_init()
+        n3m.cmd_init()
+        s = json.loads(self._settings().read_text(encoding="utf-8"))
+        for event in ("UserPromptSubmit", "Stop"):
+            hs = self._own(s, event)
+            assert len(hs) == 1 and hs[0]["timeout"] == 120
+
+    def test_old_entry_without_timeout_is_replaced(self):
+        sp = self._settings()
+        sp.parent.mkdir(parents=True)
+        sp.write_text(json.dumps({"hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "C:/Tools/n3mc-hook.exe"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "python -m n3memorycore.n3mc_stop_hook"}]}]}}))
+        n3m.cmd_init()
+        s = json.loads(sp.read_text(encoding="utf-8"))
+        for event in ("UserPromptSubmit", "Stop"):
+            hs = self._own(s, event)
+            assert len(hs) == 1 and hs[0]["timeout"] == 120
 
     def test_fresh_install_registers_hooks_and_rules(self, capsys):
         assert n3m.cmd_init() == 0

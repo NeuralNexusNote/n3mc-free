@@ -396,7 +396,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 - **止め方（`_stop_stale_server`）**: まず `POST /shutdown`（本文 `{"root": "<自分の HOME_DIR>"}`）を頼む。v1.3.x のように `/shutdown` を持たないサーバーにだけ、psutil で確かめてからプロセスを終了する。**PID ファイルの番号では止めない**（別のプロセスに使い回されている可能性がある）。
 - **psutil での確かめ（`_is_own_server_process`）**: PID は `/health` の `pid`、それがなければポートで待ち受けているプロセス（`psutil.net_connections`）から得る。そのプロセスのコマンドラインに `n3memorycore.n3memory` と `--run-server` があり、環境変数 `N3MC_HOME` から解いたデータフォルダが自分の `HOME_DIR` と同じときだけ「自分のサーバー」とする。psutil が入っていない・権限がない・どれかが一致しない、のときは「確かめられない」。
 - 確かめられないときは止めず、「古いサーバーを止められない。同じ `server_port` を別の N3MC のフォルダが使っている可能性もある。各フォルダの `config.json` の `server_port` を確かめ、手で起動し直すこと」という知らせ（`stale_server`）を出す。自分の古いサーバー（`root` が同じ）を止められなかったときは、同じ DB を使っているので、そのまま使い続ける（`ensure_server` は True）。
-- **PID ファイルの扱い**: `/health` が応答しないとき、PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（起動中）だけ**、PID ファイルを残したまま `/health` を最大 60 秒（0.5 秒間隔）見て待つ。60 秒たってもまだ起動中なら（初回起動はモデルのダウンロードで 2〜10 分かかる）、**別のサーバーを起動せず、PID ファイルも消さない**。このコマンドはサーバーなしで進め（保存は `_buffer_direct` へ、検索は `_(memory search unavailable: the memory server is still starting)_` を出す）、次のコマンドでまた確かめる。それ以外（番号のプロセスが死んでいる、別のプロセスに使い回されている）は、待たずに PID ファイルを消して起動する。
+- **PID ファイルの扱い**: `/health` が応答しないとき、PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（起動中）だけ**、PID ファイルを残したまま `/health` を最大 60 秒（0.5 秒間隔）見て待つ。60 秒たってもまだ起動中なら（初回起動はモデルのダウンロードで 2〜10 分かかる）、**別のサーバーを起動せず、PID ファイルも消さない**。このコマンドはサーバーなしで進め（保存は `_buffer_direct` へ、検索は `_(memory search unavailable: the memory server is still starting)_` を出す）、次のコマンドでまた確かめる。この最大 60 秒の待ちはフックの中で起きるので、`--init` は 2 本のフックを `"timeout": 120` で登録する（§4「フックの制限時間」）。それ以外（番号のプロセスが死んでいる、別のプロセスに使い回されている）は、待たずに PID ファイルを消して起動する。
   - **サーバーが別のポートにいるとき（2026-11-20）**: 待つ前に、確かめたそのプロセスが、いまの `server_port` 以外のポートで待ち受けていないかを調べる（psutil で、その PID の `LISTEN` の接続）。サーバーが動いている間に利用者が `server_port` を変えると、こうなる。新しいポートの `/health` はずっと答えないので、この確認がないと、コマンドのたびに 60 秒待ち、サーバーはいつまでも起動しない。そうしたポートのうち `/health` がこのフォルダの `root` を返すものに `POST /shutdown`（本文 `{"root": "<自分の HOME_DIR>"}`）を送り、プロセスが終わるのを最大 15 秒待ち、PID ファイルがまだその PID を持っていれば消し、待たずにいまのポートでサーバーを起動する。`/health` が答えないポートや、別の `root` を返すポートには何もしない。PID ファイルの番号でプロセスを止めないことは変わらない。起動中のサーバーはまだどのポートでも待ち受けていないので、上の 60 秒の待ちはそのまま働く。
 - **psutil は必須（v1.5.0）**: 上の PID ファイルの確かめには psutil が要る。psutil がないと、v1.4.0 は起動中のサーバーを一度も確かめられず、モデルの読み込み中にコマンドのたびに PID ファイルを消して別のサーバーを起動していた（`open(..., 'x')` による防止はこの削除で効かなくなっていた）。それでも `import psutil` に失敗した場合（壊れたインストール）は、PID ファイルの更新時刻から 60 秒間は PID ファイルのプロセスをすべて「起動中」、それ以降は死んでいるものとして扱う。作られてから 60 秒未満の PID ファイルがある間は、2 つ目のサーバーを決して起動しない。
 - 自分で起動したサーバーが応答した時点で、`stale_server`・`port_conflict`・`server_start_failed` の知らせを消す。
@@ -408,6 +408,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 3. そうして早く終了したときは、知らせ `server_start_failed`（"The N3MC memory server could not start (exit code <n>). See <path of server.log> for the reason."）を出し、時刻を `.memory/server_start_failed`（マーカーファイル）に書き、PID ファイルが終了したその子プロセスの PID を持っていれば消し、サーバーなしで進める（直接保存 / `memory search unavailable`）。`Popen` そのものが例外を出したときも、サーバーなしで進む（stderr に 1 行。知らせとマーカーは書かない）。
 4. `.memory/server_start_failed` が作られてから 5 分未満の間は、サーバーの起動を試み直さず、そのままサーバーなしの処理に進む。これにより、壊れた環境でフックのたびに最大 60 秒かかることを防ぐ。サーバーが応答したらマーカーを消し、知らせも消す。
 5. 60 秒たっても子プロセスが生きていれば、まだ起動中（モデルのダウンロード）なので、そのまま動かしておき、上の「起動中」の決まりに従う。
+6. フックは `"timeout": 120` で登録する（§4「フックの制限時間」）。この最大 60 秒の待ちと、そのあとの保存が、Claude Code にフックを止められる前に終わるようにするため。
 
 > **⚠️ 理由（v1.5.0、Free v1.4.0 のレビューで見つかった）**: v1.4.0 は子プロセスを見ずに 60 秒待ち切り、その stderr を `DEVNULL` に捨てていた。ポートが別のプログラムに使われていたり、サーバーが起動時に落ちたりすると、フックのたびに 60 秒止まり、理由もどこにも残らなかった。
 
@@ -436,7 +437,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 
 テストでは `NOTICES_FILE` と `AUDIT_LOG` を必ず一時フォルダに向けること（本物の `~/.n3mc` に書かない）。
 - **応答目標**: 0.7s 前後（埋め込み生成 + DB検索の合計）。ハードウェア・OS・モデルキャッシュ状態に依存するため、達成目標として扱い厳密な要件とはしない。
-- **初回起動**: モデルのプリロードを uvicorn 起動前に実行するため、初回起動（またはモデルキャッシュ未作成時）は最大 60 秒を要する場合がある。これは仕様上の許容動作であり、2回目以降は数秒以内に起動する。
+- **初回起動**: モデルのプリロードを uvicorn 起動前に実行するため、初回に限らず、サーバーの起動には毎回時間がかかる。モデルがキャッシュ済みでも、サーバーを起動する必要があったフックは開発機で 41.2 秒かかった（2026-11-22。サーバーが動いていない状態からの `--hook-submit`。次の呼び出しは 0.9 秒）。モデルがまだキャッシュにないときは、ダウンロードに 2〜10 分かかる。フックは最大 60 秒待ち、そのあとはサーバーなしで進める（上の「PID ファイルの扱い」）。これは仕様上の許容動作であり、その待ちはフックの `"timeout": 120`（§4「フックの制限時間」）に収まる。
 
 ### SQLite 剛性設定
 接続時に以下を強制実行せよ:
@@ -1006,7 +1007,8 @@ n3mc --init
         "hooks": [
           {
             "type": "command",
-            "command": "C:/Users/you/AppData/Local/Programs/Python/Python312/Scripts/n3mc-hook.EXE"
+            "command": "C:/Users/you/AppData/Local/Programs/Python/Python312/Scripts/n3mc-hook.EXE",
+            "timeout": 120
           }
         ]
       }
@@ -1016,7 +1018,8 @@ n3mc --init
         "hooks": [
           {
             "type": "command",
-            "command": "C:/Users/you/AppData/Local/Programs/Python/Python312/Scripts/n3mc-stop-hook.EXE"
+            "command": "C:/Users/you/AppData/Local/Programs/Python/Python312/Scripts/n3mc-stop-hook.EXE",
+            "timeout": 120
           }
         ]
       }
@@ -1038,6 +1041,8 @@ import n3memorycore
 
 SETTINGS = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
 PKG_DIR = os.path.normcase(os.path.abspath(os.path.dirname(n3memorycore.__file__)))
+
+HOOK_TIMEOUT_SECONDS = 120  # 2 本のフックの項目の "timeout"（下の「フックの制限時間」）
 
 OURS = {  # イベント -> (エントリポイント名, モジュール名)
     "UserPromptSubmit": ("n3mc-hook", "n3memorycore.n3mc_hook"),
@@ -1139,7 +1144,8 @@ for event, (exe_name, _module) in OURS.items():
                 print(f"Another N3MC hook is registered for {event} and was left in place: {c}")
         if inner:
             kept.append({**entry, "hooks": inner})
-    kept.append({"hooks": [{"type": "command", "command": resolve_cmd(exe_name)}]})
+    kept.append({"hooks": [{"type": "command", "command": resolve_cmd(exe_name),
+                            "timeout": HOOK_TIMEOUT_SECONDS}]})
     hooks[event] = kept
 
 # 3. §4 ② のパーミッションのルールで足りないものを足す（何も取り除かない）。
@@ -1160,6 +1166,7 @@ if settings != before:
     os.replace(tmp, SETTINGS)
 ```
 
+- **フックの制限時間（2026-11-22）**: 2 つの項目とも `"timeout": 120`（秒）を持つ。Claude Code のドキュメントは、`timeout` がないときの既定を 600 秒とし、UserPromptSubmit では 30 秒に下げるとしている。止められたフックの出力は捨てられる。サーバーを起動する必要があったフックは、サーバーを最大 60 秒待ち（§3「PID ファイルの扱い」「サーバーの起動」）、そのあとで保存する。Stop の項目は `--save-claude-turn`（同じく最大 60 秒の待ち）のあとに `--stop` を実行する。`timeout` がないと、PC を起動して最初の発言や、サーバーを入れ替えた直後の発言（計測で 41.2 秒、§3「初回起動」）が 30 秒で止められた。検索結果が Claude に届かず、`--hook-submit` が検索のあとに保存する利用者の発言が DB に入らないおそれがあった（`audit.log` には残る）。60 秒では、待ちきったあとの保存の時間が残らないので、値は 120 とする。古い版が書いた `timeout` のない自分の項目は、`--init` をやり直すと新しい項目に置き換わる（下の決まり）。この変更より前に登録した利用者は、`n3mc --init` をもう一度実行する。
 - **どのエントリが自分のものか（決定 D1、v1.5.0）**: (a) 実行ファイルが `n3mc-hook` / `n3mc-stop-hook` のコマンド（`.exe` の拡張子は無視し、フォルダは問わない）、(b) `-m n3memorycore.n3mc_hook` / `-m n3memorycore.n3mc_stop_hook` を含むコマンド、(c) **このパッケージのフォルダから** `n3mc_hook.py` / `n3mc_stop_hook.py` を実行するコマンド、だけ。エントリポイント形と `-m` 形の両方を見分けないと、再実行のたびに重複が漏れて残る（両方の形を照合するようにする前は、実機で 4 件重複事例あり）。
 - **ほかの N3MC のフックは残す**: `n3mc_hook` を*含むだけ*のコマンド — 例えば `python ".../N3MC-Pro_Arnolf/N3MemoryCore/n3mc_hook.py"` — はほかの版のもので、残す。`--init` は `Another N3MC hook is registered for <event> and was left in place: <command>` と出す。両方が登録されていると、両方が毎ターン動く。どちらかを取り除くかはユーザーが決める。
 - **控えとアトミックな書き込み（v1.5.0）**: 既存のファイルを変える前に `~/.claude/settings.json.bak-n3mc-<YYYYmmddHHMMSS>` にコピーする。同じフォルダの一時ファイルに書いて `os.replace` で置き換える。ファイルを JSON オブジェクトとして読めない場合（または `hooks` / `permissions` / `permissions.allow` の型が違う場合）は、何も変えず、理由を出して終了ステータス 1 で終わる。
@@ -1222,10 +1229,12 @@ Claude が直接呼び出すエントリポイントは 2 系統ある。**Claud
 
 `--stop` 実行時の処理順序:
 
-**作業フォルダがホームのときは手順 1 と 2 をしない（2026-11-22）**: `<cwd>` がユーザーのホームフォルダ（`os.path.normcase(os.path.realpath(cwd)) == os.path.normcase(os.path.realpath(os.path.expanduser("~")))`）なら、`.claude/rules/n3mc-behavior.md` を作らず・変えず、`.claude/CLAUDE.md` も読まない。手順 3 はいつもどおり行い、何も出力しない。理由: ホームの `.claude/` は Claude Code のユーザー全体の設定のフォルダで、`~/.claude/rules/` の規則はすべてのプロジェクトで読み込まれる。利用者が Claude Code をホームで開いたとき（またはホームで `--stop` を手で実行したとき）に規則ファイルを書くと、すべてのプロジェクトでプロジェクトの規則ファイルと二重に読まれる。さらに、この製品をアンインストールしたあとも残り、もうないコマンドを使うよう指示し続ける（2026-11-22、開発機で起きた）。`~/.claude/CLAUDE.md` は利用者のファイルなので触れない（下の片付けの決まりと同じ）。ホームにすでにあるファイルは、読まず、消さない。
+**プロジェクトのフォルダ（`<project>`、2026-11-22）**: 手順 1 と 2 は、フックが動いているフォルダではなく、プロジェクトのフォルダで行う。`<project>` は、環境変数 `CLAUDE_PROJECT_DIR` があり、実在するフォルダを指すときはその値（Claude Code が、自分の起動するフックのコマンドに渡す。セッションを始めたプロジェクトの根。Windows ではスラッシュで書かれる。例 `C:/Users/you/work`）。なければ（`--stop` を手で実行したときなど）`<cwd>`（プロセスの作業フォルダ）。理由: フックはセッションの今の作業フォルダで動き、Claude が `cd` したあとはそのサブフォルダになる。そのため `--stop` はサブフォルダにも `.claude/rules/n3mc-behavior.md` を作っていた（2026-11-22、開発機と公開リポジトリで見つかった）。サブフォルダの規則ファイルは、Claude がそのフォルダのファイルを読むたびに、プロジェクトの規則ファイルに重ねて読み込まれ、この製品をアンインストールしたあとも残る。すでにサブフォルダにできたファイルには触れない（`--stop` は利用者のフォルダを探さない）。
 
-1. `<cwd>/.claude/rules/n3mc-behavior.md`（AI 行動指針）を用意する（`_ensure_behavior_md`、下記「AI 行動指針ファイルの版」）。
-2. `<cwd>/.claude/CLAUDE.md` に旧版が書いた memory_context の `@import` 行があれば取り除く（`_retire_memory_context`、下記）。**N3MC は CLAUDE.md に何も書き足さない。** CLAUDE.md がなければ作らない。
+**プロジェクトのフォルダがホームのときは手順 1 と 2 をしない（2026-11-22）**: `<project>` がユーザーのホームフォルダ（`os.path.normcase(os.path.realpath(project)) == os.path.normcase(os.path.realpath(os.path.expanduser("~")))`）なら、`.claude/rules/n3mc-behavior.md` を作らず・変えず、`.claude/CLAUDE.md` も読まない。手順 3 はいつもどおり行い、何も出力しない。理由: ホームの `.claude/` は Claude Code のユーザー全体の設定のフォルダで、`~/.claude/rules/` の規則はすべてのプロジェクトで読み込まれる。利用者が Claude Code をホームで開いたとき（またはホームで `--stop` を手で実行したとき）に規則ファイルを書くと、すべてのプロジェクトでプロジェクトの規則ファイルと二重に読まれる。さらに、この製品をアンインストールしたあとも残り、もうないコマンドを使うよう指示し続ける（2026-11-22、開発機で起きた）。`~/.claude/CLAUDE.md` は利用者のファイルなので触れない（下の片付けの決まりと同じ）。ホームにすでにあるファイルは、読まず、消さない。
+
+1. `<project>/.claude/rules/n3mc-behavior.md`（AI 行動指針）を用意する（`_ensure_behavior_md`、下記「AI 行動指針ファイルの版」）。
+2. `<project>/.claude/CLAUDE.md` に旧版が書いた memory_context の `@import` 行があれば取り除く（`_retire_memory_context`、下記）。**N3MC は CLAUDE.md に何も書き足さない。** CLAUDE.md がなければ作らない。
 3. 後片付け（v1.5.0）: 更新時刻が 30 日より古い `.memory/turn_id_*.txt` を削除し（Claude Code のセッションごとに 1 つ作られ、これまで一度も消されていなかった）、`audit.log` が 50 MB を超えていたらローテーションする（§5.4「audit.log の大きさと中身」）。
 4. 正常終了する。成功時は一切出力しない（沈黙）。`--stop` は DB に書かないので、物理保存の警告を出すことはない。手順 1〜3 のエラーはそれぞれ 1 行ずつ stderr に出し、終了ステータスは変えない。
 
@@ -1238,7 +1247,7 @@ v1.3.x までは、`--search` の結果を `~/.n3mc/.memory/memory_context.md` �
 - **理由**: `memory_context.md` は PC に 1 つしかなく、どのセッション・どのプロジェクトの質問でも上書きされる。新しいセッションの最初に `@import` で読み込まれるのは**別の会話の検索結果**で、毎回コンテキストを消費していた。毎ターンの記憶は UserPromptSubmit フックの**標準出力**から入るので、ファイルも `@import` も要らない。
 - **実装**: `--search` / `--hook-submit` は検索結果を **stdout にだけ**出す。`memory_context.md` を作らない・書かない。`paths.py` に `CONTEXT_FILE` 定数は残してよい（片付けにだけ使う）。
 - **片付け（`_retire_memory_context`、`--stop` のたびに実行）**:
-  1. `<cwd>/.claude/CLAUDE.md` に**このインストール自身の `CONTEXT_FILE`**（`HOME_DIR/.memory/memory_context.md`）**を指す** `@import` 行があれば、その行と、その直前に続く N3MC のコメントのまとまり（`# N3MemoryCore — …` / `# Path resolves to …` / `# If you have not yet run …`。コメントと `@import` 行の間の空行も含む）を取り除く。ファイルのほかの場所は変えない。候補の行は正規表現 `^[ \t]*@[^\n]*memory_context\.md[ \t]*$`（行単位、空白を含むパスも当たる）で探す。候補を取り除くのは、`@` のあとのパス（前後の空白を除き、`~` を展開したもの）が絶対パスで、`os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(CONTEXT_FILE))` のとき**だけ**（スラッシュとバックスラッシュは同じとみなす）。相対パス（`@../.memory/memory_context.md`）、ほかのフォルダ（`@C:/other/.memory/memory_context.md`、ほかの版のファイル）、末尾が同じなだけの名前（`@docs/notes_about_memory_context.md`）は残す。書き換える前に `CLAUDE.md.bak-n3mc-<YYYYmmddHHMMSS>` に控えを取る。**改行の形（LF / CRLF）は元のまま書き戻す。** 該当行がなければファイルに触れない（読むだけ）。プロジェクトごとに CLAUDE.md があるので、マーカーで 1 回きりにはせず、毎回確かめる。
+  1. `<project>/.claude/CLAUDE.md`（§4「`--stop`」のプロジェクトのフォルダ）に**このインストール自身の `CONTEXT_FILE`**（`HOME_DIR/.memory/memory_context.md`）**を指す** `@import` 行があれば、その行と、その直前に続く N3MC のコメントのまとまり（`# N3MemoryCore — …` / `# Path resolves to …` / `# If you have not yet run …`。コメントと `@import` 行の間の空行も含む）を取り除く。ファイルのほかの場所は変えない。候補の行は正規表現 `^[ \t]*@[^\n]*memory_context\.md[ \t]*$`（行単位、空白を含むパスも当たる）で探す。候補を取り除くのは、`@` のあとのパス（前後の空白を除き、`~` を展開したもの）が絶対パスで、`os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(CONTEXT_FILE))` のとき**だけ**（スラッシュとバックスラッシュは同じとみなす）。相対パス（`@../.memory/memory_context.md`）、ほかのフォルダ（`@C:/other/.memory/memory_context.md`、ほかの版のファイル）、末尾が同じなだけの名前（`@docs/notes_about_memory_context.md`）は残す。書き換える前に `CLAUDE.md.bak-n3mc-<YYYYmmddHHMMSS>` に控えを取る。**改行の形（LF / CRLF）は元のまま書き戻す。** 該当行がなければファイルに触れない（読むだけ）。プロジェクトごとに CLAUDE.md があるので、マーカーで 1 回きりにはせず、毎回確かめる。
   2. `~/.n3mc/.memory/memory_context.md` が残っていれば消し、消したときに `.memory/.memory_context_retired` を作る。マーカーがあれば何もしない（ファイルがなければマーカーは作らず、次の `--stop` でまた確かめる）。
 - ユーザーが自分で `@import` を書いたほかの CLAUDE.md（`~/.claude/CLAUDE.md` など）には触れない。プロジェクトの CLAUDE.md の中でも、取り除くのはこのインストール自身のファイルを指す行だけ。
 
@@ -1486,7 +1495,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【実装仕様】致命的故障の警告**: DB書き込み失敗、またはINSERT後にDB件数が変化しない場合のみ以下を強調表示せよ:
   > ⚠️ 物理保存に失敗。現在の記憶は失われる可能性があります。
 
-  直接の保存（`_buffer_direct`）も失敗したときは、あわせて `_notify('save_failed', "A record could not be saved (<ErrorType>: <message>). Current memories may be lost; if it happens again, check that no other program holds the memory database.")` を呼び、次の検索の出力に出す（F11：フックの stderr の警告は誰も読まない）。
+  直接の保存（`_buffer_direct`）も失敗したときは、あわせて `_notify('save_failed', "A record could not be saved (<ErrorType>: <message>). Current memories may be lost; if it happens again, check that no other program holds the memory database.")` を呼び、次の検索の出力に出す（F11：フックの stderr の警告は誰も読まない）。**消すとき（2026-11-22）**: 保存が `ok` か `skipped` で終わったら、サーバー経由（`/buffer`、`_save_record`）でも `_buffer_direct` でも `_clear_notice('save_failed')` を呼ぶ。（それまでは `_buffer_direct` の成功でしか消えず、直接の保存が 1 回失敗すると、そのあとサーバー経由の保存が成功しても、知らせが 1 日 1 回ずっと出た。再現済み。）
 - **【実装仕様】文脈注入（stdout のみ）**: `--search` の結果は **stdout に `print()` で出力**せよ。UserPromptSubmit フックの stdout は Claude Code がそのターンのコンテキストに入れる。stdout 出力がないと Claude が検索結果を認識できず、記憶があるにもかかわらず「記憶にありません」と応答する原因になる。**`memory_context.md` などのファイルには書かない**（v1.4.0 で廃止。§4「memory_context.md の廃止」）。
 - **【実装仕様】毎回の出力（劣化状態も必ず出す）**: `cmd_search` は呼び出されるたびに、結果に関わらず stdout に必ず出力せよ。失敗パスでは「劣化状態を示すプレースホルダー」を出し、記憶層の状態を Claude に見えるようにする:
   - **空クエリ**（画像のみのプロンプト、または `--search ""`）→ `# Recalled Memory Context\n\n_No relevant memories found._\n`。
@@ -1761,7 +1770,7 @@ python -m pytest tests/ -v
 | `TestStripImages` | `plain_text_unchanged`, `base64_image_stripped`, `image_only_payload_returns_empty` | 画像ペイロード除去 |
 | `TestExtractText` | `plain_string`, `multimodal_json_list`, `image_only_empty`, `empty_input`, `json_text_is_kept_as_typed` | マルチモーダル抽出。JSON として読める入力をマルチモーダルの配列として扱わない |
 | `TestCompleteRecording` | `short_claude_response_saved`, `short_user_message_saved`, `skip_pattern_abolished`, `code_block_replaced_in_purify`, `inline_code_preserved_in_purify` | 完全記録契約（フィルタ廃止） |
-| `TestStopIdempotency` | `no_import_added`, `rules_file_created`, `home_folder_untouched` | --stop冪等性。**2026-11-22**: 作業フォルダがホームのとき、`--stop` は `.claude/rules/` に何も作らず、`.claude/CLAUDE.md` に触れない（すでにあるファイルはバイト単位で変わらない） |
+| `TestStopIdempotency` | `no_import_added`, `rules_file_created`, `home_folder_untouched` | --stop冪等性。**2026-11-22**: 作業フォルダがホームのとき、`--stop` は `.claude/rules/` に何も作らず、`.claude/CLAUDE.md` に触れない（すでにあるファイルはバイト単位で変わらない）。**プロジェクトのフォルダ（2026-11-22）**: `CLAUDE_PROJECT_DIR` が別の一時フォルダを指すときは、規則ファイルをそこに作り、`<cwd>` には何も作らない。変数がないときは `<cwd>` に作る。変数がホームを指すときは何も作らない |
 | `TestSanitizerUnit` | `strips_lone_high_surrogate`, `strips_lone_low_surrogate`, `clean_japanese_unchanged`, `complete_emoji_pair_preserved`, `recursive_dict`, `recursive_list`, `none_passthrough` | サロゲート除去（`test_hooks_encoding.py`） |
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |
@@ -1794,7 +1803,8 @@ python -m pytest tests/ -v
 | `TestChunkSentences`（v1.5.0） | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
 | `TestTimeBounds`（v1.5.0） | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（UTC 以外の固定のタイムゾーンで）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー |
 | `TestDbCorrupt`（v1.5.0） | 2 回の破損で 2 つのバックアップ（`n3memory.db.corrupt-<time>.bak`）ができ、`-wal` / `-shm` は削除されずに隣へ移される、知らせ `db_corrupt` が出る、`quick_check` は 1 プロセスに 1 回。中身がごみのファイルと、先頭のページが壊れた DB は、次の直接保存と起動時の確認で退避され、`db_corrupt` の通知が出る。`OperationalError` と sqlite-vec の失敗は破損として扱わない（F13） |
-| `TestInit`（v1.5.0、一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、(v1.6.0)`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる |
+| `TestInit`（v1.5.0、一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、(v1.6.0)`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる、(2026-11-22)`--init` が書く 2 つの項目に `"timeout": 120` がある、再実行しても項目が増えない、`timeout` のない自分の項目は `timeout` のある項目に置き換わる |
+| `TestSaveFailedNotice`（2026-11-22） | 直接の保存が 1 回失敗したあと（`save_failed` がある）、サーバー経由の保存（`/buffer` を `ok` と答える偽物に差し替え）で知らせが消える。`skipped` と答えたときも消える |
 | `TestHousekeeping`（v1.5.0） | `--stop` が 30 日より古い `turn_id_*.txt` を消し、新しいものは残す、50 MB を超えた `audit.log` を `audit.log.1` にローテーションする（テストではサイズのしきい値を差し替える） |
 | `TestModelRetry`（v1.5.0） | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |
 | `TestPackaging`（v1.5.0） | `psutil` が `pyproject.toml` の `dependencies` に入っている |
