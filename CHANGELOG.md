@@ -6,6 +6,59 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.9.1] - Unreleased
 
+### Fixed (2026-11-22)
+- **The check for unindexed records no longer slows every prompt** (spec §5.2,
+  "Detection of unindexed data"). `--hook-submit` calls `/repair` before every
+  prompt, and the check joined `memories_vec` (sqlite-vec) row by row: about
+  0.5 ms per record once the DB is past about 1,000 records (0.5 s at 1,600,
+  about 10 s at 20,000), even with nothing to repair. It is now
+  `rowid NOT IN (SELECT rowid FROM ...)`: 3.6 ms at 1,600 records, the same rows.
+- **`--stop` writes nothing in the home folder** (spec §4, "`--stop`
+  Hook Specification"). When
+  Claude Code was opened in the home folder, the rules file landed in
+  `~/.claude/rules/`, Claude Code's user-level folder: it was read in every
+  project and stayed after Free was uninstalled. Now, when the current folder
+  is the home folder, `--stop` neither writes the rules file nor touches
+  `.claude/CLAUDE.md` (the user's `~/.claude/CLAUDE.md`). A file left there by
+  an earlier version is not removed; delete `~/.claude/rules/n3mc-behavior.md`
+  by hand if you have one.
+- **The PID file is removed after the server stops on Windows**: it was
+  deleted while still open, which Windows refuses, so it stayed after
+  `/shutdown`.
+- **`--since` / `--until` errors name the flag** that could not be read
+  (`--since: cannot read ...`).
+- The code and tests were generated again from the v1.9.1 spec; the tests now
+  follow the layout of spec §7 (12 files).
+
+### Changed (2026-11-22, not in the spec)
+- **Search settings on by default**: `vector_min_cos` 0.82 (spec 0.85), and the
+  new `fts_stopwords` (true), `kw_only_min_terms` (3), `top_matches_max` (5) and
+  `cross_lang_min_cos` (0.80). See README "Search settings on by default". A
+  `config.json` written before keeps its `vector_min_cos`; the new keys are
+  added with their defaults. Writing the spec values restores the spec's search.
+  On the test set in `eval/`: right record first 31 → 38 of 50 questions,
+  unanswerable questions with an unrelated record 9 → 2 of 15; same-language
+  right record within the first 3: 39 → 37 of 40.
+
+### Changed in the spec (2026-11-22)
+- Python itself is installed by the user (Claude Code sees it only after the
+  user signs out or restarts); the Python packages and, on Windows, the
+  Visual C++ runtime are installed automatically.
+- The ID hierarchy matches the code: `local_id` is the install, not a
+  per-session agent, and `turn_id` (one exchange) is listed.
+- `--stop` in the home folder (above), and the check for unindexed records is
+  written as `NOT IN`, not as a LEFT JOIN on `memories_vec` (above).
+
+### Fixed in the spec (2026-11-20, from the data-safety review of N3MC Pro's generated code)
+The same review found these holes in N3MC Pro's spec; the code that followed it had the bugs.
+- **Concurrent repair** (§3.5, F11): after the embeddings, the write lock is
+  taken and each row is checked again; rows another call filled or deleted
+  are skipped. Before, the second of two calls could stop with
+  `UNIQUE constraint failed on memories_vec primary key`.
+- **FTS punctuation cleaning under the hook's limit** (§3.5): the last rowid
+  done is kept in the `meta` key `fts_punct_cursor`, so calls limited to 200
+  carry on and finish. Before, each call started at rowid 0.
+
 ### Security
 - **The resident server refuses requests with an `Origin` header** (spec §3
   "Resident FastAPI Server"): every endpoint returns 403 when the request
