@@ -378,7 +378,7 @@ from .core.processor import (
 ```
 
 - `root`: そのサーバーのデータフォルダ（`$N3MC_HOME` または `~/.n3mc`）の絶対パス。比較は `os.path.normcase(os.path.abspath(...))` で行う。
-- `code_version`: `n3memorycore/n3memory.py`・`core/database.py`・`core/processor.py` のファイル内容と、`config.json` の中身（JSON として読めたら、キーの順に並べ直して `json.dumps(..., sort_keys=True)` したもの。読めなければ生のバイト列）をまとめた SHA-256 の先頭 16 桁。**空白やキーの順だけの違いでは変わらない。** `_load_config` が `config.json` を書き直した場合は計算し直す。
+- `code_version`: `n3memorycore/n3memory.py`・`core/database.py`・`core/processor.py` のファイル内容と、`config.json` の中身（JSON として読めたら、キーの順に並べ直して `json.dumps(..., sort_keys=True)` したもの。読めなければ生のバイト列）をまとめた SHA-256 の先頭 16 桁。**空白やキーの順だけの違いでは変わらない。** `_load_config` が `config.json` を書き直した場合は計算し直す。**サーバーは自分の `code_version` を、動くための設定に `_load_config` が使ったのと同じ `config.json` の内容（読んだバイト列。キーを補って書いたときは書いた内容）から計算し、ファイルを開き直さない。** そのため、その読み取りのあとに変えると、クライアントの値と違い、サーバーは stale として入れ替わる（2026-11-22、レビュー #9：2 回目の読み取りがあると、その間に変えたとき、古い設定で動くサーバーが新しいハッシュを返し、入れ替わらず、変更が反映されなかった）。
 - `pid`: サーバープロセスの PID。
 
 #### サーバーの確認と入れ替え（`ensure_server`）
@@ -403,6 +403,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 
 #### サーバーの起動（`_start_server`、v1.5.0）
 
+0. **起動する前に起動を予約する（2026-11-22、レビュー #5）**：`Popen` の前に `open(..., "x")` で PID ファイルを作り、`Popen` が返るまで空のままにし、返ったら子プロセスの PID を書く。`FileExistsError` なら、ほかのプロセスがサーバーを起動している（または動かしている）：起動せず、上の「PID ファイルの扱い」に従う。`Popen` が例外を出したら、予約を消す。**空か読めない PID ファイル**（予約から書くまでの間）は、ファイルの更新時刻から 60 秒の間「起動中」として扱い、死んだプロセスとは扱わない。消さず、2 つ目のサーバーも起動しない。60 秒を過ぎたら死んだものとして扱う。PID ファイルを作らなかったプロセスは、それを上書きしない。自分の PID を書くのはサーバー自身だけ（下の `--run-server`）。（それまでは `_start_server` が先に `Popen` を呼び、そのあとで PID ファイルを作り、あれば上書きしていた。同時に動いた 2 つのフックがどちらもサーバーを起動し、モデルを 2 回読み込み、2 つ目はポートを取れずに失敗し、PID ファイルがその失敗したプロセスを指すことがあった。）
 1. 下の「Clean CLI」のとおり `subprocess.Popen` で `python -m n3memorycore.n3memory --run-server` を起動する。stdout と stdin は `DEVNULL`、**stderr は `.memory/server.log` に追記する**（ファイルが 1 MB を超えていたら起動前に切り詰める）。サーバーはフックのプロセスから**切り離し**、フックが終わっても動き続けるようにする: Windows では `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW`、それ以外では `start_new_session=True`。
 2. `/health` を 0.5 秒ごとに最大 60 秒見る。**待っている間に子プロセスが終了したら（`proc.poll() is not None`）、すぐに待つのをやめる** — ポートを N3MC 以外のプログラムが使っている、依存パッケージがない、DB を開けない、などの場合。**応答は、`ensure_server` と同じ確認を通ったときだけ使う**（2026-11-20 の 2 回目のレビュー）：`root` がこのフォルダであること（「ok」、または「stale」— このフォルダの、コードの違うサーバーで、次の呼び出しが入れ替える）。別のフォルダのサーバーが答えたとき（同じ `server_port` の 2 つのフォルダを同時に起動し、もう一方が先にポートを取った）や、`root` を返さないサーバーのときは、決して使わない。`_FOREIGN_SERVER_ROOT` を設定し、上の表と同じ `port_conflict` を出し、サーバーなしで進む（保存は `_buffer_direct`、検索はしない）。この決まりの前は、どんな応答でも待ちを終え、その呼び出しの検索と保存が別のフォルダの記憶に向かった。
 3. そうして早く終了したときは、知らせ `server_start_failed`（"The N3MC memory server could not start (exit code <n>). See <path of server.log> for the reason."）を出し、時刻を `.memory/server_start_failed`（マーカーファイル）に書き、PID ファイルが終了したその子プロセスの PID を持っていれば消し、サーバーなしで進める（直接保存 / `memory search unavailable`）。`Popen` そのものが例外を出したときも、サーバーなしで進む（stderr に 1 行。知らせとマーカーは書かない）。
@@ -862,6 +863,7 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 - ないファイルを**作る**ときは排他作成（`open(path, "x")`）を使う。`FileExistsError` で失敗したら、別のプロセスが先に作ったということなので、書かずにそのファイルを読む。これにより、新規インストールで 2 つのフックが同時に始まっても `owner_id` は 1 つになる（v1.4.0 では 2 つの違う値が書かれることがあり、レコードにその値が刻印されたあとで 2 つ目が 1 つ目を上書きしていた）。
 - 既存のファイルを**更新する**とき（足りないキーを足すとき）は、同じフォルダに一時ファイルを書いて `os.replace` で元のファイルと置き換える。これで書き込みが途中で止まっても `config.json` が途中で切れたままになることはない。`notices.json` も同じ方法で書く。
+- **既存のファイルに `owner_id` / `local_id` を補うとき（2026-11-22、レビュー #2）** は、プロセスの間で順番にする：ロックファイル `.memory/config.lock` を排他作成で取り（0.05 秒ごとに最大 10 秒やり直す。10 秒より古いロックファイルは残骸とみなして消す）、ロックの中で `config.json` を読み直し、まだ欠けているものだけを足し、`os.replace` で書き、ロックを消す。どのプロセスも、ロックの中でディスクに見つけた（または書いた）ID を使う。10 秒以内にロックを取れないとき（または作れないとき）は、これまでどおりロックなしで補う。（それまでは、ID のない同じファイルを読んだ 2 つのプロセスが、DB に戻せる記録がないとき、それぞれ自分の `owner_id` を書き、負けたプロセスの記録はファイルにない ID を持った。）
 - 知らせは §3「知らせ」の仕組み（stderr、`audit.log`、検索結果の先頭に 1 日 1 回）で出る。直すと次の読み込みで消える。
 - **DB からの ID 復旧**: `owner_id` または `local_id` が得られない場合、既存の DB レコードから最頻出の値を使う（`SELECT owner_id FROM memories GROUP BY owner_id ORDER BY COUNT(*) DESC LIMIT 1`）。DB にもレコードがない場合のみ、新しい UUID を生成する。
 
@@ -902,7 +904,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 | キー | 値 | 書くもの |
 |---|---|---|
 | `embed_model` | `memories_vec` のベクトルを作ったモデルの名前 | `/repair`（初回）と `--reembed` |
-| `embed_dim` | `memories_vec` の次元（`768`） | 同上 |
+| `embed_dim` | `memories_vec` の次元。表そのものから読む（`init_db` が作った表なら `768`） | 同上 |
 | `embed_model_at` | `embed_model` を書いた時刻（UTC の ISO 8601） | 同上 |
 | `fts_punct_cleaned` | FTS の句読点クリーニングが終わったら `1` | `/repair` |
 | `fts_punct_cursor` | FTS の句読点クリーニングが終えた最後の rowid。終わったら消す（2026-11-20） | `/repair` |
@@ -910,11 +912,12 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 | `reembed_model`、`reembed_cursor` | 終わっていない `--reembed` の進み具合 | `--reembed`（終わったら消す） |
 
 - **`/repair`** は、一度きりの処理（FTS の句読点クリーニング、バイグラムの埋め込み）を、そのキーが**データベースの中に**ないときに行い、処理が終わったときだけキーを書く。どちらも何度行っても結果は同じなので、すでに済んだデータベースでもう一度行っても、1 回の走査で済む。
+- **`memories_vec` の次元（2026-11-22、レビュー #3）**：いつも表そのものから読む。`SELECT sql FROM sqlite_master WHERE name = 'memories_vec'` の `float[N]` の数で、定数 `EMBED_DIM` は使わない。`/repair` は、欠けた `meta` の行を補うときにこの値を `embed_dim` に書き、`--reembed`（下の手順 2）は試しのベクトルをこの値と比べる。（それまではどちらも 768 を使っていた。§3「埋め込み」の手作業の手順で 384 次元の表にしたあと、`--reembed` は `memories_vec has 768` と出して終了ステータス 1 で終わり、ベクトルの索引を作り直せなかった。）
 - **`embed_model` がないとき**：`memories_vec` に行がなければ、設定の `embed_model`。そうでなければ、`.memory/vec_model.txt` があって空でなければその内容（v1.7.0 以前の印）。それもなければ、設定の `embed_model`。このファイルはこのためだけに読み、書き込みも削除もしない。
 - **モデルの食い違い**：`meta.embed_model` が設定の `embed_model` と違うとき、`/repair` は通知 `embed_model_mismatch` を出す（§3「通知」）：`The stored vectors were made with <recorded>, but config.json sets embed_model to <configured>. Search quality is degraded until they are re-made: run n3mc --reembed (it re-embeds all <N> records with <configured>), or set embed_model back to <recorded>.` 一致すれば通知を消す。
 - **`n3mc --reembed`** は、すべての記録を設定の `embed_model` で埋め込み直す。**CLI のプロセスの中で**行う（数分かかることがあり、HTTP の呼び出しでは時間切れになる）：
   1. このフォルダーのサーバーを止める（古いサーバーと同じ `/shutdown` の要求、§3「サーバーの起動」）。次の CLI の呼び出しで、設定のモデルで起動し直される。ほかのフォルダーのサーバーには触れない。
-  2. 設定のモデルを読み込み、試しの文を 1 つ埋め込む。その次元が `memories_vec` の次元と違えば、`N3MC: --reembed: <model> makes <d>-dimensional vectors but memories_vec has <D>; a different dimension needs the manual procedure in §3 "Embeddings".` を出し、何も変えずに終了コード 1 で終わる。
+  2. 設定のモデルを読み込み、試しの文を 1 つ埋め込む。その次元が `memories_vec` の次元（上のとおり表から読む）と違えば、`N3MC: --reembed: <model> makes <d>-dimensional vectors but memories_vec has <D>; a different dimension needs the manual procedure in §3 "Embeddings".` を出し、何も変えずに終了コード 1 で終わる。
   3. 再開の位置：`meta.reembed_model` が設定のモデルと同じなら、`meta.reembed_cursor`（`memories.rowid`）の次から始める。違えば最初から始め、`reembed_model` を書く。
   4. `rowid` の順に 200 行ずつ：その行を埋め込み（`"passage: " + content`、正規化）、1 つのトランザクションで、その行を `memories_vec` から消し、新しいベクトルを入れ、`reembed_cursor` を最後の rowid にする。1 回ごとに stderr に `Re-embedded <done> / <total>` を出す。
   5. 行が残っていなければ：`embed_model`、`embed_dim`、`embed_model_at` を書き、`reembed_model` と `reembed_cursor` を消し、通知 `embed_model_mismatch` を消し、`Re-embedded <N> record(s) with <model>.` を出す。
@@ -1785,7 +1788,7 @@ python -m pytest tests/ -v
 |---|---|
 | `TestFtsQuoting` | `\ / # = @ * $ %`・`AND/OR/NOT`・`"`・制御文字を含むクエリで例外にならない、記号を含む語がヒットする、`search_fts` が例外を出しても `hybrid_search` が続く。**v1.5.0**: 語を `OR` でつなぐ（文のようなクエリが、その語の一部だけを含む記録にヒットする）、3 文字未満の語（`AI`、`東京`）は捨て、そういう語だけのクエリは FTS を飛ばす、クエリの句読点で語が分かれる（`「アルファ9」の気温は？` が `架空の惑星「アルファ9」の気温設定` にヒットする）。**2026-11-17**: 最大 40 語、CJK を含む 4 文字以上の語は 3 文字ずつに分ける |
 | `test_search_port_2026_11_17.py`（2026-11-17） | 空白のない日本語の文が、その語を含む記録に当たる。ひらがなだけの 3 文字を捨てる。記号だけ・2 文字だけの質問で例外にならない。`bigram_text('N3MCの設定')` が `N3MC の設 設定`。`記憶` と `PR` がバイグラムの索引で（`hybrid_search` でも）当たる。バイグラムの検索が失敗しても trigram の結果が残る。`delete_memory` のあとバイグラムの行が残らない。`--repair` が古い DB のバイグラムの行を 1 回だけ埋める（2 回動かしても 1 記録 1 行）。`<agent-message from=...>` と `<system-reminder>` の入力は保存も検索もせず `turn_id` を変えない。`<agent-message` や `<div>` で始まるユーザーの質問は飛ばさない。返答との近さの並べ直しは既定で off、on なら返答の近い往復が上に来る、DB のエラーでは入力をそのまま返す |
-| `test_index_meta.py`（v1.8.0） | `init_db` が `meta` を作る。`/repair` が `fts_punct_cleaned` / `fts_bigram` / `embed_model` / `embed_dim` を書く。v1.7.0 の印のファイルの隣に戻した古いデータベース（`meta` のキーなし）でバイグラム索引が埋まる。`embed_model` を `vec_model.txt` から取るのはベクトルがあるときだけ。食い違いで `embed_model_mismatch` が出て、一致で消える。`--reembed` がすべてのベクトルを設定のモデルのものに替え、`embed_model` を書き、通知を消し、`reembed_cursor` から再開し、次元の違うモデルは何も変えずに断る |
+| `test_index_meta.py`（v1.8.0） | （2026-11-22）`memories_vec` を `float[384]` で作り直し、`meta` の 3 行を消したあと、384 次元の代わりのモデルで `--reembed` が成功し、ベクトルの件数が記録の件数と一致し、`embed_dim` が 384 になる。次元が本当に違うモデルでは何も変えず exit 1。`init_db` が `meta` を作る。`/repair` が `fts_punct_cleaned` / `fts_bigram` / `embed_model` / `embed_dim` を書く。v1.7.0 の印のファイルの隣に戻した古いデータベース（`meta` のキーなし）でバイグラム索引が埋まる。`embed_model` を `vec_model.txt` から取るのはベクトルがあるときだけ。食い違いで `embed_model_mismatch` が出て、一致で消える。`--reembed` がすべてのベクトルを設定のモデルのものに替え、`embed_model` を書き、通知を消し、`reembed_cursor` から再開し、次元の違うモデルは何も変えずに断る |
 | `test_review_2026_11_17.py`（2026-11-17） | どのチャンクも `max_chars` を超えない（段落と文の経路、`max_chars` が 400 と小さい値、日本語の文）。`chunk_text('x' * 10 + '\n\n' + 'y' * 400)` は 410 個の文字（`x` と `y`）をすべて残し、400 字以下のチャンクを返す。`is_own_hook` は、引用符なしで `\` 区切りの `C:\Tools\n3mc-hook.exe` と `C:\Tools\n3mc-stop-hook.exe` を自分のフックと認識し、`--init` はそのエントリを足さずに置き換える |
 | `TestVectorFilter` | `since` 付きの検索で範囲内の記録が KNN の上位外にあっても返る、`rowid IN` が使えないときに全件計算に切り替わる |
 | `TestNoSimilarityDedup` | 似た分割（cos ≥ 0.95）がすべて保存される、同じ `turn_id` の完全一致は飛ばす、別の `turn_id` の完全一致は保存する、`turn_id` なしは全体で完全一致を飛ばす |
@@ -1794,10 +1797,10 @@ python -m pytest tests/ -v
 | `TestNoContextFile` | `--search` が `memory_context.md` を作らない、`--stop` が CLAUDE.md からこのインストールの `CONTEXT_FILE` の `@import` を取り除く（控えあり・CRLF のまま・空白を含むパス・スラッシュでもバックスラッシュでも）、該当行がなければ触れない、旧ファイルを消してマーカーを作る。**v1.5.0**: 相対の `@../.memory/memory_context.md`、ほかのフォルダの `memory_context.md` を指す `@` の行、`@docs/notes_about_memory_context.md` は残す |
 | `TestBehaviorMd` | 目印が同じなら触れない、過去のひな形なら控えを取って置き換える（**v1.6.0**: `v2` のひな形、ハッシュ `5af3c015c06c62c1` も含む。新しいファイルの 1 行目は `<!-- n3mc-behavior v3 -->` で、Weak Matches の節がある）、手で編集したものは置き換えず知らせを出す。**v1.5.0**: 知らせのキーにパスのハッシュが入り、メッセージにパスが入る、手で編集したファイルが 2 つあれば知らせも 2 つ、ファイルの 1 行目が今の目印になったら知らせが消える |
 | `TestServerDecision` | 正常／`code_version` 違い／別のフォルダ／`root` なしで確かめられない、`/shutdown` を先に使う、`root` が違えば 403、死んだ PID ファイルは待たない。**2026-11-20**: PID ファイルのサーバーが別のポートで待ち受けていて、その `/health` がこのフォルダを返すときは、そのポートに `/shutdown` を送り、60 秒待たずに新しいサーバーを起動する。別の `root` を返すポートには `/shutdown` を送らない。`Host` の確認は、いまの `config.json` ではなく、サーバーが待ち受けているポートを使う |
-| `TestServerStart`（v1.5.0） | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え） |
+| `TestServerStart`（v1.5.0） | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え）、（2026-11-22）PID ファイルもサーバーもない状態で同時に始めた 2 つの `ensure_server` は `Popen` を 1 回だけ呼ぶ、予約した側の `Popen` が例外を出すと予約は消え、あとの呼び出しが起動できる、負けた側は PID ファイルを書き換えない、60 秒未満の空の PID ファイルは起動中とみなす |
 | `TestServerApi`（v1.5.0） | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る。`HTTP_PROXY` を別のローカルのサーバーに向けても、`_get` は N3MC のサーバーに届き、プロキシには何も届かない（F16）。**v1.9.1**: `Origin: http://evil.example` のリクエストと `Origin: null` のリクエストは、`Host: 127.0.0.1:<port>` でも、どのエンドポイントでも 403。同じリクエストから `Origin` を外すと通る。`_post` と `_get` が送るリクエストには `Origin` ヘッダーがない |
 | `TestForeignServer` | 別のフォルダのサーバーのとき、保存は自分の DB に直接、検索はしない、`--repair` は何もしない |
-| `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける。**C-06**: `search_result_limit` の `1366` も `config_type` で無視し、`1365` は受け付ける。`k = 4095` のベクトル検索は動く）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す |
+| `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の中身が変わったときだけ `code_version` が変わる。**v1.5.0**: `search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（**v1.6.0**: `min_results` の `-1` と `1.5` も同じ。`0` は受け付ける。**C-06**: `search_result_limit` の `1366` も `config_type` で無視し、`1365` は受け付ける。`k = 4095` のベクトル検索は動く）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す、（2026-11-22）ID のない既存の `config.json`（DB は空）から同時に始めた 2 つのプロセスは、どちらもディスクの `owner_id` / `local_id` で終わり、利用者の設定は残る、何も変えなければサーバーの `code_version` はクライアントと一致し（キーを補って書いたあとも）、サーバーが読んだ直後に `config.json` を変えるとサーバーは `stale`、再起動後に新しい設定で `ok` |
 | `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない。**v1.5.0**: 前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす（末尾の 1 行だけ。止めた質問を送り直しても、その前の返答は返らない）。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く |
 | `TestPurifyBeforeChunk`（v1.5.0） | 2 つのコードブロックとその間の文章を持つ 500 字を超えるユーザー発言で、文章は残り、どちらのコードブロックも保存されない、400 字より長いコードブロックは保存されず置き換えられる |
 | `TestChunkSentences`（v1.5.0） | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |

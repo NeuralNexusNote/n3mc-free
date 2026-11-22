@@ -386,6 +386,96 @@ class TestServerStart:
             assert seen["start_new_session"] is True
         assert seen["stderr"].name == n3m.SERVER_LOG
 
+    # ---- 2026-11-22, review #5: the PID file is reserved before Popen
+    @staticmethod
+    def _proc(pid):
+        class Proc:
+            returncode = None
+
+            def poll(self):
+                return None
+        p_ = Proc()
+        p_.pid = pid
+        return p_
+
+    def test_two_concurrent_ensure_server_calls_popen_once(self, monkeypatch):
+        import threading
+        started = threading.Event()
+        calls = []
+
+        def fake_popen(cmd, **kw):
+            calls.append(1)
+            time.sleep(0.5)  # the other call runs into the reservation meanwhile
+            started.set()
+            return self._proc(4242)
+
+        def health(port=None):
+            return ({"status": "ok", "root": n3m.HOME_DIR, "code_version": n3m.compute_code_version(), "pid": 4242}
+                    if started.is_set() else None)
+
+        n3m.get_config()
+        monkeypatch.setattr(n3m, "_start_server", _real_start_server)
+        monkeypatch.setattr(n3m.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(n3m, "_get_health", health)
+        monkeypatch.setattr(n3m, "_pid_is_own", lambda pid: True)  # the fake child is this folder's server
+        barrier, results = threading.Barrier(2), []
+
+        def run():
+            barrier.wait()
+            results.append(n3m.ensure_server())
+
+        ts = [threading.Thread(target=run) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(30)
+        assert results == [True, True] and len(calls) == 1
+        assert open(n3m.PID_FILE).read() == "4242"
+
+    def test_popen_failure_removes_the_reservation(self, monkeypatch):
+        monkeypatch.setattr(n3m, "_start_server", _real_start_server)
+        monkeypatch.setattr(n3m, "_get_health", lambda port=None: None)
+        monkeypatch.setattr(n3m, "SERVER_WAIT_SECONDS", 0)
+
+        def boom(*a, **k):
+            raise OSError("cannot spawn")
+
+        monkeypatch.setattr(n3m.subprocess, "Popen", boom)
+        assert n3m.ensure_server() is False and not os.path.exists(n3m.PID_FILE)
+        calls = []
+        monkeypatch.setattr(n3m.subprocess, "Popen", lambda *a, **k: calls.append(1) or self._proc(5151))
+        n3m.ensure_server()
+        assert calls == [1] and open(n3m.PID_FILE).read() == "5151"
+
+    def test_the_call_that_lost_never_rewrites_the_pid_file(self, monkeypatch):
+        open(n3m.PID_FILE, "w").write("777")
+        t0 = time.time() - 30
+        os.utime(n3m.PID_FILE, (t0, t0))
+        monkeypatch.setattr(n3m, "_start_server", _real_start_server)
+        monkeypatch.setattr(n3m, "_get_health", lambda port=None: None)
+        monkeypatch.setattr(n3m, "_pid_is_own", lambda pid: True)
+        monkeypatch.setattr(n3m, "_listen_ports", lambda pid: [])
+        monkeypatch.setattr(n3m, "SERVER_WAIT_SECONDS", 0)
+        monkeypatch.setattr(n3m.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("launched")))
+        assert n3m._start_server() is False and n3m._SERVER_STARTING is True
+        assert open(n3m.PID_FILE).read() == "777" and abs(os.path.getmtime(n3m.PID_FILE) - t0) < 1
+
+    def test_empty_pid_file_younger_than_60_s_counts_as_starting(self, monkeypatch):
+        open(n3m.PID_FILE, "w").close()
+        monkeypatch.setattr(n3m, "_start_server", _real_start_server)
+        monkeypatch.setattr(n3m, "_get_health", lambda port=None: None)
+        monkeypatch.setattr(n3m, "SERVER_WAIT_SECONDS", 0)
+        monkeypatch.setattr(n3m.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("launched")))
+        assert n3m.ensure_server() is False and n3m._SERVER_STARTING is True and os.path.exists(n3m.PID_FILE)
+        assert n3m._start_server() is False and open(n3m.PID_FILE).read() == ""
+        # older than 60 s: dead, removed, and the server is started
+        t0 = time.time() - 120
+        os.utime(n3m.PID_FILE, (t0, t0))
+        calls = []
+        monkeypatch.setattr(n3m.subprocess, "Popen", lambda *a, **k: calls.append(1) or self._proc(6161))
+        n3m.ensure_server()
+        assert calls == [1] and open(n3m.PID_FILE).read() == "6161"
+
 
 _real_start_server = n3m._start_server
 
@@ -524,6 +614,82 @@ class TestConfig:
         monkeypatch.setattr(os, "replace", lambda a, b: seen.append(b) or real(a, b))
         n3m._load_config()
         assert n3m.CONFIG_FILE in seen and json.load(open(n3m.CONFIG_FILE))["min_results"] == 3
+
+    # ---- 2026-11-22, review #2: filling in the IDs of an existing file is serialized
+    def test_concurrent_fill_in_ends_with_the_ids_on_disk(self, monkeypatch):
+        import threading
+        os.makedirs(n3m.HOME_DIR, exist_ok=True)
+        open(n3m.CONFIG_FILE, "w").write(json.dumps({"min_score": 0.3, "my_own_note": "keep me"}))
+        barrier, local = threading.Barrier(2), threading.local()
+        real_read = n3m._read_config_file
+
+        def read():
+            out = real_read()
+            if not getattr(local, "seen", False):  # both calls read the file without IDs first
+                local.seen = True
+                barrier.wait(10)
+            return out
+
+        monkeypatch.setattr(n3m, "_read_config_file", read)
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(n3m._load_config())) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(30)
+        disk = json.load(open(n3m.CONFIG_FILE))
+        assert len(results) == 2
+        for r in results:
+            assert (r["owner_id"], r["local_id"]) == (disk["owner_id"], disk["local_id"])
+        assert disk["min_score"] == 0.3 and disk["my_own_note"] == "keep me"
+        assert not os.path.exists(os.path.join(n3m.MEMORY_DIR, "config.lock"))
+
+    def test_stale_config_lock_is_removed(self):
+        os.makedirs(n3m.HOME_DIR, exist_ok=True)
+        open(n3m.CONFIG_FILE, "w").write(json.dumps({"min_score": 0.3}))
+        lock = os.path.join(n3m.MEMORY_DIR, "config.lock")
+        open(lock, "w").write("1")
+        os.utime(lock, (time.time() - 60, time.time() - 60))
+        t = time.time()
+        cfg = n3m._load_config()
+        assert time.time() - t < 5 and json.load(open(n3m.CONFIG_FILE))["owner_id"] == cfg["owner_id"]
+        assert not os.path.exists(lock)
+
+    # ---- 2026-11-22, review #9: the server's code_version comes from the content it loaded
+    def _run_server(self, monkeypatch):
+        import uvicorn
+        monkeypatch.setattr(uvicorn, "run", lambda app, **k: None)
+        monkeypatch.setattr(n3m._processor, "get_model", lambda name=None: object())
+        monkeypatch.setattr(n3m, "_CFG_CACHE", None)
+        monkeypatch.setattr(n3m, "_SERVER_STATE", {})
+        assert n3m.cmd_run_server() == 0
+        return {"status": "ok", "root": n3m.HOME_DIR, "code_version": n3m._SERVER_STATE["code_version"]}
+
+    def test_server_code_version_equals_client_after_fill_in(self, monkeypatch):
+        os.makedirs(n3m.HOME_DIR, exist_ok=True)
+        open(n3m.CONFIG_FILE, "w").write(json.dumps({"min_score": 0.3}))  # no IDs: the server fills them in
+        h = self._run_server(monkeypatch)
+        assert "owner_id" in json.load(open(n3m.CONFIG_FILE))
+        assert h["code_version"] == n3m.compute_code_version() and n3m._health_decision(h) == "ok"
+        assert n3m._health_decision(self._run_server(monkeypatch)) == "ok"  # nothing changed: same value
+
+    def test_change_right_after_the_server_read_makes_it_stale(self, monkeypatch):
+        n3m._load_config()
+        real_read = n3m._read_config_file
+
+        def read_then_edit():
+            out = real_read()
+            d = json.load(open(n3m.CONFIG_FILE))
+            d["min_score"] = 0.35
+            open(n3m.CONFIG_FILE, "w").write(json.dumps(d))
+            return out
+
+        monkeypatch.setattr(n3m, "_read_config_file", read_then_edit)
+        h = self._run_server(monkeypatch)
+        assert n3m._SERVER_STATE["cfg"]["min_score"] == 0.2 and n3m._health_decision(h) == "stale"
+        monkeypatch.setattr(n3m, "_read_config_file", real_read)
+        h = self._run_server(monkeypatch)  # the restart
+        assert n3m._SERVER_STATE["cfg"]["min_score"] == 0.35 and n3m._health_decision(h) == "ok"
 
 
 def _transcript(tmp_path, rows):

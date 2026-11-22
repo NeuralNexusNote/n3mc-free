@@ -69,6 +69,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.delenv("N3MC_SESSION_ID", raising=False)
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)  # set when pytest runs from a Claude Code hook
     monkeypatch.setattr(n3m, "_CFG_CACHE", None)
+    monkeypatch.setattr(n3m, "_CFG_SOURCE", None)
     monkeypatch.setattr(n3m, "_SERVER_OK", None)
     monkeypatch.setattr(n3m, "_FOREIGN_SERVER_ROOT", None)
     monkeypatch.setattr(n3m, "_QUICK_CHECKED", False)
