@@ -4,7 +4,7 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.9.1] - Unreleased
+## [1.9.1] - 2026-11-22
 
 ### Fixed (2026-11-22)
 - **The check for unindexed records no longer slows every prompt** (spec §5.2,
