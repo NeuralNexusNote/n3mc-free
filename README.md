@@ -16,11 +16,6 @@ n3mc --init
 Then restart Claude Code. Memory works from the next session. The first run
 downloads the search model (about 1.1 GB) once. Details: [Setup](#setup).
 
-> **Which version you get** — The package on PyPI is **v1.6.0**. This README
-> describes **v1.9.1**, the code in this repository, which is not on PyPI yet.
-> To use v1.9.1, install from the repository (the second command block of
-> [Path A](#path-a--quick-start-with-pip)).
-
 > **⚠️ How long memories are kept, and data size**
 >
 > - **Memories are not deleted.** Free has no feature that deletes old records; they stay after a year without changing any setting.
@@ -219,13 +214,13 @@ Use the reference build directly:
 
 #### 1. Install
 
-The simplest install — straight from PyPI (no clone needed). This gives the version on PyPI (v1.6.0 at the moment):
+The simplest install — straight from PyPI (no clone needed):
 
 ```bash
 pip install n3memorycore-free
 ```
 
-Or, for the code of this repository (v1.9.1, described in this README), or if you want a local checkout to read / modify / contribute:
+Or, if you want a local checkout to read / modify / contribute:
 
 ```bash
 git clone https://github.com/NeuralNexusNote/n3mc-free.git
