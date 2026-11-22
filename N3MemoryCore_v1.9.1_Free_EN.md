@@ -1224,6 +1224,8 @@ The responsibility of `--stop` is **session-end cleanup (preparing the AI behavi
 
 Processing order on `--stop` execution:
 
+**Not in the home folder (2026-11-22)**: when `<cwd>` is the user's home folder (`os.path.normcase(os.path.realpath(cwd)) == os.path.normcase(os.path.realpath(os.path.expanduser("~")))`), skip steps 1 and 2: do not create or change `.claude/rules/n3mc-behavior.md`, and do not read `.claude/CLAUDE.md`. Step 3 still runs, and nothing is printed. Why: the home folder's `.claude/` is Claude Code's user-level folder, and the rules in `~/.claude/rules/` are loaded in every project. A rules file written there when the user opens Claude Code in the home folder (or runs `--stop` there by hand) is read in every project on top of the project's own file, and it stays after this product is uninstalled, telling Claude to run commands that are gone (2026-11-22, it happened on a development PC). `~/.claude/CLAUDE.md` is the user's file and is not touched (the same rule as the clean-up below). A file already there is neither read nor removed.
+
 1. Prepare `<cwd>/.claude/rules/n3mc-behavior.md` (AI behavioral guidelines) (`_ensure_behavior_md`; see "Behavior Guidelines File Versioning" below).
 2. If `<cwd>/.claude/CLAUDE.md` contains a memory_context `@import` line written by an older version, remove it (`_retire_memory_context`, below). **N3MC adds nothing to CLAUDE.md.** If CLAUDE.md does not exist, do not create it.
 3. Housekeeping (v1.5.0): delete `.memory/turn_id_*.txt` files whose modification time is more than 30 days old (one file is created per Claude Code session and none was ever removed), and rotate `audit.log` when it exceeds 50 MB (§5.4 "audit.log size and contents").
@@ -1763,7 +1765,7 @@ python -m pytest tests/ -v
 | `TestStripImages` | `plain_text_unchanged`, `base64_image_stripped`, `image_only_payload_returns_empty` | Image payload stripping |
 | `TestExtractText` | `plain_string`, `multimodal_json_list`, `image_only_empty`, `empty_input`, `json_text_is_kept_as_typed` | Multimodal text extraction; typed text that is valid JSON is not read as a multimodal array |
 | `TestCompleteRecording` | `short_claude_response_saved`, `short_user_message_saved`, `skip_pattern_abolished`, `code_block_replaced_in_purify`, `inline_code_preserved_in_purify` | Complete-Recording Contract (filters removed) |
-| `TestStopIdempotency` | `no_import_added`, `rules_file_created` | --stop idempotency |
+| `TestStopIdempotency` | `no_import_added`, `rules_file_created`, `home_folder_untouched` | --stop idempotency. **2026-11-22**: with the current folder = the home folder, `--stop` creates nothing in `.claude/rules/` and leaves `.claude/CLAUDE.md` as it is (a file already there is kept byte for byte) |
 | `TestSanitizerUnit` | `strips_lone_high_surrogate`, `strips_lone_low_surrogate`, `clean_japanese_unchanged`, `complete_emoji_pair_preserved`, `recursive_dict`, `recursive_list`, `none_passthrough` | Surrogate stripping (`test_hooks_encoding.py`) |
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |

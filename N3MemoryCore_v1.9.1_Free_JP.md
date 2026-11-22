@@ -1222,6 +1222,8 @@ Claude が直接呼び出すエントリポイントは 2 系統ある。**Claud
 
 `--stop` 実行時の処理順序:
 
+**作業フォルダがホームのときは手順 1 と 2 をしない（2026-11-22）**: `<cwd>` がユーザーのホームフォルダ（`os.path.normcase(os.path.realpath(cwd)) == os.path.normcase(os.path.realpath(os.path.expanduser("~")))`）なら、`.claude/rules/n3mc-behavior.md` を作らず・変えず、`.claude/CLAUDE.md` も読まない。手順 3 はいつもどおり行い、何も出力しない。理由: ホームの `.claude/` は Claude Code のユーザー全体の設定のフォルダで、`~/.claude/rules/` の規則はすべてのプロジェクトで読み込まれる。利用者が Claude Code をホームで開いたとき（またはホームで `--stop` を手で実行したとき）に規則ファイルを書くと、すべてのプロジェクトでプロジェクトの規則ファイルと二重に読まれる。さらに、この製品をアンインストールしたあとも残り、もうないコマンドを使うよう指示し続ける（2026-11-22、開発機で起きた）。`~/.claude/CLAUDE.md` は利用者のファイルなので触れない（下の片付けの決まりと同じ）。ホームにすでにあるファイルは、読まず、消さない。
+
 1. `<cwd>/.claude/rules/n3mc-behavior.md`（AI 行動指針）を用意する（`_ensure_behavior_md`、下記「AI 行動指針ファイルの版」）。
 2. `<cwd>/.claude/CLAUDE.md` に旧版が書いた memory_context の `@import` 行があれば取り除く（`_retire_memory_context`、下記）。**N3MC は CLAUDE.md に何も書き足さない。** CLAUDE.md がなければ作らない。
 3. 後片付け（v1.5.0）: 更新時刻が 30 日より古い `.memory/turn_id_*.txt` を削除し（Claude Code のセッションごとに 1 つ作られ、これまで一度も消されていなかった）、`audit.log` が 50 MB を超えていたらローテーションする（§5.4「audit.log の大きさと中身」）。
@@ -1759,7 +1761,7 @@ python -m pytest tests/ -v
 | `TestStripImages` | `plain_text_unchanged`, `base64_image_stripped`, `image_only_payload_returns_empty` | 画像ペイロード除去 |
 | `TestExtractText` | `plain_string`, `multimodal_json_list`, `image_only_empty`, `empty_input`, `json_text_is_kept_as_typed` | マルチモーダル抽出。JSON として読める入力をマルチモーダルの配列として扱わない |
 | `TestCompleteRecording` | `short_claude_response_saved`, `short_user_message_saved`, `skip_pattern_abolished`, `code_block_replaced_in_purify`, `inline_code_preserved_in_purify` | 完全記録契約（フィルタ廃止） |
-| `TestStopIdempotency` | `no_import_added`, `rules_file_created` | --stop冪等性 |
+| `TestStopIdempotency` | `no_import_added`, `rules_file_created`, `home_folder_untouched` | --stop冪等性。**2026-11-22**: 作業フォルダがホームのとき、`--stop` は `.claude/rules/` に何も作らず、`.claude/CLAUDE.md` に触れない（すでにあるファイルはバイト単位で変わらない） |
 | `TestSanitizerUnit` | `strips_lone_high_surrogate`, `strips_lone_low_surrogate`, `clean_japanese_unchanged`, `complete_emoji_pair_preserved`, `recursive_dict`, `recursive_list`, `none_passthrough` | サロゲート除去（`test_hooks_encoding.py`） |
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |
