@@ -154,3 +154,51 @@ def test_repair_skips_rows_deleted_or_filled_in_while_embedding(conn, cfg, monke
     n3m._repair(conn, cfg)  # must not raise UNIQUE constraint failed
     assert conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+
+
+# ---- 2026-11-22, review #3: the dimension of memories_vec is read from the table
+
+def _make_384_table(conn, cfg):
+    for i in range(3):
+        add(conn, cfg, f"record {i}", embed=False)
+    conn.execute("DROP TABLE memories_vec")
+    conn.execute("CREATE VIRTUAL TABLE memories_vec USING vec0(embedding float[384])")
+    for k in ("embed_model", "embed_dim", "embed_model_at"):
+        db.delete_meta(conn, k)
+    conn.commit()
+
+
+def _e384(text, name=None):
+    v = fake_embed(text)[:384]
+    n = sum(x * x for x in v) ** 0.5
+    return [x / n for x in v]
+
+
+def test_vec_dim_is_read_from_the_table(conn, cfg, monkeypatch):
+    assert db.vec_dim(conn) == 768
+    _make_384_table(conn, cfg)
+    assert db.vec_dim(conn) == 384
+    monkeypatch.setattr(n3m, "embed_passage", _e384)
+    n3m._repair(conn, cfg)
+    assert db.get_meta(conn, "embed_dim") == "384"
+
+
+def test_reembed_works_on_a_384_dimensional_table(conn, cfg, monkeypatch):
+    _make_384_table(conn, cfg)
+    monkeypatch.setattr(n3m._processor, "get_model", lambda name=None: object())
+    monkeypatch.setattr(n3m, "embed_passage", _e384)
+    assert n3m.cmd_reembed() == 0
+    c2 = db.get_connection()
+    assert c2.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == db.count_memories(c2) == 3
+    assert db.get_meta(c2, "embed_dim") == "384"
+    c2.close()
+
+
+def test_reembed_refuses_768_on_a_384_dimensional_table(conn, cfg, monkeypatch, capsys):
+    _make_384_table(conn, cfg)
+    monkeypatch.setattr(n3m._processor, "get_model", lambda name=None: object())
+    monkeypatch.setattr(n3m, "embed_passage", lambda t, name=None: fake_embed(t))
+    assert n3m.cmd_reembed() == 1
+    assert "memories_vec has 384" in capsys.readouterr().err
+    assert conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 0
+    assert db.get_meta(conn, "embed_dim") is None and db.get_meta(conn, "reembed_model") is None

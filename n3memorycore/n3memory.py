@@ -44,7 +44,7 @@ from .core.database import (
     get_connection, init_db, migrate_schema, insert_memory, insert_memory_once,
     check_exact_duplicate, search_vector, find_unindexed_memories,
     strip_fts_punctuation, serialize_vector, bigram_text, get_meta, set_meta, delete_meta,
-    count_memories, get_memories_by_turn_id,
+    count_memories, get_memories_by_turn_id, vec_dim,
 )
 from .core.processor import (
     embed_passage, embed_query, cosine_sim_from_l2, hybrid_search,
@@ -117,6 +117,7 @@ _QUICK_CHECKED = False
 _SERVER_PORT = None          # the port this server process listens on (Host check)
 _SERVER_STATE = {}
 _CFG_CACHE = None
+_CFG_SOURCE = None         # config.json content _CFG_CACHE comes from (bytes; None: no readable file)
 
 
 def _norm(p):
@@ -142,9 +143,11 @@ def _atomic_write_json(path, obj):
     _os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix="." + _os.path.basename(path) + ".")
     try:
+        text = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
         with _os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+            f.write(text)
         _os.replace(tmp, path)
+        return text
     except BaseException:
         try:
             _os.unlink(tmp)
@@ -244,24 +247,99 @@ def _config_value_ok(key, value):
     return True
 
 
+class _ConfigReadError(Exception):
+    """config.json could not be parsed; `raw` holds the bytes read (None when the file could not be read)."""
+
+    def __init__(self, cause, raw):
+        super().__init__(str(cause))
+        self.raw = raw
+
+
 def _read_config_file():
-    """Read config.json; a file touched in the last 2 s is retried (it may still be being written)."""
+    """Read config.json -> (parsed JSON, bytes read). A file touched in the last 2 s is retried (it may
+    still be being written). On failure raises _ConfigReadError carrying the bytes of the last read."""
     attempts = 1
     try:
         if time.time() - _os.path.getmtime(CONFIG_FILE) <= 2:
             attempts = 20
     except OSError:
         pass
-    last = None
+    last, last_raw = None, None
     for i in range(attempts):
+        raw = None
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(CONFIG_FILE, "rb") as f:
+                raw = f.read()
+            return json.loads(raw.decode("utf-8")), raw
         except Exception as e:  # noqa: BLE001
-            last = e
+            last, last_raw = e, raw
             if i < attempts - 1:
                 time.sleep(0.05)
-    raise last
+    raise _ConfigReadError(last, last_raw)
+
+
+CONFIG_LOCK_WAIT_SECONDS = 10
+CONFIG_LOCK_STALE_SECONDS = 10
+
+
+def _config_lock_path():
+    return _os.path.join(MEMORY_DIR, "config.lock")
+
+
+def _acquire_config_lock():
+    """Take .memory/config.lock (exclusive create; retry every 0.05 s for up to 10 s; a lock older than
+    10 s is stale and removed). Returns True when the lock is held."""
+    path = _config_lock_path()
+    end = time.time() + CONFIG_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fd = _os.open(path, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
+            try:
+                _os.write(fd, str(_os.getpid()).encode("ascii"))
+            finally:
+                _os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - _os.path.getmtime(path) > CONFIG_LOCK_STALE_SECONDS:
+                    _os.unlink(path)
+                    continue
+            except OSError:
+                continue  # removed meanwhile: try again at once
+        except OSError:
+            return False
+        if time.time() >= end:
+            return False
+        time.sleep(0.05)
+
+
+def _release_config_lock():
+    try:
+        _os.unlink(_config_lock_path())
+    except OSError:
+        pass
+
+
+def _merge_config(raw):
+    """Validated settings of a parsed config.json (defaults for missing keys) and the bad keys."""
+    bad, merged = [], {}
+    for k, v in raw.items():
+        if k in DEFAULT_CONFIG and not _config_value_ok(k, v):
+            bad.append(k)
+        else:
+            merged[k] = v
+    for k, v in DEFAULT_CONFIG.items():
+        if k not in merged:
+            merged[k] = v
+    return merged, bad
+
+
+def _id_ok(v):
+    return isinstance(v, str) and bool(v)
+
+
+def _needs_fill(raw):
+    return any(k not in raw for k in DEFAULT_CONFIG) or not all(_id_ok(raw.get(k)) for k in ("owner_id", "local_id"))
 
 
 def _recover_id(column):
@@ -279,65 +357,91 @@ def _recover_id(column):
         return None
 
 
+def _fill_ids_in_memory(merged):
+    for idk in ("owner_id", "local_id"):
+        if not _id_ok(merged.get(idk)):
+            merged[idk] = _recover_id(idk) or str(uuid.uuid4())
+
+
+def _notify_bad(bad):
+    _notify("config_type", "These config.json items have the wrong type or are out of range and were "
+            f"ignored (defaults used): {', '.join(sorted(bad))}")
+
+
+def _fill_config_locked(raw, src):
+    """Add the missing keys / IDs of an existing, valid config.json under .memory/config.lock (review #2):
+    read the file again inside the lock and add only what is still missing, so every process ends with
+    the IDs on disk. Returns (settings, the config.json content they come from)."""
+    locked = _acquire_config_lock()
+    try:
+        try:
+            raw2, src2 = _read_config_file()
+            if isinstance(raw2, dict):
+                raw, src = raw2, src2
+        except Exception:  # noqa: BLE001
+            pass  # vanished or unreadable now: work from the first read, as before
+        merged, bad = _merge_config(raw)
+        if bad:  # edited meanwhile with a bad value: leave the file alone
+            _fill_ids_in_memory(merged)
+            _notify_bad(bad)
+            return merged, src
+        if not _needs_fill(raw):
+            return merged, src
+        _fill_ids_in_memory(merged)
+        out = dict(raw)
+        for k, v in merged.items():
+            if k not in out or (k in ("owner_id", "local_id") and out.get(k) != v):
+                out[k] = v
+        try:
+            src = _atomic_write_json(CONFIG_FILE, out).encode("utf-8")
+        except Exception as e:  # noqa: BLE001
+            print(f"N3MC: could not update config.json ({e})", file=sys.stderr)
+        return merged, src
+    finally:
+        if locked:
+            _release_config_lock()
+
+
 def _load_config():
-    global _CFG_CACHE
+    """Load config.json. _CFG_SOURCE is set to the content the settings come from (the bytes read, or the
+    content written), so the server's code_version is computed from it, not from a second read (#9)."""
+    global _CFG_CACHE, _CFG_SOURCE
     _ensure_dirs()
     cfg = dict(DEFAULT_CONFIG)
     if not _os.path.exists(CONFIG_FILE):
         cfg["owner_id"] = _recover_id("owner_id") or str(uuid.uuid4())
         cfg["local_id"] = _recover_id("local_id") or str(uuid.uuid4())
+        text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
         try:
             with open(CONFIG_FILE, "x", encoding="utf-8") as f:
-                f.write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+                f.write(text)
         except FileExistsError:
             return _load_config()
         _clear_notice("config_unreadable")
         _clear_notice("config_type")
-        _CFG_CACHE = cfg
+        _CFG_CACHE, _CFG_SOURCE = cfg, text.encode("utf-8")
         return cfg
     try:
-        raw = _read_config_file()
+        raw, src = _read_config_file()
         if not isinstance(raw, dict):
-            raise ValueError("config.json is not a JSON object")
+            raise _ConfigReadError(ValueError("config.json is not a JSON object"), src)
     except Exception as e:  # noqa: BLE001
         _notify("config_unreadable", f"{CONFIG_FILE} could not be read ({e}). It was left untouched; default "
                 "settings are in use. Fix the file to apply your settings.")
         cfg["owner_id"] = _recover_id("owner_id") or str(uuid.uuid4())
         cfg["local_id"] = _recover_id("local_id") or str(uuid.uuid4())
-        _CFG_CACHE = cfg
+        _CFG_CACHE, _CFG_SOURCE = cfg, getattr(e, "raw", None)
         return cfg
     _clear_notice("config_unreadable")
-    bad = []
-    merged = {}
-    for k, v in raw.items():
-        if k in DEFAULT_CONFIG and not _config_value_ok(k, v):
-            bad.append(k)
-        else:
-            merged[k] = v
-    for k, v in DEFAULT_CONFIG.items():
-        if k not in merged:
-            merged[k] = v
-    for idk in ("owner_id", "local_id"):
-        if not isinstance(merged.get(idk), str) or not merged.get(idk):
-            merged[idk] = _recover_id(idk) or str(uuid.uuid4())
+    merged, bad = _merge_config(raw)
     if bad:
-        _notify("config_type", "These config.json items have the wrong type or are out of range and were "
-                f"ignored (defaults used): {', '.join(sorted(bad))}")
+        _fill_ids_in_memory(merged)
+        _notify_bad(bad)
     else:
         _clear_notice("config_type")
-        # fill in missing keys / ids and save (the file is valid)
-        out = dict(raw)
-        changed = False
-        for k, v in merged.items():
-            if k not in out or (k in ("owner_id", "local_id") and out.get(k) != v):
-                out[k] = v
-                changed = True
-        if changed:
-            try:
-                _atomic_write_json(CONFIG_FILE, out)
-            except Exception as e:  # noqa: BLE001
-                print(f"N3MC: could not update config.json ({e})", file=sys.stderr)
-    _CFG_CACHE = merged
+        if _needs_fill(raw):  # fill in missing keys / ids and save (the file is valid)
+            merged, src = _fill_config_locked(raw, src)
+    _CFG_CACHE, _CFG_SOURCE = merged, src
     return merged
 
 
@@ -452,7 +556,12 @@ def _read_db_if_exists():
 
 # ============================================================ code version
 
-def compute_code_version():
+_FROM_DISK = object()
+
+
+def compute_code_version(config_source=_FROM_DISK):
+    """config_source: the config.json content to hash (bytes, or None for no readable file). By default
+    the file is read (the client). The server passes the content _load_config used (review #9)."""
     h = hashlib.sha256()
     base = _os.path.dirname(_os.path.abspath(__file__))
     for rel in ("n3memory.py", _os.path.join("core", "database.py"), _os.path.join("core", "processor.py")):
@@ -461,16 +570,25 @@ def compute_code_version():
                 h.update(f.read())
         except OSError:
             h.update(b"?")
-    try:
-        with open(CONFIG_FILE, "rb") as f:
-            raw = f.read()
+    raw = config_source
+    if raw is _FROM_DISK:
+        try:
+            with open(CONFIG_FILE, "rb") as f:
+                raw = f.read()
+        except OSError:
+            raw = None
+    if raw is not None:
         try:
             h.update(json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True).encode("utf-8"))
         except Exception:  # noqa: BLE001
             h.update(raw)
-    except OSError:
-        pass
     return h.hexdigest()[:16]
+
+
+def _server_code_version():
+    """code_version of this server: from the config.json content its settings were loaded from (#9)."""
+    get_config()
+    return compute_code_version(_CFG_SOURCE)
 
 
 # ============================================================ storing
@@ -517,7 +635,9 @@ def _repair(conn, cfg, max_records=None):
             except OSError:
                 pass
         set_meta(conn, "embed_model", model)
-        set_meta(conn, "embed_dim", _database.EMBED_DIM)
+        dim = vec_dim(conn)  # from the table itself, never EMBED_DIM (review #3)
+        if dim is not None:
+            set_meta(conn, "embed_dim", dim)
         set_meta(conn, "embed_model_at", datetime.now(timezone.utc).isoformat())
         conn.commit()
     recorded = get_meta(conn, "embed_model")
@@ -675,7 +795,7 @@ def create_app():
     @app.get("/health")
     def health():
         return {"status": "ok", "root": HOME_DIR,
-                "code_version": _SERVER_STATE.get("code_version") or compute_code_version(),
+                "code_version": _SERVER_STATE.get("code_version") or _server_code_version(),
                 "pid": _os.getpid()}
 
     @app.post("/buffer")
@@ -780,7 +900,7 @@ def cmd_run_server():
               "from the network. Use 127.0.0.1.", file=sys.stderr)
     _SERVER_STATE["cfg"] = cfg
     _SERVER_STATE["session_id"] = str(uuid.uuid4())
-    _SERVER_STATE["code_version"] = compute_code_version()
+    _SERVER_STATE["code_version"] = compute_code_version(_CFG_SOURCE)  # same content as cfg (#9)
     conn = _open_db("integrity_check")
     conn.close()
     try:
@@ -972,9 +1092,100 @@ def _clear_server_notices():
         pass
 
 
+PID_RESERVATION_SECONDS = 60
+
+
+def _reserve_pid_file():
+    """Create the PID file, empty, with exclusive creation (review #5). True: reserved by this call;
+    False: it exists (another process starts or runs the server); None: it could not be created."""
+    try:
+        with open(PID_FILE, "x", encoding="utf-8"):
+            pass
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        return None
+
+
+def _drop_reservation():
+    """Delete our reservation (still empty: nobody else writes into it)."""
+    try:
+        if _os.path.getsize(PID_FILE) == 0:
+            _os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+def _write_reserved_pid(pid):
+    """Write the child's PID into our (still empty) reservation; never overwrite what is there."""
+    try:
+        with open(PID_FILE, "r+", encoding="utf-8") as f:
+            if not f.read().strip():
+                f.seek(0)
+                f.write(str(pid))
+                f.truncate()
+    except OSError:
+        pass
+
+
+def _wait_for_starting_server():
+    """Another process is starting this folder's server: poll /health for up to 60 s."""
+    global _SERVER_STARTING
+    end = time.time() + SERVER_WAIT_SECONDS
+    while time.time() < end:
+        h = _get_health()
+        d = _health_decision(h)
+        if d in ("ok", "stale"):
+            return True
+        if d in ("foreign", "legacy"):
+            return _foreign(h)
+        time.sleep(0.5)
+    _SERVER_STARTING = True
+    return False
+
+
+def _follow_pid_file():
+    """"PID file handling" (no server answers). Returns True/False when the PID file decides the outcome,
+    or None when there is no live PID file (it was dead and has been removed): start the server."""
+    if not _os.path.exists(PID_FILE):
+        return None
+    pid = _read_pid()
+    if pid is None:
+        # Empty or unreadable: a start reserved by another process (review #5). Starting for 60 s after
+        # the file's modification time, dead afterwards.
+        try:
+            age = time.time() - _os.path.getmtime(PID_FILE)
+        except OSError:
+            return None
+        if age < PID_RESERVATION_SECONDS:
+            return _wait_for_starting_server()
+        try:
+            if _read_pid() is None and time.time() - _os.path.getmtime(PID_FILE) >= PID_RESERVATION_SECONDS:
+                _os.unlink(PID_FILE)
+        except OSError:
+            pass
+        return None
+    if _pid_is_own(pid):
+        if _shutdown_other_port(pid):
+            return _launch()
+        return _wait_for_starting_server()
+    _remove_pid_if(pid)
+    return None
+
+
 def _start_server():
     global _SERVER_STARTING, _FOREIGN_SERVER_ROOT
     _ensure_dirs()
+    for _ in range(3):
+        reserved = _reserve_pid_file()
+        if reserved is not False:
+            break
+        r = _follow_pid_file()  # another process starts or runs the server: do not launch
+        if r is not None:
+            return r
+    else:
+        return False
     try:
         if _os.path.exists(SERVER_LOG) and _os.path.getsize(SERVER_LOG) > 1024 * 1024:
             open(SERVER_LOG, "wb").close()
@@ -988,16 +1199,11 @@ def _start_server():
                                 stderr=log, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kwargs)
     except Exception as e:  # noqa: BLE001
         print(f"N3MC: could not start the memory server ({type(e).__name__}: {e})", file=sys.stderr)
+        if reserved:
+            _drop_reservation()
         return False
-    try:
-        with open(PID_FILE, "x", encoding="utf-8") as f:
-            f.write(str(proc.pid))
-    except FileExistsError:
-        try:
-            with open(PID_FILE, "w", encoding="utf-8") as f:
-                f.write(str(proc.pid))
-        except OSError:
-            pass
+    if reserved:
+        _write_reserved_pid(proc.pid)
     end = time.time() + SERVER_WAIT_SECONDS
     while time.time() < end:
         h = _get_health()
@@ -1082,26 +1288,9 @@ def ensure_server():
             return _launch()
         return _foreign(h)
     # no server answers
-    pid = _read_pid()
-    if pid is not None:
-        if _pid_is_own(pid):
-            if _shutdown_other_port(pid):
-                return _launch()
-            end = time.time() + SERVER_WAIT_SECONDS
-            while time.time() < end:
-                h = _get_health()
-                d = _health_decision(h)
-                if d in ("ok", "stale"):
-                    return True
-                if d in ("foreign", "legacy"):
-                    return _foreign(h)
-                time.sleep(0.5)
-            _SERVER_STARTING = True
-            return False
-        try:
-            _os.unlink(PID_FILE)
-        except OSError:
-            pass
+    r = _follow_pid_file()
+    if r is not None:
+        return r
     return _launch()
 
 
@@ -1889,7 +2078,11 @@ def cmd_reembed():
         return 1
     conn = _open_db()
     try:
-        dim = int(get_meta(conn, "embed_dim", _database.EMBED_DIM))
+        dim = vec_dim(conn)  # from the table definition, never EMBED_DIM (review #3)
+        if dim is None:
+            print("N3MC: --reembed: could not read the dimension of memories_vec from its table definition.",
+                  file=sys.stderr)
+            return 1
         if len(test) != dim:
             print(f"N3MC: --reembed: {model} makes {len(test)}-dimensional vectors but memories_vec has {dim}; "
                   "a different dimension needs the manual procedure in §3 \"Embeddings\".", file=sys.stderr)

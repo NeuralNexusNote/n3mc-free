@@ -209,6 +209,16 @@ def delete_meta(conn, key):
     conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
 
+_VEC_DIM_RE = re.compile(r"float\[\s*(\d+)\s*\]", re.IGNORECASE)
+
+
+def vec_dim(conn):
+    """Dimension of memories_vec, read from the table definition (the N of float[N]); None if unknown."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE name='memories_vec'").fetchone()
+    m = _VEC_DIM_RE.search(row[0] or "") if row else None
+    return int(m.group(1)) if m else None
+
+
 # ---- writes ---------------------------------------------------------------
 
 def insert_memory(conn, id, content, timestamp, owner_id, local_id=None, agent_name=None,
