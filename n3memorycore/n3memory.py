@@ -1553,8 +1553,21 @@ def _housekeeping():
         print(f"N3MC: could not rotate audit.log ({e})", file=sys.stderr)
 
 
+def _cwd_is_home(cwd=None):
+    """True when the current folder is the user's home folder. Its `.claude/` is Claude Code's user-level
+    folder: a rules file in `~/.claude/rules/` is read in every project, and `~/.claude/CLAUDE.md` is the
+    user's own file (2026-11-22)."""
+    try:
+        here = _os.path.normcase(_os.path.realpath(cwd or _os.getcwd()))
+        home = _os.path.normcase(_os.path.realpath(_os.path.expanduser("~")))
+        return here == home
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def cmd_stop():
-    for step in (_ensure_behavior_md, _retire_memory_context, _housekeeping):
+    steps = (_housekeeping,) if _cwd_is_home() else (_ensure_behavior_md, _retire_memory_context, _housekeeping)
+    for step in steps:
         try:
             step()
         except Exception as e:  # noqa: BLE001
