@@ -241,7 +241,7 @@ Once setup is complete, everything works automatically from the next session:
 
 N3MC finds records whose meaning is close to your question with vector search.
 `vector_min_cos` is the threshold for "how close is close enough to be a
-candidate" (default 0.85).
+candidate" (default 0.82; the specification's value is 0.85).
 
 | If you | What happens |
 |---|---|
@@ -254,6 +254,34 @@ restarts automatically). If the file has a typo and cannot be read, it is left
 untouched and N3MC runs with defaults until you fix it; a notice about this
 appears at the top of the recalled context once a day. Write numbers without
 quotes.
+
+If you installed N3MC before this change, your `config.json` already holds
+`"vector_min_cos": 0.85` (it was written there on the first run), and that value
+stays in use. Change it to 0.82 by hand to use the new default.
+
+### Search settings on by default (2026-11-22)
+
+Four more settings keep unrelated records out of the recalled context. They are
+on by default, run on the CPU, and need no other model. When your `config.json`
+lacks one of them, it is added with the default below on the next run.
+
+| Setting | Default | What it does | To turn it off |
+|---|---|---|---|
+| `fts_stopwords` | `true` | English function words (`the`, `is`, `of`, `who`, ...) are not used as keywords, so a question made of common words no longer matches almost every record | `false` |
+| `kw_only_min_terms` | `3` | A record found by its keywords only (not close enough in meaning) goes under Top matches only when it contains 3 different words of the question. Otherwise it can still appear as a weak match | `0` |
+| `top_matches_max` | `5` | At most 5 records under Top matches, so the recalled context stays short | `0` (then up to `search_result_limit`) |
+| `cross_lang_min_cos` | `0.80` | A Japanese question can find an English record and the other way round: the closest record written in the other script counts as a match from this similarity on | `0` |
+
+On the project's test set (65 questions, `eval/`), these settings and
+`vector_min_cos` 0.82 put the right record first for 38 of 50 questions instead
+of 31, and an unrelated record came up for 2 of 15 questions with no answer
+instead of 9. Details: `docs/REVIEW_SCORECARD_20261122_JP.md` (Japanese).
+
+These settings are not in the specification (`N3MemoryCore_v1.9.1_Free_*.md`),
+so code generated again from it does not have them. For the specification's
+search exactly, write `"vector_min_cos": 0.85, "fts_stopwords": false,
+"kw_only_min_terms": 0, "top_matches_max": 0, "cross_lang_min_cos": 0` in
+`~/.n3mc/config.json`.
 
 ### Weak matches (min_results)
 
