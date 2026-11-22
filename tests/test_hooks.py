@@ -143,6 +143,40 @@ class TestStopIdempotency:
         n3m.cmd_stop()
         assert (tmp_path / ".claude" / "rules" / "n3mc-behavior.md").exists()
 
+    def test_project_dir_is_used(self, tmp_path, monkeypatch):
+        """With CLAUDE_PROJECT_DIR naming another folder, --stop writes there and nothing in <cwd> (2026-11-22, F3)."""
+        project, sub = tmp_path / "proj", tmp_path / "proj" / "sub"
+        sub.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", project.as_posix())
+        monkeypatch.chdir(sub)
+        assert n3m.cmd_stop() == 0
+        assert (project / ".claude" / "rules" / "n3mc-behavior.md").exists()
+        assert not (sub / ".claude").exists()
+
+    def test_without_project_dir_cwd_is_used(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        n3m.cmd_stop()
+        assert (tmp_path / ".claude" / "rules" / "n3mc-behavior.md").exists()
+
+    def test_missing_project_dir_falls_back_to_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "gone"))
+        monkeypatch.chdir(tmp_path)
+        n3m.cmd_stop()
+        assert (tmp_path / ".claude" / "rules" / "n3mc-behavior.md").exists()
+        assert not (tmp_path / "gone").exists()
+
+    def test_project_dir_home_creates_nothing(self, tmp_path, monkeypatch):
+        home, work = tmp_path / "home", tmp_path / "work"
+        home.mkdir()
+        work.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", home.as_posix())
+        monkeypatch.chdir(work)
+        assert n3m.cmd_stop() == 0
+        assert not (home / ".claude").exists() and not (work / ".claude").exists()
+
     def test_rules_file_created(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         n3m.cmd_stop()

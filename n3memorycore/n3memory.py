@@ -1163,6 +1163,7 @@ def _save_record(content, agent_name=None, session_id=None, turn_id=None, local_
         try:
             r = _post("/buffer", body)
             if isinstance(r, dict) and r.get("status") in ("ok", "skipped"):
+                _clear_notice("save_failed")  # any save that ends ok / skipped clears it (2026-11-22, F2)
                 return r
         except Exception as e:  # noqa: BLE001
             print(f"N3MC: server save failed ({type(e).__name__}); saving directly", file=sys.stderr)
@@ -1565,11 +1566,26 @@ def _cwd_is_home(cwd=None):
         return False
 
 
+def _project_dir():
+    """The project folder for --stop (spec §4 "Project folder", 2026-11-22): $CLAUDE_PROJECT_DIR when it names
+    an existing folder (Claude Code sets it for hook commands), otherwise the working folder. Hooks run in the
+    session's current folder, a subfolder after Claude has cd'ed into it."""
+    p = _os.environ.get("CLAUDE_PROJECT_DIR")
+    try:
+        if p and _os.path.isdir(p):
+            return _os.path.abspath(p)
+    except Exception:  # noqa: BLE001
+        pass
+    return _os.getcwd()
+
+
 def cmd_stop():
-    steps = (_housekeeping,) if _cwd_is_home() else (_ensure_behavior_md, _retire_memory_context, _housekeeping)
-    for step in steps:
+    project = _project_dir()
+    steps = [] if _cwd_is_home(project) else [(_ensure_behavior_md, project), (_retire_memory_context, project)]
+    steps.append((_housekeeping, None))
+    for step, arg in steps:
         try:
-            step()
+            step(arg) if arg is not None else step()
         except Exception as e:  # noqa: BLE001
             print(f"N3MC: {step.__name__} failed ({type(e).__name__}: {e})", file=sys.stderr)
     return 0
@@ -1593,6 +1609,8 @@ PERMISSION_RULES = [
     "Bash(n3mc --show-turn *)",
     "Bash(n3mc --recall-thread *)",
 ]
+
+HOOK_TIMEOUT_SECONDS = 120  # "timeout" of both hook entries (spec §4 "Hook time limit", 2026-11-22)
 
 _OURS = {
     "UserPromptSubmit": ("n3mc-hook", "n3memorycore.n3mc_hook"),
@@ -1692,7 +1710,8 @@ def cmd_init():
                     print(f"Another N3MC hook is registered for {event} and was left in place: {c}")
             if inner:
                 kept.append({**entry, "hooks": inner})
-        kept.append({"hooks": [{"type": "command", "command": _resolve_cmd(exe_name)}]})
+        kept.append({"hooks": [{"type": "command", "command": _resolve_cmd(exe_name),
+                                "timeout": HOOK_TIMEOUT_SECONDS}]})
         hooks[event] = kept
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
     for rule in PERMISSION_RULES:
