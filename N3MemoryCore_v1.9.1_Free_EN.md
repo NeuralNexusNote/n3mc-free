@@ -37,6 +37,7 @@ By using this software, you agree to the terms above.
 | Python | 3.10 or higher |
 | pip packages | `fastapi` `uvicorn` `sqlite-vec` `sentence-transformers` `uuid7` `psutil` (**required since v1.5.0** — the CLI uses it to tell whether the process in the PID file is this folder's server while it is still starting; see §3 "PID file handling") |
 | Claude Code | Any recent version (hook support required — configured automatically, no prior knowledge needed) |
+| Git | Only for Path A (`git clone`); Path B does not use it |
 
 ### Quick Start
 
@@ -1623,7 +1624,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 ## 6. Autonomous Evaluation ([N3MC v1.9.1 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
-> **Definition of "implementation complete"**: Autonomously execute tests 1–7 below → run `n3mc --init` (displays "saving will start from the next session") → report ⭐⭐⭐⭐⭐. Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All three steps must finish before the implementation is considered done.
+> **Definition of "implementation complete"**: Autonomously execute tests 1–6 below → run `n3mc --init` (displays "saving will start from the next session") → run test 7.1 (hook registration check) → report ⭐⭐⭐⭐⭐. Tests 7.2 and 7.3 need a new session opened outside the project, so they are checked after Claude Code is restarted (report them as "to be checked after restart", not as failures). Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All of these steps must finish before the implementation is considered done.
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
 
