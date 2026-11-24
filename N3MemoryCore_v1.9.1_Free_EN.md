@@ -45,8 +45,11 @@ There are two ways to set it up. Method A, generating the code from this specifi
 
 **Method A: Generate from the spec (primary, recommended)**
 
-1. Load this specification into Claude Code and ask: "Please implement N3MemoryCore according to this specification."
-   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below): open Claude Code in an empty folder such as `~/<name>` first.
+1. **Make a folder**: in File Explorer, create one empty folder (for example `C:\Users\<you>\n3mc-free`). The code is generated in this folder and stays in use after setup; do not delete or move it later.
+2. **Put the specification in it**: copy the downloaded specification `N3MemoryCore_v1.9.1_Free_EN.md` into that folder (put nothing else in it).
+3. **Open Claude Code in that folder**: in the Claude desktop app, open the **Code** tab at the top of the sidebar and start a new session with **+ New**. In the row under the prompt box, choose **Local** as the environment, then click the folder control beside it, choose **Open folder…** and pick the folder from step 1. (In a terminal, change to that folder and run `claude`.)
+4. **Ask**: in the prompt box, send "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.1_Free_EN.md`."
+   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below).
    - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
 
 > **📖 After implementation (Method A only)**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
