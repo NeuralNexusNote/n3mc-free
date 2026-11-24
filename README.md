@@ -22,7 +22,7 @@ To install from PyPI instead (bonus), see [Method B: Install the package (bonus)
 
 > **⚠️ How long memories are kept, and data size**
 >
-> - **Memories are not deleted.** Free has no feature that deletes old records; they stay after a year without changing any setting.
+> - **Memories are not deleted.** Free has no feature that deletes old records.
 > - **More data makes it slower.** The more records there are, the longer a search takes.
 
 > A NeuralNexusNote™ product
@@ -88,7 +88,7 @@ _If several versions of the same content appear, the one with the newest `saved`
 [claude] Agreed, PostgreSQL it is. The reason, for the record: several editors at the same time, and SQLite allows one writer at a time. Next step: write the schema for the articles table.
 ```
 
-`Top matches` are the records that passed the relevance floors. `Possibly related` are the closest of the records that did not (see [Weak matches](#weak-matches-min_results)). The last part shows the whole exchange a top match belongs to.
+`Top matches` are the records that passed the relevance floors. `Possibly related` are the closest of the records that did not. The last part shows the whole exchange a top match belongs to.
 
 ### Relationship with Claude's built-in auto-memory
 
@@ -187,7 +187,7 @@ What does go over the network:
 | Search that stays fast as the memory grows | - | ✅ Above 20,000 records an in-memory index narrows the candidates |
 | The previous session's thread at session start | - | ✅ |
 | Your own agent's / install's memories ranked first (`b_local`) | - | ✅ |
-| Delete / pin individual records | - | ✅ |
+| Delete individual records | - | ✅ |
 | Retention period (`--gc`) | - | ✅ Off by default; you run it yourself |
 | Export / import | - | ✅ Data migration & sharing |
 | Entity index | - | ✅ |
@@ -324,64 +324,9 @@ Once setup is complete, everything works automatically from the next session:
 - Saving and searching happen in the background — no action needed on your part
 - The Stop hook writes a small rules file, `.claude/rules/n3mc-behavior.md`, into each project folder you work in. It tells Claude how to read the recalled block; a file you edited by hand is not replaced
 
-### Tuning recall (vector_min_cos)
+### Search settings
 
-N3MC finds records whose meaning is close to your question with vector search.
-`vector_min_cos` is the threshold for "how close is close enough to be a
-candidate" (default 0.82; the specification's value is 0.85).
-
-| If you | What happens |
-|---|---|
-| lower it (e.g. 0.80–0.83) | Records are found even when the wording differs, and short questions recall more. Less related records also come in, and the injected context gets longer |
-| raise it (e.g. 0.88) | Fewer loosely related records and shorter injected context. Related records are also dropped more easily |
-
-A sensible range is 0.80–0.88. Set it in `~/.n3mc/config.json`, e.g.
-`"vector_min_cos": 0.83`. It takes effect from the next question (the server
-restarts automatically). If the file has a typo and cannot be read, it is left
-untouched and N3MC runs with defaults until you fix it; a notice about this
-appears at the top of the recalled context once a day. Write numbers without
-quotes.
-
-If you installed N3MC before this change, your `config.json` already holds
-`"vector_min_cos": 0.85` (it was written there on the first run), and that value
-stays in use. Change it to 0.82 by hand to use the new default.
-
-### Search settings on by default (2026-11-22)
-
-Four more settings keep unrelated records out of the recalled context. They are
-on by default, run on the CPU, and need no other model. When your `config.json`
-lacks one of them, it is added with the default below on the next run.
-
-| Setting | Default | What it does | To turn it off |
-|---|---|---|---|
-| `fts_stopwords` | `true` | English function words (`the`, `is`, `of`, `who`, ...) are not used as keywords, so a question made of common words no longer matches almost every record | `false` |
-| `kw_only_min_terms` | `3` | A record found by its keywords only (not close enough in meaning) goes under Top matches only when it contains 3 different words of the question. Otherwise it can still appear as a weak match | `0` |
-| `top_matches_max` | `5` | At most 5 records under Top matches, so the recalled context stays short | `0` (then up to `search_result_limit`) |
-| `cross_lang_min_cos` | `0.80` | A Japanese question can find an English record and the other way round: the closest record written in the other script counts as a match from this similarity on | `0` |
-
-On the project's test set (65 questions), these settings and
-`vector_min_cos` 0.82 put the right record first for 38 of 50 questions instead
-of 31, and an unrelated record came up for 2 of 15 questions with no answer
-instead of 9.
-
-These settings are not in the specification (`N3MemoryCore_v1.9.1_Free_*.md`),
-so code generated again from it does not have them. For the specification's
-search exactly, write `"vector_min_cos": 0.85, "fts_stopwords": false,
-"kw_only_min_terms": 0, "top_matches_max": 0, "cross_lang_min_cos": 0` in
-`~/.n3mc/config.json`.
-
-### Weak matches (min_results)
-
-When fewer than 3 records pass the relevance floors, N3MC adds the closest
-of the records it dropped, up to 3 in total, under a separate heading
-`## Possibly related (weak matches — may be unrelated)`. Claude is told to use
-them only when they are actually relevant. This keeps a question from getting
-no memory at all, at the cost of up to 3 extra, mostly unrelated chunks per
-turn. Set `"min_results": 0` in `~/.n3mc/config.json` to turn it off, or
-another number to change the count.
-
-Old records are never hidden by their age: age only lowers their rank below
-newer records of the same relevance.
+How memories are recalled can be tuned in `~/.n3mc/config.json`. The main settings and what they do are described in the specification.
 
 ### Backup and restore
 
