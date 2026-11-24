@@ -60,7 +60,7 @@ pip install -e .          # editable install; or  pip install .
 n3mc --init               # creates ~/.n3mc/  and registers Claude Code hooks
 ```
 
-Then **restart Claude Code**. Memory kicks in from the next session.
+Then **restart Claude Code** (closing the window may not be enough: quit Claude from its icon under the "^" at the right end of the taskbar, or sign out of Windows once). Memory kicks in from the next session.
 
 ### Data Backup
 
@@ -1630,6 +1630,18 @@ After implementation is complete, autonomously resolve the following tests and r
 > - While fixing, run only the pytest files (§7) that concern the change; run the whole suite once, at the end.
 
 > **Definition of "implementation complete"**: Autonomously execute tests 1–6 below → run `n3mc --init` (displays "saving will start from the next session") → run test 7.1 (hook registration check) → report ⭐⭐⭐⭐⭐. Tests 7.2 and 7.3 need a new session opened outside the project, so they are checked after Claude Code is restarted (report them as "to be checked after restart", not as failures). Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All of these steps must finish before the implementation is considered done.
+
+> **Shape of the completion report**: so that the user does not miss the restart, write the completion report in this shape.
+> - At the **very top**, put the heading `## ⚠️ Claude Code must be restarted`, with the restart steps right below it. Test results and notes come after that.
+> - At the **very end**, put the line `> ⚠️ **Memory does not work until Claude Code is restarted.**`
+> - Write the restart steps for beginners: one action per step, in plain words. Never reduce them to the single sentence "Restart Claude Code". Tell the user:
+>   1. Close every open Claude Code (the desktop app, terminals, Claude Code in VS Code and other editors).
+>   2. Closing the window is not always enough: the app can keep running in the background. On Windows, open the "^" at the right end of the taskbar (near the clock); if a Claude icon is there, right-click it and quit.
+>   3. If unsure, sign out of Windows once and sign in again: Start menu → your account icon (bottom left) → **Sign out**. Restarting the PC also works.
+>   4. Open Claude Code again. Memory works from the next session.
+>   5. After reopening, open this same session and send "I restarted".
+> - When the user sends "I restarted" (or the same in their language), check that the message was saved (this product's `--list` shows its `[user]` line) and that `# Recalled Memory Context` arrived in that turn, and tell the user briefly whether memory works. Then tell them what to do next: go to Phase 2 of the appendix "Recommended Development Workflow" at the end of the specification and paste its prompts in order.
+
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
 
