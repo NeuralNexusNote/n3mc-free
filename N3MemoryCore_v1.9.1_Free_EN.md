@@ -37,13 +37,21 @@ By using this software, you agree to the terms above.
 | Python | 3.10 or higher |
 | pip packages | `fastapi` `uvicorn` `sqlite-vec` `sentence-transformers` `uuid7` `psutil` (**required since v1.5.0** — the CLI uses it to tell whether the process in the PID file is this folder's server while it is still starting; see §3 "PID file handling") |
 | Claude Code | Any recent version (hook support required — configured automatically, no prior knowledge needed) |
-| Git | Only for Path A (`git clone`); Path B does not use it |
+| Git | Only for Method B (`git clone`); Method A does not use it |
 
 ### Quick Start
 
-There are two supported setup paths:
+There are two ways to set it up. Method A, generating the code from this specification, is the primary one; Method B, installing the package, is a bonus:
 
-**Path A — Quick Start with `pip`** (use the reference build directly)
+**Method A: Generate from the spec (primary, recommended)**
+
+1. Load this specification into Claude Code and ask: "Please implement N3MemoryCore according to this specification."
+   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below): open Claude Code in an empty folder such as `~/<name>` first.
+   - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
+
+> **📖 After implementation (Method A only)**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
+
+**Method B: Install the package (bonus)**
 
 ```bash
 git clone https://github.com/NeuralNexusNote/n3mc-free.git
@@ -53,14 +61,6 @@ n3mc --init               # creates ~/.n3mc/  and registers Claude Code hooks
 ```
 
 Then **restart Claude Code**. Memory kicks in from the next session.
-
-**Path B — AI-Native Setup** (regenerate from this specification)
-
-1. Load this specification into Claude Code and ask: "Please implement N3MemoryCore according to this specification."
-   - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below): open Claude Code in an empty folder such as `~/<name>` first.
-   - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
-
-> **📖 After implementation (Path B only)**: Be sure to review **"Appendix: Recommended Development Workflow"** at the end of this document. It contains debugging and quality review steps (operated by you, the human).
 
 ### Data Backup
 
@@ -78,7 +78,7 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 
 > **Do NOT output manual command hints** (e.g., `n3mc --buffer "fact to save"`, `n3mc --search "keyword"`, `n3mc --list`) at any point during or after implementation.
 
-> **⚠️ Install folder check (Path B — do this first, before anything else)**: Path B writes the code into the folder Claude Code is open in (the current working directory): `pyproject.toml`, `README.md`, `tests/`, `n3memorycore/` and the other files of §2. That folder stays in use after setup: with `pip install -e .` the hooks run the code from it, so deleting or moving it later stops the memory from working.
+> **⚠️ Install folder check (Method A — do this first, before anything else)**: Method A writes the code into the folder Claude Code is open in (the current working directory): `pyproject.toml`, `README.md`, `tests/`, `n3memorycore/` and the other files of §2. That folder stays in use after setup: with `pip install -e .` the hooks run the code from it, so deleting or moving it later stops the memory from working.
 > 1. Show the user the absolute path of the current working directory and this message: "N3MemoryCore will be installed in this folder: <absolute path>. The code will stay here; deleting or moving this folder later stops the memory hooks. Continue? (yes/no)". **Wait for the user's answer.** Continue only on a clear yes. This is the only confirmation of the setup; everything after it runs automatically.
 > 2. Before asking, look at the folder. If it contains anything other than this specification file, `.claude/`, `.git/` and the files of an earlier setup of this product (`n3memorycore/`, `pyproject.toml` whose `name` is this package's), **do not ask: abort** and display: "This folder already contains other files (for example a project of yours). Setting up here could overwrite them. Create an empty folder such as `~/n3mc-free`, open Claude Code there, and run this setup again." Never overwrite or mix into an existing project.
 > 3. Do not install into the home folder itself (`~`) or a system folder.
@@ -986,13 +986,13 @@ Register hooks **and the permission rules for the N3MC commands** in the **user-
 >
 > The single most common reason cross-session RAG fails to work after a "successful" install is that the AI implementing this spec generated all the Python code, started the server, ran `--buffer` / `--search` smoke tests successfully — and then **left the `~/.claude/settings.json` hook block to the user** (or skipped it because it touches a global config file). When this happens, every subsequent Claude Code session running outside the project directory has **zero hooks firing**, so no conversation gets auto-saved and no `--search` runs at the start of each turn. The user sees the smoke test pass, believes the install is complete, and discovers months later that nothing they said to Claude was ever recorded.
 >
-> **The implementation MUST write the hook block in §4 ① below into `~/.claude/settings.json` idempotently as part of automated setup, before reporting completion.** Path A (`pip install` + `n3mc --init`) does this for you. Path B (AI-Native regeneration) must do it programmatically — do not ask the user to do it manually, and do not skip it because it modifies a global file.
+> **The implementation MUST write the hook block in §4 ① below into `~/.claude/settings.json` idempotently as part of automated setup, before reporting completion.** Method B (`pip install` + `n3mc --init`) does this for you. Method A (AI-Native regeneration) must do it programmatically — do not ask the user to do it manually, and do not skip it because it modifies a global file.
 >
 > Verification gate (also see §6 test 7): the implementation is **not** complete until the global `~/.claude/settings.json` contains hook entries whose `command` strings reference `n3mc-hook` (UserPromptSubmit) and `n3mc-stop-hook` (Stop). For pip installs, those resolve to the absolute path of the entry-point scripts (e.g. `.../Scripts/n3mc-hook.exe` on Windows or `.../bin/n3mc-hook` on Unix).
 
 ### ① Global Settings (`~/.claude/settings.json`) — Hook Registration
 
-#### Path A — let `n3mc --init` do it (recommended)
+#### Let `n3mc --init` do it (recommended)
 
 After `pip install`, run:
 
@@ -1000,7 +1000,7 @@ After `pip install`, run:
 n3mc --init
 ```
 
-This writes the hook block into `~/.claude/settings.json` with the absolute path of `n3mc-hook` / `n3mc-stop-hook` (looked up first in the scripts folder of the running Python, then with `shutil.which`; see `resolve_cmd` in Path B), and adds the permission rules of §4 ② to `permissions.allow`. Re-running is a no-op (idempotent — entries that belong to **this package** are replaced rather than duplicated; hooks of other N3MC editions are left alone, see Path B).
+This writes the hook block into `~/.claude/settings.json` with the absolute path of `n3mc-hook` / `n3mc-stop-hook` (looked up first in the scripts folder of the running Python, then with `shutil.which`; see `resolve_cmd` in the Idempotent Hook Installation Algorithm below), and adds the permission rules of §4 ② to `permissions.allow`. Re-running is a no-op (idempotent — entries that belong to **this package** are replaced rather than duplicated; hooks of other N3MC editions are left alone, see the Idempotent Hook Installation Algorithm below).
 
 The resulting block looks like (paths vary per machine):
 
@@ -1035,7 +1035,7 @@ The resulting block looks like (paths vary per machine):
 
 > **⚠️ Path separators**: Claude Code uses a bash shell, so Windows backslashes (`\`) are interpreted as escape sequences (`\n`→newline, `\t`→tab). `n3mc --init` always writes forward slashes — if you patch the file by hand, do the same.
 
-#### Path B — Idempotent Hook Installation Algorithm (for AI-Native regeneration)
+#### Idempotent Hook Installation Algorithm (for AI-Native regeneration)
 
 When regenerating from this spec, the AI must execute logic equivalent to the following against `~/.claude/settings.json`. The merge **preserves all existing fields** (`permissions`, `autoUpdatesChannel`, anything else the user has) and only adds the two hook entries and the missing permission rules; hook entries that belong to **this package** are replaced (not duplicated). **Hooks of other programs — including other N3MC editions such as Pro, whose hook is also a script named `n3mc_hook.py` — are never removed.** Re-running the algorithm on an already-installed environment is a no-op (nothing is written).
 
@@ -1216,7 +1216,7 @@ There are two callable entry-point forms, and **the `python -m n3memorycore.n3me
 >
 > **⚠️ Path quoting**: The `n3mc` console-script form is convenient for interactive use but is `PATH`-dependent. Inside a venv where the `python` interpreter location matters, the user may add a wildcard pattern like `Bash(python *n3memorycore.n3memory* --search *)` to absorb interpreter-path variation (`--init` does not add it).
 >
-> **The generated folder gets no `.claude/settings.json` (decided 2026-11-24).** In Path B `--init` always puts the same list into `~/.claude/settings.json`, and Claude Code does not write its own settings files with its file tools without a confirmation (with automatic approval they are refused). Generating MCP Pro in a virtual machine was refused at that write.
+> **The generated folder gets no `.claude/settings.json` (decided 2026-11-24).** In Method A `--init` always puts the same list into `~/.claude/settings.json`, and Claude Code does not write its own settings files with its file tools without a confirmation (with automatic approval they are refused). Generating MCP Pro in a virtual machine was refused at that write.
 
 ### `--stop` Hook Specification (Session Termination Processing)
 
@@ -1662,7 +1662,7 @@ After implementation is complete, autonomously resolve the following tests and r
       ```bash
       python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3memorycore.n3mc_hook' in c.get('command','').lower() or 'n3mc-hook' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3memorycore.n3mc_stop_hook' in c.get('command','').lower() or 'n3mc-stop-hook' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; assert 'Bash(python -m n3memorycore.n3memory --search *)' in s.get('permissions',{}).get('allow',[]), 'permission rules missing'; print('OK')"
       ```
-      Pass criterion: prints `OK` (the check looks for this package's entry point or module, so another edition's `n3mc_hook.py` does not satisfy it, and for the §4 ② permission rules). If this assertion fails, **the implementation is not complete** — run `n3mc --init` (Path A) or re-run the idempotent installer (Path B) in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
+      Pass criterion: prints `OK` (the check looks for this package's entry point or module, so another edition's `n3mc_hook.py` does not satisfy it, and for the §4 ② permission rules). If this assertion fails, **the implementation is not complete** — run `n3mc --init` (Method B) or re-run the idempotent installer (Method A) in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
    2. **UserPromptSubmit**: From a Claude Code session running **outside the n3mc-free project directory** (e.g. `~`), send a user message and confirm that `# Recalled Memory Context` is included in that turn's context (the hook's stdout). Confirm that both the preceding Claude response (read from the transcript when Stop did not save it, §4.5) and the user message are saved to the DB (check `n3mc --list` for records with `[claude]` and `[user]` prefixes). The "outside the project directory" stipulation is essential — running the test from inside the project would mask a missing global registration.
    3. **Stop**: After session termination of that same outside-the-project session, confirm that Claude's final response is saved to the DB. Confirm that the first line of the project's `.claude/rules/n3mc-behavior.md` is `<!-- n3mc-behavior v3 -->`. Confirm that the project's `.claude/CLAUDE.md` contains **no** `@import` line for `memory_context.md`.
 

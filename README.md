@@ -117,7 +117,7 @@ This project prioritizes Instructions over Static Code. Please read our [Develop
 > Claude Code turned it into working code. Gemini reviewed it.
 > Iterated across three AIs — that process is N3MemoryCore.
 
-**Two install paths are supported**: `pip install` the reference build and run `n3mc --init`, or drop the specification into Claude Code and let it build the system. Either way, no manual hook editing. (See [Setup](#setup) below.)
+**Two ways to install**: drop the specification into Claude Code and let it build the system (primary), or `pip install` the reference build and run `n3mc --init` (bonus). Either way, no manual hook editing. (See [Setup](#setup) below.)
 
 ## Free or Lite? Which one to use
 
@@ -204,9 +204,23 @@ Nothing is deleted or replaced automatically in either edition.
 
 ## Setup
 
-There are two supported setup paths. Pick whichever fits your style. (The names are the same as in the specification: Path A is `pip`, Path B is AI-native.)
+There are two ways to set it up. Method A, generating the code from the specification, is the primary one; Method B, installing the package, is a bonus. (The names are the same as in the specification.)
 
-### Path A — Quick Start with `pip`
+### Method A: Generate from the spec (primary, recommended)
+
+Let Claude Code generate the code from the specification:
+
+1. Create an **empty folder** (for example `~/n3mc-free`) and put one specification file from the table above into it
+2. Open Claude Code in that folder
+3. Say: "Please implement N3MemoryCore according to this specification."
+
+Claude Code shows the folder and asks you once to confirm it; then it writes the code, configures the hooks, and sets everything up. It stops instead if the folder holds other files, so that a project of yours is not overwritten.
+Setup takes roughly 15–30 minutes (varies by environment and model).
+Memory kicks in from the next session. The generated code stays in that folder: deleting or moving it later stops the memory.
+
+---
+
+### Method B: Install the package (bonus)
 
 Use the reference build directly:
 
@@ -277,21 +291,7 @@ Set `N3MC_HOME=/path/to/dir` to keep the data somewhere else. N3MC reads the var
 
 ---
 
-### Path B — AI-Native Setup
-
-Let Claude Code generate the code from the specification:
-
-1. Create an **empty folder** (for example `~/n3mc-free`) and put one specification file from the table above into it
-2. Open Claude Code in that folder
-3. Say: "Please implement N3MemoryCore according to this specification."
-
-Claude Code shows the folder and asks you once to confirm it; then it writes the code, configures the hooks, and sets everything up. It stops instead if the folder holds other files, so that a project of yours is not overwritten.
-Setup takes roughly 15–30 minutes (varies by environment and model).
-Memory kicks in from the next session. The generated code stays in that folder: deleting or moving it later stops the memory.
-
----
-
-### Troubleshooting (Path A)
+### Troubleshooting (Method B)
 
 **`n3mc: command not found` after `pip install`**
 Your Python `Scripts/` (Windows) or `bin/` (Linux) directory is not on `PATH`. Either add it to `PATH`, or invoke as `python -m n3memorycore.n3memory --init` instead.
@@ -387,7 +387,7 @@ Keep these 2 files together: `config.json` holds the IDs that are stamped on the
 
 ### Uninstall
 
-If you set up via Path B, ask Claude Code: "Please delete N3MemoryCore." — it also removes the hook configuration.
+If you set up via Method A, ask Claude Code: "Please delete N3MemoryCore." — it also removes the hook configuration.
 
 To do it yourself:
 
