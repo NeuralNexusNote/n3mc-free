@@ -1632,7 +1632,7 @@ After implementation is complete, autonomously resolve the following tests and r
 > **Definition of "implementation complete"**: Autonomously execute tests 1–6 below → run `n3mc --init` (displays "saving will start from the next session") → run test 7.1 (hook registration check) → report ⭐⭐⭐⭐⭐. Tests 7.2 and 7.3 need a new session opened outside the project, so they are checked after Claude Code is restarted (report them as "to be checked after restart", not as failures). Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All of these steps must finish before the implementation is considered done.
 
 > **Shape of the completion report**: so that the user does not miss the restart, write the completion report in this shape.
-> - At the **very top**, put the heading `## ⚠️ Claude Code must be restarted`, with the restart steps right below it. Test results and notes come after that.
+> - At the **very top**, put the heading `## ⚠️ Claude Code must be restarted`, with the restart steps right below it. Test results and notes come after that. **The first line of the report must be this heading**; put nothing such as "Implementation complete" before it.
 > - At the **very end**, put the line `> ⚠️ **Memory does not work until Claude Code is restarted.**`
 > - Write the restart steps for beginners: one action per step, in plain words. Never reduce them to the single sentence "Restart Claude Code". Tell the user:
 >   1. Close every open Claude Code (the desktop app, terminals, Claude Code in VS Code and other editors).
