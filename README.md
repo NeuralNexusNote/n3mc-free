@@ -10,7 +10,9 @@ the hooks do both on every turn.
 
 1. Create an empty folder and put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it
 2. Open Claude Code in that folder and say: "Please implement N3MemoryCore according to this specification."
-3. When it is done, restart Claude Code
+3. When it is done, restart Claude Code (closing the window may not be enough; see [Restart Claude Code](#4-restart-claude-code))
+
+After the restart, open the same session and send "I restarted". Claude Code checks that memory works and tells you what to do next.
 
 Memory works from the next session. The first run
 downloads the search model (about 1.1 GB) once. Details: [Setup](#setup).
@@ -274,6 +276,8 @@ If you see `OK`, the hooks and permission rules are registered correctly. If you
 #### 4. Restart Claude Code
 
 Close **every** running Claude Code session (terminal CLI windows, IDE extensions like VS Code's "Claude Code" panel, etc.) and start a fresh one. Hooks are read at session startup; sessions started before `n3mc --init` will not pick up the new hooks.
+
+Closing the window is not always enough: the app can keep running in the background. On Windows, open the "^" at the right end of the taskbar (near the clock); if a Claude icon is there, right-click it and quit. If unsure, sign out of Windows once and sign in again (Start menu → your account icon at the bottom left → **Sign out**), or restart the PC.
 
 #### 5. Confirm it's working
 
