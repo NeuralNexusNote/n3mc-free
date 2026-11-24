@@ -1,6 +1,6 @@
-# N3MemoryCore (N3MC)
+# N3MemoryCore Free (n3mc-free) v1.9.1
 
-**Give Claude Code a memory that does not fade.**
+**Give Claude Code a memory that does not fade — free, on your own PC.**
 
 Claude Code forgets what you were working on when you close the conversation.
 N3MemoryCore saves every message and reply in a file on your own PC, and brings
@@ -8,9 +8,11 @@ the related ones back the next time you talk about the same thing. You do not
 have to say "remember this", and Claude does not have to call a search tool:
 the hooks do both on every turn.
 
-1. Create an empty folder and put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it
-2. Open Claude Code in that folder and say: "Please implement N3MemoryCore according to this specification."
-3. When it is done, restart Claude Code (closing the window may not be enough; see [Restart Claude Code](#4-restart-claude-code))
+1. In File Explorer, create an empty folder
+2. Put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it (put nothing else in it)
+3. In the Claude desktop app, open the **Code** tab, start a new session with **+ New**, choose **Local**, then **Open folder…** and pick that folder (in a terminal, change to that folder and run `claude`)
+4. Send: "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.1_Free_EN.md`."
+5. When it is done, restart Claude Code (closing the window may not be enough; see [Restart Claude Code](#4-restart-claude-code))
 
 After the restart, open the same session and send "I restarted". Claude Code checks that memory works and tells you what to do next.
 
@@ -119,7 +121,7 @@ This project prioritizes Instructions over Static Code. Please read our [Develop
 > Claude Code turned it into working code. Gemini reviewed it.
 > Iterated across three AIs — that process is N3MemoryCore.
 
-**Two ways to install**: drop the specification into Claude Code and let it build the system (primary), or `pip install` the reference build and run `n3mc --init` (bonus). Either way, no manual hook editing. (See [Setup](#setup) below.)
+**Two ways to install**: give the specification to Claude Code and let it build the system (primary), or `pip install` the reference build and run `n3mc --init` (bonus). Either way, no manual hook editing. (See [Setup](#setup) below.)
 
 ## Free or Lite? Which one to use
 
@@ -212,9 +214,10 @@ There are two ways to set it up. Method A, generating the code from the specific
 
 Let Claude Code generate the code from the specification:
 
-1. Create an **empty folder** (for example `~/n3mc-free`) and put one specification file from the table above into it
-2. Open Claude Code in that folder
-3. Say: "Please implement N3MemoryCore according to this specification."
+1. **Make a folder**: in File Explorer, create one empty folder (for example `C:\Users\<you>\n3mc-free`). The code is generated in this folder and stays in use after setup; do not delete or move it later.
+2. **Put the specification in it**: copy the downloaded specification `N3MemoryCore_v1.9.1_Free_EN.md` into that folder (put nothing else in it).
+3. **Open Claude Code in that folder**: in the Claude desktop app, open the **Code** tab at the top of the sidebar and start a new session with **+ New**. In the row under the prompt box, choose **Local** as the environment, then click the folder control beside it, choose **Open folder…** and pick the folder from step 1. (In a terminal, change to that folder and run `claude`.)
+4. **Ask**: in the prompt box, send "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.1_Free_EN.md`."
 
 Claude Code shows the folder and asks you once to confirm it; then it writes the code, configures the hooks, and sets everything up. It stops instead if the folder holds other files, so that a project of yours is not overwritten.
 Setup takes roughly 15–30 minutes (varies by environment and model).
