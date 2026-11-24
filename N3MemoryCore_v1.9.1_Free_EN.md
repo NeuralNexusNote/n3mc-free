@@ -1623,6 +1623,12 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 ## 6. Autonomous Evaluation ([N3MC v1.9.1 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
+> **How to run them (to save time, 2026-11-24)**: when the tests use a temporary data folder:
+> - Prepare one temporary data folder and one port, and keep the resident server running across the tests. Do not recreate the folder or restart the server for each test (every start reloads the embedding model, about 20–30 seconds).
+> - Run the tests that rewrite `config.json` last, together (changing settings can restart the server).
+> - Make only the data folder temporary. Even when `HOME` / `USERPROFILE` are changed, keep `HF_HOME` pointing at the real model cache (`~/.cache/huggingface`), so the model (about 1.1 GB) is not downloaded again.
+> - While fixing, run only the pytest files (§7) that concern the change; run the whole suite once, at the end.
+
 > **Definition of "implementation complete"**: Autonomously execute tests 1–6 below → run `n3mc --init` (displays "saving will start from the next session") → run test 7.1 (hook registration check) → report ⭐⭐⭐⭐⭐. Tests 7.2 and 7.3 need a new session opened outside the project, so they are checked after Claude Code is restarted (report them as "to be checked after restart", not as failures). Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All of these steps must finish before the implementation is considered done.
 
 1. **Resident Speed & Process Management**: Measure and record the response time of `--search` (target: up to 2.0s on CPU). Verify that PID file creation, deletion, and restart function correctly.
