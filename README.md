@@ -8,13 +8,13 @@ the related ones back the next time you talk about the same thing. You do not
 have to say "remember this", and Claude does not have to call a search tool:
 the hooks do both on every turn.
 
-```bash
-pip install n3memorycore-free
-n3mc --init
-```
+1. Create an empty folder and put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it
+2. Open Claude Code in that folder and say: "Please implement N3MemoryCore according to this specification."
+3. When it is done, restart Claude Code
 
-Then restart Claude Code. Memory works from the next session. The first run
+Memory works from the next session. The first run
 downloads the search model (about 1.1 GB) once. Details: [Setup](#setup).
+To install from PyPI instead (bonus), see [Method B: Install the package (bonus)](#method-b-install-the-package-bonus).
 
 > **⚠️ How long memories are kept, and data size**
 >
