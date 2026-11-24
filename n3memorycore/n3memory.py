@@ -1474,6 +1474,32 @@ def _user_text(content):
     return None
 
 
+_REMINDER_OPEN = "<system-reminder>"
+_REMINDER_CLOSE = "</system-reminder>"
+
+
+def _user_prompt_text(text):
+    """The text the user typed, or None for a system input.
+
+    A message that starts with ``<system-reminder>`` loses every leading
+    ``<system-reminder>...</system-reminder>`` block; the stripped rest is user text
+    when it is not empty and is not another system input. A missing closing tag
+    makes the whole message a system input. Other messages are returned unchanged.
+    """
+    rest = text.lstrip()
+    if not rest.startswith(_REMINDER_OPEN):
+        return None if rest.startswith(_SYSTEM_PROMPT_PREFIXES) else text
+    while rest.startswith(_REMINDER_OPEN):
+        end = rest.find(_REMINDER_CLOSE)
+        if end < 0:
+            return None
+        rest = rest[end + len(_REMINDER_CLOSE):].lstrip()
+    rest = rest.strip()
+    if not rest or rest.startswith(_SYSTEM_PROMPT_PREFIXES):
+        return None
+    return rest
+
+
 def _last_assistant_text(path, current_prompt):
     """The last assistant text block before the current prompt, read from the session transcript."""
     if not path:
@@ -1490,7 +1516,7 @@ def _last_assistant_text(path, current_prompt):
     except Exception as e:  # noqa: BLE001
         _audit_stage("UserPromptSubmit", "transcript_unreadable", reason=f"{type(e).__name__}")
         return None
-    skip_prefixes = ("[Request interrupted by user", "<command-", "<local-command-") + _SYSTEM_PROMPT_PREFIXES
+    skip_prefixes = ("[Request interrupted by user", "<command-", "<local-command-")
     first = True
     cur = (current_prompt or "").strip()
     for line in reversed(lines):
@@ -1509,7 +1535,11 @@ def _last_assistant_text(path, current_prompt):
             if obj.get("isMeta"):
                 continue
             text = _user_text(content)
-            real = text is not None and not text.lstrip().startswith(skip_prefixes)
+            if text is not None and not text.lstrip().startswith(skip_prefixes):
+                text = _user_prompt_text(text)  # None for a system input
+            else:
+                text = None
+            real = text is not None
             if first:
                 first = False
                 if real and text.strip() == cur:
@@ -1542,10 +1572,12 @@ def cmd_hook_submit():
     prompt = data.get("prompt") if data.get("prompt") is not None else data.get("message")
     text = _extract_text(prompt)
     session_id = data.get("session_id") or None
-    if text.lstrip().startswith(_SYSTEM_PROMPT_PREFIXES):
+    user_text = _user_prompt_text(text)
+    if user_text is None:
         _audit_stage("UserPromptSubmit", "skipped", reason="system_prompt")
         print("# Recalled Memory Context\n\n_No relevant memories found._\n")
         return 0
+    text = user_text
     failed = 0
     if _use_server():
         try:
