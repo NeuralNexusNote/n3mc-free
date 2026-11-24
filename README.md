@@ -7,6 +7,7 @@ N3MemoryCore saves every message and reply in a file on your own PC, and brings
 the related ones back the next time you talk about the same thing. You do not
 have to say "remember this", and Claude does not have to call a search tool:
 the hooks do both on every turn.
+Of the AI's memory, N3MC covers the **conversation history** layer (what was said, when, and in which conversation). It does not cover the rules that are always loaded, such as CLAUDE.md, or connections to external tools.
 
 1. In File Explorer, create an empty folder
 2. Put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it (put nothing else in it)
@@ -19,6 +20,12 @@ After the restart, open the same session and send "I restarted". Claude Code che
 Memory works from the next session. The first run
 downloads the search model (about 1.1 GB) once. Details: [Setup](#setup).
 To install from PyPI instead (bonus), see [Method B: Install the package (bonus)](#method-b-install-the-package-bonus).
+
+> **⚠️ Disclaimer**
+>
+> - **No support, no claims**: This project is provided as-is with no support. Questions, bug reports, and feature requests are not guaranteed a response. Use entirely at your own discretion.
+> - **Use at your own risk**: This system runs on AI-generated code. The author is not responsible for any data changes or issues caused by its use.
+> - **Backup first**: Always back up your current environment before running this on important projects.
 
 > **⚠️ How long memories are kept, and data size**
 >
@@ -400,12 +407,6 @@ N3MemoryCore is built from a specification, so extending it is as simple as aski
 - **Hashtag support** — Claude auto-tags memories with `#hashtags` for filtered search (e.g. `--search "#AWS"`) — works with existing FTS, no DB changes needed
 
 Just load the specification into Claude Code and say what you want to add.
-
-## ⚠️ Disclaimer
-
-- **No support, no claims**: This project is provided as-is with no support. Questions, bug reports, and feature requests are not guaranteed a response. Use entirely at your own discretion.
-- **Use at your own risk**: This system runs on AI-generated code. The author is not responsible for any data changes or issues caused by its use.
-- **Backup first**: Always back up your current environment before running this on important projects.
 
 ---
 
