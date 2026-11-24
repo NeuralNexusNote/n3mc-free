@@ -7,6 +7,7 @@ N3MemoryCore saves every message and reply in a file on your own PC, and brings
 the related ones back the next time you talk about the same thing. You do not
 have to say "remember this", and Claude does not have to call a search tool:
 the hooks do both on every turn.
+Of the AI's memory, N3MC covers the **conversation history** layer (what was said, when, and in which conversation). It does not cover the rules that are always loaded, such as CLAUDE.md, or connections to external tools.
 
 1. In File Explorer, create an empty folder
 2. Put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it (put nothing else in it)
