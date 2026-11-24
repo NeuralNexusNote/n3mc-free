@@ -152,7 +152,6 @@ n3mc-free/                       # リポジトリルート
 │   ├── test_review_2026_11_17.py   # 2026-11-17 のコードレビュー: チャンクの長さの上限、Windows のフックのパス（モデル不要、§7 Layer 5）
 │   └── test_index_meta.py       # meta 表、モデルの食い違いの通知、--reembed（v1.8.0。モデル不要、§7 Layer 5）
 └── .claude/                     # プロジェクト固有 Claude Code 設定（git 追跡）
-    ├── settings.json            # パーミッション許可リスト（フックはユーザー全体の ~/.claude/settings.json に登録 — §4 参照）
     ├── CLAUDE.md                # プロジェクト用ガイダンス（N3MC は何も書き足さない。旧版の memory_context.md への @import は --stop が取り除く）
     └── rules/
         └── n3mc-behavior.md     # AI 行動指針（--stop により自動生成・版の更新）
@@ -1215,7 +1214,7 @@ Claude が直接呼び出すエントリポイントは 2 系統ある。**Claud
 >
 > **⚠️ パスの引用符**: `n3mc` コンソールスクリプト形式は対話シェル用途では便利だが、PATH 依存。venv 内などで `python` インタプリタの位置に依存する場合は、ユーザーが `Bash(python *n3memorycore.n3memory* --search *)` のようなワイルドカードを足して、インタプリタパスのバリエーションを吸収させてもよい（`--init` はこれを足さない）。
 >
-> リポジトリ自身の `.claude/settings.json` にも同じ一覧があり、`--init` を実行せずにリポジトリの中で作業する人のためのものである。
+> **生成したフォルダの `.claude/settings.json` は作らない（2026-11-24 に決定）。** 経路 B では必ず `--init` が、同じ一覧を `~/.claude/settings.json` に入れる。また、Claude Code は自分の設定ファイルを、ファイルを書く道具では確認なしに書かない（自動で進める設定では拒否される）。MCP Pro の仮想マシンでの生成で、ここで書き込みが拒否された。
 
 ### `--stop` フック仕様（セッション終了処理）
 

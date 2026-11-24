@@ -152,7 +152,6 @@ n3mc-free/                       # Repository root
 │   ├── test_review_2026_11_17.py   # 2026-11-17 code review: chunk length bound, Windows hook paths (no model needed, §7 Layer 5)
 │   └── test_index_meta.py       # meta table, model mismatch notice, --reembed (v1.8.0; no model needed, §7 Layer 5)
 └── .claude/                     # Project-scoped Claude Code config (tracked)
-    ├── settings.json            # Permission allowlist (Hooks live in user-global ~/.claude/settings.json — see §4)
     ├── CLAUDE.md                # Per-project guidance (N3MC adds nothing; --stop removes the memory_context.md @import written by older versions)
     └── rules/
         └── n3mc-behavior.md     # AI behavioral guidelines (auto-generated and version-updated by --stop)
@@ -1217,7 +1216,7 @@ There are two callable entry-point forms, and **the `python -m n3memorycore.n3me
 >
 > **⚠️ Path quoting**: The `n3mc` console-script form is convenient for interactive use but is `PATH`-dependent. Inside a venv where the `python` interpreter location matters, the user may add a wildcard pattern like `Bash(python *n3memorycore.n3memory* --search *)` to absorb interpreter-path variation (`--init` does not add it).
 >
-> The repository's own `.claude/settings.json` keeps the same list for people who work inside the repository without running `--init`.
+> **The generated folder gets no `.claude/settings.json` (decided 2026-11-24).** In Path B `--init` always puts the same list into `~/.claude/settings.json`, and Claude Code does not write its own settings files with its file tools without a confirmation (with automatic approval they are refused). Generating MCP Pro in a virtual machine was refused at that write.
 
 ### `--stop` Hook Specification (Session Termination Processing)
 
