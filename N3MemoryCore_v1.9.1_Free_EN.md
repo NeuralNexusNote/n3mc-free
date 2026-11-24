@@ -3,6 +3,8 @@
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
 >
+> **Which memory N3MC provides**: N3MC is the **conversation history** layer of the AI's memory — its long-term, episodic memory (what was said, when, and in which conversation). It keeps conversations as they happened and brings back the related moments later. It does not cover the rules that are always loaded (user settings such as CLAUDE.md) or connections to external tools.
+>
 > **Who is this for?** Claude Code users who want persistent, searchable memory that survives across sessions — without manually maintaining CLAUDE.md.
 >
 > **Tested with**: Claude Pro (claude.ai/code) on Windows 11 and Ubuntu.

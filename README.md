@@ -20,6 +20,12 @@ Memory works from the next session. The first run
 downloads the search model (about 1.1 GB) once. Details: [Setup](#setup).
 To install from PyPI instead (bonus), see [Method B: Install the package (bonus)](#method-b-install-the-package-bonus).
 
+> **⚠️ Disclaimer**
+>
+> - **No support, no claims**: This project is provided as-is with no support. Questions, bug reports, and feature requests are not guaranteed a response. Use entirely at your own discretion.
+> - **Use at your own risk**: This system runs on AI-generated code. The author is not responsible for any data changes or issues caused by its use.
+> - **Backup first**: Always back up your current environment before running this on important projects.
+
 > **⚠️ How long memories are kept, and data size**
 >
 > - **Memories are not deleted.** Free has no feature that deletes old records.
@@ -400,12 +406,6 @@ N3MemoryCore is built from a specification, so extending it is as simple as aski
 - **Hashtag support** — Claude auto-tags memories with `#hashtags` for filtered search (e.g. `--search "#AWS"`) — works with existing FTS, no DB changes needed
 
 Just load the specification into Claude Code and say what you want to add.
-
-## ⚠️ Disclaimer
-
-- **No support, no claims**: This project is provided as-is with no support. Questions, bug reports, and feature requests are not guaranteed a response. Use entirely at your own discretion.
-- **Use at your own risk**: This system runs on AI-generated code. The author is not responsible for any data changes or issues caused by its use.
-- **Backup first**: Always back up your current environment before running this on important projects.
 
 ---
 
