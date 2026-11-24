@@ -763,6 +763,62 @@ class TestHookSubmit:
         assert db.count_memories(conn) == 0 and n3m._read_turn_id("s") == "KEEP"
         assert '"reason": "system_prompt"' in open(n3m.AUDIT_LOG, encoding="utf-8").read()
 
+    def _submit(self, monkeypatch, prompt, **extra):
+        searched = []
+        real = n3m._search_text
+        monkeypatch.setattr(n3m, "_search_text", lambda q, sid: searched.append(q) or real(q, sid))
+        monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
+            {"session_id": "s", "prompt": prompt, **extra}).encode()), encoding="utf-8"))
+        n3m.cmd_hook_submit()
+        return searched
+
+    def test_user_text_after_system_reminder_is_saved_and_searched(self, conn, monkeypatch, capsys):
+        n3m._write_turn_id("s", "OLD")
+        prompt = "<system-reminder>\n## The user forked this session\n</system-reminder>\n\nside chat question"
+        assert self._submit(monkeypatch, prompt) == ["side chat question"]
+        assert [r[0] for r in conn.execute("SELECT content FROM memories")] == ["[user] side chat question"]
+        assert n3m._read_turn_id("s") not in (None, "OLD")
+        assert "# Recalled Memory Context" in capsys.readouterr().out
+
+    def test_two_leading_reminder_blocks_are_removed(self, conn, monkeypatch, capsys):
+        prompt = "<system-reminder>a</system-reminder>\n<system-reminder>b</system-reminder>\n  my text  "
+        assert self._submit(monkeypatch, prompt) == ["my text"]
+        assert [r[0] for r in conn.execute("SELECT content FROM memories")] == ["[user] my text"]
+
+    def test_reminder_inputs_without_user_text_are_skipped(self, conn, monkeypatch, capsys):
+        n3m._write_turn_id("s", "KEEP")
+        for prompt in ("<system-reminder>a</system-reminder>\n\n",
+                       "<system-reminder>a</system-reminder><system-reminder>b</system-reminder>",
+                       "<system-reminder>a</system-reminder>\n<task-notification>done</task-notification>",
+                       "<system-reminder>a</system-reminder>\n<agent-message from=\"x\">hi</agent-message>",
+                       "<system-reminder>no closing tag\nuser text"):
+            assert self._submit(monkeypatch, prompt) == []
+        assert db.count_memories(conn) == 0 and n3m._read_turn_id("s") == "KEEP"
+        assert "_No relevant memories found._" in capsys.readouterr().out
+        log = open(n3m.AUDIT_LOG, encoding="utf-8").read()
+        assert log.count('"reason": "system_prompt"') == 5
+
+    def test_transcript_line_with_user_text_after_reminder_is_a_real_prompt(self, tmp_path):
+        rows = [U("q1"), A("reply before the side chat"),
+                U("<system-reminder>forked</system-reminder>\n\nside question"), A("side reply"),
+                U("q3")]
+        t = _transcript(tmp_path, rows)
+        assert n3m._last_assistant_text(t, "q3") == "side reply"
+        # as the trailing line it is the current prompt (compared by the text after the blocks) and is skipped
+        rows = [U("q1"), A("reply before the side chat"),
+                U("<system-reminder>forked</system-reminder>\n\nside question")]
+        t = _transcript(tmp_path, rows)
+        assert n3m._last_assistant_text(t, "side question") == "reply before the side chat"
+        # as an earlier line it ends the walk: no reply before it is returned
+        rows = [U("q1"), A("reply before the side chat"),
+                U("<system-reminder>forked</system-reminder>\n\nside question"), U("q4")]
+        assert n3m._last_assistant_text(_transcript(tmp_path, rows), "q4") is None
+
+    def test_transcript_reminder_line_without_user_text_is_skipped(self, tmp_path):
+        rows = [U("q1"), A("the answer"), U("<system-reminder>only a notice</system-reminder>"),
+                U("<system-reminder>a</system-reminder>\n<task-notification>x</task-notification>"), U("q2")]
+        assert n3m._last_assistant_text(_transcript(tmp_path, rows), "q2") == "the answer"
+
     def test_stop_save_does_not_remove_turn_id(self, conn, monkeypatch):
         n3m._write_turn_id("s", "T9")
         monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
