@@ -563,9 +563,9 @@ def _get(path, timeout=HEALTH_TIMEOUT, port=None):
     return _request("GET", path, None, timeout=timeout, port=port)
 
 
-def _health(port=None):
+def _health(port=None, timeout=HEALTH_TIMEOUT):
     try:
-        h = _get("/health", timeout=HEALTH_TIMEOUT, port=port)
+        h = _get("/health", timeout=timeout, port=port)
         return h if isinstance(h, dict) else None
     except Exception:  # noqa: BLE001
         return None
@@ -766,9 +766,12 @@ def _pid_status(pid, age):
 def _wait_for_starting(cfg) -> bool:
     global _NO_SERVER_REASON
     port = _current_port(cfg)
-    steps = int(SERVER_WAIT_SECONDS / POLL_INTERVAL)
-    for _ in range(steps):
-        h = _health(port)
+    deadline = time.monotonic() + SERVER_WAIT_SECONDS
+    for _ in range(int(SERVER_WAIT_SECONDS / POLL_INTERVAL)):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        h = _health(port, timeout=min(HEALTH_TIMEOUT, left))
         d = _health_decision(h)
         if d in ("ok", "stale"):
             _server_responded()
@@ -890,8 +893,11 @@ def _start_server(cfg) -> bool:
             f.write(str(proc.pid))
     except OSError:
         pass
-    steps = int(SERVER_WAIT_SECONDS / POLL_INTERVAL)
-    for _ in range(steps):
+    deadline = time.monotonic() + SERVER_WAIT_SECONDS
+    for _ in range(int(SERVER_WAIT_SECONDS / POLL_INTERVAL)):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
         rc = proc.poll()
         if rc is not None:
             _notify("server_start_failed", f"The N3MC memory server could not start (exit code {rc}). "
@@ -904,7 +910,7 @@ def _start_server(cfg) -> bool:
             _remove_pid_file_if(proc.pid)
             _NO_SERVER_REASON = f"the memory server could not start (exit code {rc})"
             return False
-        h = _health(port)
+        h = _health(port, timeout=min(HEALTH_TIMEOUT, left))
         d = _health_decision(h)
         if d in ("ok", "stale"):
             _server_responded()
@@ -2161,9 +2167,20 @@ def is_own_hook(command: str, event: str) -> bool:
     return False
 
 
+# Characters that make bash (Git Bash on Windows) split or reinterpret an unquoted word.
+_SHELL_SPECIAL = frozenset(" \t'\"&|;<>()$`\\!#*?[]{}~")
+
+
 def shell_path(p) -> str:
+    """Forward slashes always. A plain path stays bare (a command that starts with a quote fails as a
+    hook on some Windows setups); a path with a space or another shell character is double-quoted,
+    with \\, ", $ and ` escaped, so that bash reads it as one word."""
     s = pathlib.Path(p).as_posix()
-    return f'"{s}"' if " " in s else s
+    if not any(c in _SHELL_SPECIAL for c in s):
+        return s
+    for ch in ("\\", '"', "$", "`"):
+        s = s.replace(ch, "\\" + ch)
+    return f'"{s}"'
 
 
 def _scripts_folders():

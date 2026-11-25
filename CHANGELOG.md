@@ -28,6 +28,18 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (up to 3 spaces before it) with an optional info string, and the closing
   fence is a line of only backticks, at least as many as the opening one;
   an unclosed fence is left as it is (specification "Fence definition").
+- **The wait for a starting server is measured by the clock.** It was counted
+  as 120 checks of `/health`, and each check can wait up to 5 seconds for a
+  process that accepts the connection but does not answer, so a hung server
+  could hold a hook for up to 11 minutes; Claude Code stops the hook at 120
+  seconds and the prompt was not saved. Both waits now end after 60 seconds,
+  and each check gets at most the time left (specification "Starting the
+  server" step 7).
+- **A hook path with `'`, `&` or another shell character is quoted.** Only a
+  path with a space was quoted, so a scripts folder such as
+  `C:/Users/O'Brien/...` gave a command that bash could not parse, and every
+  hook failed. `shell_path` now quotes such a path and escapes `\`, `"`, `$`
+  and `` ` ``; a plain path stays bare (specification `shell_path`).
 - The specification no longer says that chunks dropped by the per-`turn_id`
   cap of 2 always appear in `pairs`: they appear only when their exchange is
   selected for `pairs` and fits within `pair_max_chars`; otherwise the

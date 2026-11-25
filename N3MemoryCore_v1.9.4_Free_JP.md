@@ -438,6 +438,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 4. `.memory/server_start_failed` が作られてから 5 分未満の間は、サーバーの起動を試み直さず、そのままサーバーなしの処理に進む。これにより、壊れた環境でフックのたびに最大 60 秒かかることを防ぐ。サーバーが応答したらマーカーを消し、知らせも消す。
 5. 60 秒たっても子プロセスが生きていれば、まだ起動中（モデルのダウンロード）なので、そのまま動かしておき、上の「起動中」の決まりに従う。
 6. フックは `"timeout": 120` で登録する（§4「フックの制限時間」）。この最大 60 秒の待ちと、そのあとの保存が、Claude Code にフックを止められる前に終わるようにするため。
+7. **60 秒の待ち（ここと「PID ファイルの扱い」の 2 つ）は、見た回数ではなく時計で測る**：ループの前に `time.monotonic()` で期限を決め、期限を過ぎたらやめ、`/health` の 1 回ごとの待ちは残りの時間までにする（`min(HEALTH_TIMEOUT, 期限 - 今)`）。見る回数の上限 120 回も残し、sleep の関数を差し替えたときもループが終わるようにする。接続は受け付けるのに答えないプロセス（固まったサーバー、一時停止したプロセス）では、`/health` が毎回 5 秒のタイムアウトまで待つ。120 回で数えると、待ちは最長 120 ×（5 + 0.5）= 660 秒になり、Claude Code は 120 秒でフックを止めてその出力を捨て、利用者の発言は保存されない。
 
 > **⚠️ 理由**: 子プロセスを見ずに 60 秒待ち切り、その stderr を `DEVNULL` に捨てると、ポートが別のプログラムに使われていたり、サーバーが起動時に落ちたりしたとき、フックのたびに 60 秒止まり、理由もどこにも残らない。
 
@@ -1143,12 +1144,21 @@ def is_own_hook(command: str, event: str) -> bool:
                 return True
     return False
 
+# 引用符なしの語を bash(Windows では Git Bash)が区切ったり読み替えたりする文字。
+SHELL_SPECIAL = frozenset(" \t'\"&|;<>()$`\\!#*?[]{}~")
+
 def shell_path(p) -> str:
     # 常にフォワードスラッシュ(bash は "\" をエスケープとして読む)。引用符は
-    # パスに空白があるときだけ付ける。引用符で始まるコマンドは、Windows の
-    # 環境によってはフックとして動かない。素のパスなら動く。
+    # パスに空白か SHELL_SPECIAL の文字があるときだけ付ける。引用符で始まる
+    # コマンドは、Windows の環境によってはフックとして動かない。素のパスなら
+    # 動く。ただし引用符のない ' や & (C:/Users/O'Brien/...)は bash の構文
+    # エラーになり、フックが発言のたびに失敗する。
     s = pathlib.Path(p).as_posix()
-    return f'"{s}"' if " " in s else s
+    if not any(c in SHELL_SPECIAL for c in s):
+        return s
+    for ch in ("\\", '"', "$", "`"):   # 二重引用符の中でも特別な意味を持つ
+        s = s.replace(ch, "\\" + ch)
+    return f'"{s}"'
 
 def resolve_cmd(script_name: str) -> str:
     # 1. --init を実行している Python の scripts フォルダ(通常、次にユーザー
@@ -1168,7 +1178,7 @@ def resolve_cmd(script_name: str) -> str:
     exe = shutil.which(script_name)
     if exe:
         return shell_path(exe)
-    # 3. 最後の手段: python -m(パスに空白が無ければ引用符を付けない)。
+    # 3. 最後の手段: python -m(shell_path が引用符を要るとしたときだけ付ける)。
     module = {"n3mc-hook": "n3memorycore.n3mc_hook",
               "n3mc-stop-hook": "n3memorycore.n3mc_stop_hook"}[script_name]
     return f'{shell_path(sys.executable)} -m {module}'
@@ -1235,7 +1245,7 @@ if settings != before:
 - **読めないものに触れない**: `command` が文字列でないフックの項目（`null` など）は、自分のものではないとして残す。`settings.json` が UTF-8 として読めないときは、何も変えずに 1 行の案内を出し、終了ステータス 1 で終える。どちらも例外にすると、`--init` がトレースバックで終わる。
 - **「`hooks` キーが無ければ `{...}` を入れる」だけの判定はダメ**: 空の `hooks: {}` が既に存在するケースで素通りし、結果フックが入らないままになる。必ず内側の配列まで点検すること。
 - **クロスプラットフォームのパス**: Windows でも `command` 文字列の中はフォワードスラッシュ厳守。`shutil.which()` の戻り値は `pathlib.Path(exe).as_posix()` で必ず正規化すること。Claude Code が起動する bash シェルはバックスラッシュをエスケープシーケンス（`\n` → 改行、`\t` → タブ）として解釈するため、`\Users\...` をそのまま書くとパスが破壊される。
-- **コマンドの形**: `resolve_cmd` は、`shutil.which` より**先に**、`--init` を実行している Python の scripts フォルダ(`sysconfig.get_path("scripts")`、次にユーザーのスキーム)でエントリポイントを探す。パスを二重引用符で囲むのは、**パスに空白があるときだけ**。空白の無いパスを引用符で囲んではならない。
+- **コマンドの形**: `resolve_cmd` は、`shutil.which` より**先に**、`--init` を実行している Python の scripts フォルダ(`sysconfig.get_path("scripts")`、次にユーザーのスキーム)でエントリポイントを探す。パスを二重引用符で囲むのは、**パスに空白か、bash が特別に読む文字があるときだけ**（`shell_path` の `SHELL_SPECIAL`）。そのとき引用符の中の `\`・`"`・`$`・`` ` `` はエスケープする。そうした文字のないパスを引用符で囲んではならない。
 
 > **⚠️ 理由**: Python を入れた直後は、動いている Claude Code の `PATH` が古く、`Python3xx/Scripts` が入っていない。`shutil.which("n3mc-hook")` は何も返さず、`--init` は最後の手段の `"C:/.../python.exe" -m n3memorycore.n3mc_hook` を登録することになる。Windows の PC によっては、先頭に引用符のあるフックのコマンドは一度も動かない(`audit.log` にフックの記録が入らない)。`sys.executable` の scripts フォルダを探せば `PATH` に関係なくエントリポイントが見つかり、素のパスならそうした PC でも動く。
 
@@ -1589,7 +1599,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 - **【実装仕様】フックの入口の終了ステータス**: `n3mc_hook.py` は `--hook-submit` の終了ステータスで終わる。`n3mc_stop_hook.py` は `--save-claude-turn` の終了ステータスで終わる（`--stop` の結果は使わない）。
 - **【実装仕様】`/buffer` が 200 でエラーを返すとき**: INSERT のあとで記録の件数が増えていなければ、`/buffer` は HTTP 200 で `{"status": "error", "message": "record count did not change after INSERT"}` を返す。CLI は、`status` が `error` の応答を HTTP の失敗と同じに扱い、`_buffer_direct` に切り替える。
 - **【実装仕様】`/search` の結果の行が持つ項目**: 応答例にあるキー（`id, content, score, timestamp, turn_id, weak`）のほかに、どの行も `agent_name`、`session_id`、`filter_score`、`cos_sim`、`keyword_relevance` を持つ。表示は `agent_name` を読む。これがない行は、エージェントが `-` と表示される。`score` が同じ行は、`(score, timestamp, id)` の降順で並べる。
-- **【実装仕様】ensure_server() 競合起動待機**: PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（別プロセスが起動中）だけ**、最大 60 秒（120 × 0.5 秒）待機する。それでもまだ起動中なら（初回のモデルダウンロードは 2〜10 分かかる）、このコマンドはサーバーなしで進め、2 つ目のサーバーは起動しない。番号のプロセスが死んでいる・別のプロセスであるときは待たずに起動する（§3「PID ファイルの扱い」）。
+- **【実装仕様】ensure_server() 競合起動待機**: PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（別プロセスが起動中）だけ**、最大 60 秒（時計で測る。§3「サーバーの起動」の 7）待機する。それでもまだ起動中なら（初回のモデルダウンロードは 2〜10 分かかる）、このコマンドはサーバーなしで進め、2 つ目のサーバーは起動しない。番号のプロセスが死んでいる・別のプロセスであるときは待たずに起動する（§3「PID ファイルの扱い」）。
 - **【実装仕様】audit.log の大きさと中身**: `audit.log` はフックの生の入力 — すべての質問と返答の全文。**コードブロックや貼り付けたものも含む**（purify しない）— を持つ。個人的なデータとして扱うこと。50 MB を超えたら `--stop` が `audit.log.1` に名前を変え（古い `audit.log.1` は置き換える）、次のフックが新しいファイルを始めるので、残るのは最大で約 100 MB。`audit.log` の書き込みの失敗は stderr に出し、フックを止めることはない。
 - **【実装仕様】_load_vec_extension 冪等性**: 同一コネクションで sqlite-vec 拡張を2回ロードしても副作用はない。拡張がすでにロード済みの場合、ロード呼び出しは "already" または "duplicate" を含む例外を発生させる。そのような例外はキャッチして続行し、それ以外の例外は再スローする。
 - **【実装仕様】delete_memory のトランザクション化**: `delete_memory` はまず `_load_vec_extension(conn)` を呼び出し、次に4件の DELETE（memories_fts・memories_fts_bi・memories_vec・memories）を try/except で囲み、失敗時は `conn.rollback()` を実行する。4つの表がすべて成功するか、すべてロールバックされる。
@@ -1887,7 +1897,7 @@ python -m pytest tests/ -v
 | `TestBehaviorMd` | 目印が同じなら触れない、`_KNOWN_BEHAVIOR_MD_HASHES` に `ade0a59b94f59f9a`・`34ed39efe5a3833d`・`5af3c015c06c62c1` の 3 つが入っている（この指示書にあるのはハッシュだけで、過去のひな形の本文はないので、定数に入っていることを確かめる）、ハッシュがその定数にあるファイルなら控えを取って置き換える（テストでは、代わりの古いひな形を使い、そのハッシュを定数に足す。新しいファイルの 1 行目は `<!-- n3mc-behavior v3 -->` で、Weak Matches の節がある）、手で編集したものは置き換えず知らせを出す、知らせのキーにパスのハッシュが入り、メッセージにパスが入る、手で編集したファイルが 2 つあれば知らせも 2 つ、ファイルの 1 行目が今の目印になったら知らせが消える |
 | `TestServerDecision` | 正常／`code_version` 違い／別のフォルダ／`root` なしで確かめられない、`/shutdown` を先に使う、`root` が違えば 403、死んだ PID ファイルは待たない、PID ファイルのサーバーが別のポートで待ち受けていて、その `/health` がこのフォルダを返すときは、そのポートに `/shutdown` を送り、60 秒待たずに新しいサーバーを起動する。別の `root` を返すポートには `/shutdown` を送らない。`Host` の確認は、いまの `config.json` ではなく、サーバーが待ち受けているポートを使う |
 | `TestNotices` | `notices.json` の `last_shown` が文字列や壊れた値でも `_take_notices` は例外にならず、知らせを出して `last_shown` を今の時刻にする |
-| `TestServerStart` | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え）、PID ファイルもサーバーもない状態で同時に始めた 2 つの `ensure_server` は `Popen` を 1 回だけ呼ぶ、予約した側の `Popen` が例外を出すと予約は消え、あとの呼び出しが起動できる、負けた側は PID ファイルを書き換えない、60 秒未満の空の PID ファイルは起動中とみなす、`Popen` に渡る `cwd` がデータフォルダ（`HOME_DIR`）になる（その場で動かすチェックアウトではそのフォルダ） |
+| `TestServerStart` | 待っている間に終了した子プロセスでは待つのをすぐやめ、`server.log` を示す `server_start_failed` を出す、失敗から 5 分以内は新たに起動しない、あとで起動に成功したら知らせとマーカーが消える、60 秒たってもまだ起動中の PID ファイルのプロセスは入れ替えも重複起動もしない、`Popen` にプラットフォームに応じた切り離しのフラグが渡り stderr が `server.log` に行く（プロセスの作成は偽物に差し替え）、PID ファイルもサーバーもない状態で同時に始めた 2 つの `ensure_server` は `Popen` を 1 回だけ呼ぶ、予約した側の `Popen` が例外を出すと予約は消え、あとの呼び出しが起動できる、負けた側は PID ファイルを書き換えない、60 秒未満の空の PID ファイルは起動中とみなす、`Popen` に渡る `cwd` がデータフォルダ（`HOME_DIR`）になる（その場で動かすチェックアウトではそのフォルダ）、接続は受け付けるのに `/health` に答えないサーバー（毎回タイムアウトまで待つ）でも、`_wait_for_starting` と `_start_server` はどちらも時計で 60 秒たてば待つのをやめ、`/health` の 1 回の待ちは残りの時間を超えない |
 | `TestServerApi` | `Host: evil.example` のリクエストはどのエンドポイントでも 403、`127.0.0.1:<port>` と `localhost:<port>` は通る、`/buffer`・`/search`・`/repair`・`/list` は普通の `def` 関数、`{"max_records": 200}` 付きの `/repair` は最大 200 件しか処理せず、`--hook-submit` はその上限を送る。`HTTP_PROXY` を別のローカルのサーバーに向けても、`_get` は N3MC のサーバーに届き、プロキシには何も届かない。`Origin: http://evil.example` のリクエストと `Origin: null` のリクエストは、`Host: 127.0.0.1:<port>` でも、どのエンドポイントでも 403。同じリクエストから `Origin` を外すと通る。`_post` と `_get` が送るリクエストには `Origin` ヘッダーがない |
 | `TestForeignServer` | 別のフォルダのサーバーのとき、保存は自分の DB に直接、検索はしない、`--repair` は何もしない |
 | `TestConfig` | 読めない `config.json` を上書きしない、型の違う項目だけ無視、直したら知らせが消える、`config.json` の空白やキーの順だけでは `code_version` が変わらない、`search_query_max_chars` の `2000.0`、`half_life_days` の `0`、`server_port` の `70000` / `-1`、`min_score` の `1.5` は `config_type` 付きで無視される（`min_results` の `-1` と `1.5` も同じ。`0` は受け付ける。`search_result_limit` の `1366` も `config_type` で無視し、`1365` は受け付ける。`k = 4095` のベクトル検索は動く）、ないファイルは排他作成で作り、同時に作った別のプロセスのファイルは上書きせず読む（`owner_id` は 1 つ）、更新は一時ファイルと `os.replace` を通す、ID のない既存の `config.json`（DB は空）から同時に始めた 2 つのプロセスは、どちらもディスクの `owner_id` / `local_id` で終わり、利用者の設定は残る、何も変えなければサーバーの `code_version` はクライアントと一致し（キーを補って書いたあとも）、サーバーが読んだ直後に `config.json` を変えるとサーバーは `stale`、再起動後に新しい設定で `ok`、`paths.py` の中身だけを変えても `code_version` が変わる |
@@ -1896,7 +1906,7 @@ python -m pytest tests/ -v
 | `TestChunkSentences` | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
 | `TestTimeBounds` | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（その機械のローカルのタイムゾーンで確かめる。プロセスのタイムゾーンを替えられる環境（`TZ` と `time.tzset`。Windows ではできない）では、さらに UTC 以外の固定のタイムゾーンでも）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー、`astimezone()` が `OSError` を投げるとき（差し替え）、`--since 1969-01-01` と `--until 9999-12-31` は例外にならず UTC として読まれる |
 | `TestDbCorrupt` | 2 回の破損で 2 つのバックアップ（`n3memory.db.corrupt-<time>.bak`）ができ、`-wal` / `-shm` は削除されずに隣へ移される、知らせ `db_corrupt` が出る、`quick_check` は 1 プロセスに 1 回。中身がごみのファイルと、先頭のページが壊れた DB は、次の直接保存と起動時の確認で退避され、`db_corrupt` の通知が出る。`OperationalError` と sqlite-vec の失敗は破損として扱わない |
-| `TestInit`（一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる、`--init` が書く 2 つの項目に `"timeout": 120` がある、再実行しても項目が増えない、`timeout` のない自分の項目は `timeout` のある項目に置き換わる、`command` が `null` の項目は残り例外にならない、cp932 の `settings.json` は変えずに終了ステータス 1 |
+| `TestInit`（一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる、`shell_path` は素のパスをそのままにし、`'` や `&` のあるパスを二重引用符で囲み、`$` と `` ` `` をエスケープする、`--init` が書く 2 つの項目に `"timeout": 120` がある、再実行しても項目が増えない、`timeout` のない自分の項目は `timeout` のある項目に置き換わる、`command` が `null` の項目は残り例外にならない、cp932 の `settings.json` は変えずに終了ステータス 1 |
 | `TestSaveFailedNotice` | 直接の保存が 1 回失敗したあと（`save_failed` がある）、サーバー経由の保存（`/buffer` を `ok` と答える偽物に差し替え）で知らせが消える。`skipped` と答えたときも消える |
 | `TestHousekeeping` | `--stop` が 30 日より古い `turn_id_*.txt` を消し、新しいものは残す、50 MB を超えた `audit.log` を `audit.log.1` にローテーションする（テストではサイズのしきい値を差し替える） |
 | `TestModelRetry` | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |

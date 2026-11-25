@@ -690,6 +690,29 @@ class TestServerStart:
     def _cfg(self, isolate):
         n3memory._load_config()
 
+    def test_wait_is_bounded_by_the_clock(self, monkeypatch):
+        # A server that accepts but never answers /health: every check runs into its timeout.
+        # The wait must end after SERVER_WAIT_SECONDS of clock time, not after 120 checks.
+        clock = {"t": 1000.0}
+        timeouts = []
+
+        def slow_get(path, timeout=5, port=None):
+            timeouts.append(timeout)
+            clock["t"] += timeout
+            raise urllib.error.URLError("timed out")
+        monkeypatch.setattr(n3memory.time, "monotonic", lambda: clock["t"])
+        monkeypatch.setattr(n3memory, "_get", slow_get)
+        monkeypatch.setattr(n3memory, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+        start = clock["t"]
+        assert n3memory._wait_for_starting(n3memory._CFG) is False
+        assert clock["t"] - start <= n3memory.SERVER_WAIT_SECONDS + n3memory.POLL_INTERVAL
+        assert len(timeouts) < 20 and max(timeouts) <= n3memory.HEALTH_TIMEOUT
+        clock["t"] = start = 5000.0
+        timeouts.clear()
+        monkeypatch.setattr(n3memory, "_spawn", lambda cmd, **kw: FakeProc())
+        assert n3memory._start_server(n3memory._CFG) is False
+        assert clock["t"] - start <= n3memory.SERVER_WAIT_SECONDS + n3memory.POLL_INTERVAL
+
     def test_child_exit_stops_waiting(self, monkeypatch):
         spawned = []
         monkeypatch.setattr(n3memory, "_spawn", lambda cmd, **kw: spawned.append(kw) or FakeProc(rc=3))
@@ -1370,6 +1393,13 @@ class TestInit:
         assert pro in cmds and len(cmds) == 2
         assert f"Another N3MC hook is registered for UserPromptSubmit and was left in place: {pro}" in capsys.readouterr().out
 
+    def test_shell_path_quotes_shell_characters(self):
+        assert n3memory.shell_path("C:/Users/me/Scripts/n3mc-hook.exe") == "C:/Users/me/Scripts/n3mc-hook.exe"
+        assert n3memory.shell_path("C:/Program Files/n3mc-hook.exe") == '"C:/Program Files/n3mc-hook.exe"'
+        assert n3memory.shell_path("C:/Users/O'Brien/n3mc-hook.exe") == "\"C:/Users/O'Brien/n3mc-hook.exe\""
+        assert n3memory.shell_path("C:/Users/A&B/n3mc-hook.exe") == '"C:/Users/A&B/n3mc-hook.exe"'
+        assert n3memory.shell_path("C:/Users/a$b`c/x.exe") == '"C:/Users/a\\$b\\`c/x.exe"'
+
     def test_own_entries_replaced(self, settings):
         self._write(settings, {"hooks": {
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/x/n3mc-hook.exe"}]},
@@ -1602,3 +1632,4 @@ class TestHookEntryAudit:
         assert len(lines) == 1
         assert lines[0]["hook"] == module.HOOK_NAME and len(lines[0]["raw"]) == 4096
         assert lines[0]["payload"]["prompt"] == "x" * 5000
+
