@@ -9,14 +9,41 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - The specification adds rules that prevent faults found in sibling editions:
   - The full-text search text leaves out the role prefix and `[code omitted]`;
-    existing rows are rebuilt once. `々`, `〆` and `〇` count as CJK.
-  - `--recall-thread` takes the neighbouring turns from the same session.
+    existing rows are rebuilt once.
   - The resident server's working folder is the data folder.
   - `CLAUDE.md` with a BOM or a non-UTF-8 encoding; `--init` with a non-string
     `command` or an unreadable `settings.json`.
   - `code_version` covers every `.py` file; out-of-range times; the order in
     which the Stop hook reads `turn_id`; `last_shown` of notices; the prompt is
     saved even when the search fails.
+- **`audit.log` keeps the line for an input with a lone surrogate.** Both hook
+  entry points wrote the record with `ensure_ascii=False`, so a prompt or reply
+  holding a lone surrogate (for example from a `"\ud83d"` JSON escape) made the
+  write fail with `UnicodeEncodeError` and the line was lost. The record is now
+  written with `ensure_ascii=True` (specification "audit.log `raw`").
+- **Code fences are paired by line.** A fence was closed by the next `` ``` ``
+  found anywhere, so a `` ``` `` in a sentence replaced the prose after it with
+  `[code omitted]` and kept the code, and a `` ``` `` inside code dropped the prose
+  between two blocks. An opening fence is now a line of 3 or more backticks
+  (up to 3 spaces before it) with an optional info string, and the closing
+  fence is a line of only backticks, at least as many as the opening one;
+  an unclosed fence is left as it is (specification "Fence definition").
+- **The wait for a starting server is measured by the clock.** It was counted
+  as 120 checks of `/health`, and each check can wait up to 5 seconds for a
+  process that accepts the connection but does not answer, so a hung server
+  could hold a hook for up to 11 minutes; Claude Code stops the hook at 120
+  seconds and the prompt was not saved. Both waits now end after 60 seconds,
+  and each check gets at most the time left (specification "Starting the
+  server" step 7).
+- **A hook path with `'`, `&` or another shell character is quoted.** Only a
+  path with a space was quoted, so a scripts folder such as
+  `C:/Users/O'Brien/...` gave a command that bash could not parse, and every
+  hook failed. `shell_path` now quotes such a path and escapes `\`, `"`, `$`
+  and `` ` ``; a plain path stays bare (specification `shell_path`).
+- The specification no longer says that chunks dropped by the per-`turn_id`
+  cap of 2 always appear in `pairs`: they appear only when their exchange is
+  selected for `pairs` and fits within `pair_max_chars`; otherwise the
+  exchange is read with `--show-turn` (no code change).
 
 ### Changed
 - The specification version now matches the package version: the

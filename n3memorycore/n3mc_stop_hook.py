@@ -1,4 +1,4 @@
-"""Stop hook entry: write audit.log, then `--save-claude-turn` and `--stop` synchronously."""
+"""Stop hook entry: write audit.log first, then `--save-claude-turn` (same stdin) and `--stop`."""
 import os as _os
 import sys as _sys
 
@@ -26,54 +26,50 @@ for _stream_name in ("stdin", "stdout", "stderr"):
             pass
 
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 
 from .paths import AUDIT_LOG, python_cmd
 
+HOOK_NAME = "Stop"
+RAW_MAX = 4096
 
-def write_audit(hook, raw_text):
-    """Step 0: append {ts, hook, raw, payload} to audit.log. Never raises."""
+
+def _write_audit(raw):
+    """Step 0: the raw input goes to audit.log before anything else."""
     try:
-        try:
-            payload = json.loads(raw_text)
-        except Exception:  # noqa: BLE001
-            payload = {"raw": raw_text}
-        rec = {"ts": datetime.now(timezone.utc).isoformat(), "hook": hook,
-               "raw": raw_text[:4096], "payload": payload}
-        _os.makedirs(_os.path.dirname(AUDIT_LOG), exist_ok=True)
-        with open(AUDIT_LOG, "a", encoding="utf-8", errors="replace") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        payload = json.loads(raw)
+    except ValueError:
+        payload = {"raw": raw}
+    record = {"ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"), "hook": HOOK_NAME,
+              "raw": raw[:RAW_MAX], "payload": payload}
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            # ensure_ascii=True: a lone surrogate (e.g. from a "\ud83d" escape) cannot be encoded as UTF-8
+            f.write(json.dumps(record, ensure_ascii=True) + "\n")
     except Exception as e:  # noqa: BLE001
-        print(f"N3MC: could not write audit.log ({type(e).__name__}: {e})", file=sys.stderr)
+        print(f"N3MC: audit.log could not be written ({type(e).__name__}: {e})", file=sys.stderr)
 
 
-def _read_stdin():
+def _run(flag, raw=None):
     try:
-        return sys.stdin.buffer.read().decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        try:
-            return sys.stdin.read()
-        except Exception:  # noqa: BLE001
-            return ""
+        proc = subprocess.run([*python_cmd(), "-m", "n3memorycore.n3memory", flag],
+                              input=(raw.encode("utf-8", errors="surrogatepass") if raw is not None else b""),
+                              check=False)
+        return proc.returncode
+    except Exception as e:  # noqa: BLE001
+        print(f"N3MC: {flag} could not be run ({type(e).__name__}: {e})", file=sys.stderr)
+        return 1
 
 
 def main():
-    raw = _read_stdin()
-    write_audit("Stop", raw)
-    status = 1
-    try:
-        sys.stdout.flush()
-        proc = subprocess.run([*python_cmd(), "-m", "n3memorycore.n3memory", "--save-claude-turn"],
-                              input=raw.encode("utf-8", errors="replace"))
-        status = proc.returncode
-    except Exception as e:  # noqa: BLE001
-        print(f"N3MC: save-claude-turn failed ({type(e).__name__}: {e})", file=sys.stderr)
-    try:
-        subprocess.run([*python_cmd(), "-m", "n3memorycore.n3memory", "--stop"], stdin=subprocess.DEVNULL)
-    except Exception as e:  # noqa: BLE001
-        print(f"N3MC: --stop failed ({type(e).__name__}: {e})", file=sys.stderr)
-    return status  # the result of --stop is not used
+    raw = sys.stdin.read()
+    _write_audit(raw)
+    rc = _run("--save-claude-turn", raw)
+    _run("--stop")
+    return rc
 
 
 if __name__ == "__main__":
