@@ -9,8 +9,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - The specification adds rules that prevent faults found in sibling editions:
   - The full-text search text leaves out the role prefix and `[code omitted]`;
-    existing rows are rebuilt once. `々`, `〆` and `〇` count as CJK.
-  - `--recall-thread` takes the neighbouring turns from the same session.
+    existing rows are rebuilt once.
   - The resident server's working folder is the data folder.
   - `CLAUDE.md` with a BOM or a non-UTF-8 encoding; `--init` with a non-string
     `command` or an unreadable `settings.json`.
