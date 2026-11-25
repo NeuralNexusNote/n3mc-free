@@ -4,6 +4,33 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.3] - 2026-11-25
+
+### Fixed
+- **The first message of a desktop-app side chat is saved.** The app sends it
+  with a `<system-reminder>…</system-reminder>` block in front of the user's
+  text, and the UserPromptSubmit hook skipped the whole input as a system
+  input. The hook now removes the leading `<system-reminder>` blocks; when the
+  rest is user text, it is saved and searched with a new `turn_id`. Inputs of
+  blocks only, inputs whose rest is another system input, and inputs without a
+  closing tag are still skipped. The transcript walk for the previous reply
+  treats such a line as a real prompt (specification "Skip system inputs").
+
+### Docs
+- Generation from the specification is the primary way to install: the README
+  starts with the setup steps (make an empty folder, put the specification in
+  it, open the folder in Claude Code, ask it to implement N3MemoryCore); `pip`
+  is the second way.
+- Restart guidance: the completion report starts with a restart heading and
+  explains how to quit Claude completely; after the restart, send "I
+  restarted" in the same session.
+- The disclaimer is right after the setup steps; the search-tuning sections
+  moved out of the README (the settings are described in the specification).
+- The specification says which memory N3MC provides (the conversation history
+  layer) and no longer carries development history.
+- The specification file name stays v1.9.1; code generated from it reports
+  version 1.9.1.
+
 ## [1.9.2] - 2026-11-23
 
 Documentation-only release: the code is the same as 1.9.1. It refreshes the
