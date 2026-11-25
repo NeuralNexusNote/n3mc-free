@@ -335,6 +335,19 @@ Once setup is complete, everything works automatically from the next session:
 
 How memories are recalled can be tuned in `~/.n3mc/config.json`. The main settings and what they do are described in the specification.
 
+This code also turns on search settings that are **not in the specification**. They cut unrelated records and help questions asked in another language than the record. Code you generate from the specification does not have them.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `vector_min_cos` | 0.82 (spec 0.85) | Lowest cosine for a vector match |
+| `fts_stopwords` | true | English function words (`the`, `is`, `of`, ...) are not keyword terms |
+| `kw_only_min_terms` | 3 | A record found only by the keywords needs this many question terms |
+| `top_matches_max` | 5 | At most this many Top matches |
+| `cross_lang_min_cos` | 0.80 | The closest record in the other language can be a Top match |
+| `semantic_rescue_min_cos` / `semantic_rescue_margin` | 0.80 / 0.02 | The closest exchange can be a Top match when it is clearly ahead of the others |
+
+To get the specification's search, write `vector_min_cos` 0.85, `fts_stopwords` false and 0 for the other settings. A `config.json` written by an older version keeps its own `vector_min_cos`.
+
 ### Backup and restore
 
 To migrate memories to another environment or keep a safe backup, save these 2 files

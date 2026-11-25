@@ -46,6 +46,28 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exchange is read with `--show-turn` (no code change).
 
 ### Changed
+- **Search improvements on by default (code only, not in the spec).** The
+  code was generated again from the specification, which dropped the search
+  settings of 1.9.1; they are back, with one more:
+  - `vector_min_cos` 0.82 (spec 0.85)
+  - `fts_stopwords` (true): English function words (`the`, `is`, `of`, ...)
+    are not keyword terms
+  - `kw_only_min_terms` (3): a record found only by the keywords needs 3
+    question terms to be a Top match
+  - `top_matches_max` (5): at most 5 Top matches
+  - `cross_lang_min_cos` (0.80): the closest record in the other script
+    (Japanese / English) can be a Top match
+  - new: `semantic_rescue_min_cos` (0.80) and `semantic_rescue_margin` (0.02):
+    the closest exchange is a Top match below `vector_min_cos` when it is at
+    least 0.80 and ahead of every other exchange by 0.02
+
+  A `config.json` written before keeps its own `vector_min_cos`; missing keys
+  are added with their defaults. `vector_min_cos` 0.85, `fts_stopwords` false
+  and 0 for the other settings restore the spec's search. On the project's
+  test set (65 questions): right record first 32 → 39 of 50, within the first
+  3: 38 → 45, cross-language within the first 3: 0 → 7 of 10, unanswerable
+  questions with an unrelated record: 9 → 2 of 15. Code generated from the
+  specification does not have these settings.
 - The specification version now matches the package version: the
   specification is `N3MemoryCore_v1.9.4_Free_EN.md` / `_JP.md`, and code
   generated from it reports version 1.9.4.
