@@ -398,7 +398,7 @@ agent_name  (a display label, outside the hierarchy: "claude-code" for the hooks
 N3MemoryCore is built from a specification, so extending it is as simple as asking Claude Code.
 
 - **MCP server** — Expose N3MC as an MCP server so other AI tools can access the memory
-- **PostgreSQL migration** — Move from SQLite to PostgreSQL + pgvector (a ready-made edition for one person on one PC is N3MC Pro on PostgreSQL, `n3mc-pro-postgres`)
+- **PostgreSQL migration** — Move from SQLite to PostgreSQL + pgvector (a ready-made edition for a team in one organization is N3MC Pro on PostgreSQL, `n3mc-pro-postgres`)
 - **Custom search logic** — Tune bias coefficients and ranking formulas
 - **Alternative embedding models** — Swap in a different model to suit your use case
 - **Keyword-search tokenizer** — The default keyword index (FTS5 `trigram`, plus a 2-character index for Japanese, Chinese and Korean) was chosen because it works both for languages written without spaces and for languages like English (the PyPI package is used in every country). Adapt the final tokenizer to your own language and environment (e.g. `porter unicode61` to fold English word forms, or a morphological analyzer for higher Japanese precision). Claude Code can do it for you, including the start-up check that otherwise rebuilds the index as `trigram`, and rebuilding the existing DB's FTS index

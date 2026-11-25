@@ -394,7 +394,7 @@ agent_name  (表示用のラベル。階層の外。フックは "claude-code")
 N3MemoryCoreは指示書（仕様書）を読ませて作るため、拡張もClaude Codeに相談するだけで対応できます。
 
 - **MCPサーバー化** — N3MCをMCPサーバーとして公開し、他のAIツールから記憶にアクセス
-- **PostgreSQL移行** — SQLiteからPostgreSQL + pgvectorへ（1 人が 1 台の PC で使う既製の版は、PostgreSQL の N3MC Pro、`n3mc-pro-postgres`）
+- **PostgreSQL移行** — SQLiteからPostgreSQL + pgvectorへ（組織のチームで使う既製の版は、PostgreSQL の N3MC Pro、`n3mc-pro-postgres`）
 - **カスタム検索ロジック** — バイアス係数やランキング式の調整
 - **他のembeddingモデル** — 用途に合わせたモデルへの差し替え
 - **キーワード検索のトークナイザー** — 既定のキーワードの索引（FTS5 `trigram` と、日本語・中国語・韓国語のための 2 文字の索引）は、空白で区切らない言語でも、英語のような言語でも動くように選んでいます（PyPI 版はどこの国でも使われるため）。最終的なトークナイザーは、ご自分の言語・環境に合わせて直してください（例: 英語中心なら語形変化をまとめる `porter unicode61`、日本語の精度を上げるなら形態素解析）。起動のときに索引を `trigram` に作り直す確認の直しと、既存の DB の全文検索の索引の作り直しも含めて、Claude Code に相談すれば対応できます
