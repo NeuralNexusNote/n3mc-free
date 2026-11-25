@@ -4,6 +4,29 @@ All notable changes to N3MemoryCore Free are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.4] - Unreleased
+
+### Fixed
+- The specification adds rules that prevent faults found in sibling editions:
+  - The full-text search text leaves out the role prefix and `[code omitted]`;
+    existing rows are rebuilt once. `々`, `〆` and `〇` count as CJK.
+  - `--recall-thread` takes the neighbouring turns from the same session.
+  - The resident server's working folder is the data folder.
+  - `CLAUDE.md` with a BOM or a non-UTF-8 encoding; `--init` with a non-string
+    `command` or an unreadable `settings.json`.
+  - `code_version` covers every `.py` file; out-of-range times; the order in
+    which the Stop hook reads `turn_id`; `last_shown` of notices; the prompt is
+    saved even when the search fails.
+
+### Changed
+- The specification version now matches the package version: the
+  specification is `N3MemoryCore_v1.9.4_Free_EN.md` / `_JP.md`, and code
+  generated from it reports version 1.9.4.
+
+### Docs
+- README: the ready-made PostgreSQL edition (`n3mc-pro-postgres`) is described
+  as an edition for a team in one organization.
+
 ## [1.9.3] - 2026-11-25
 
 ### Fixed

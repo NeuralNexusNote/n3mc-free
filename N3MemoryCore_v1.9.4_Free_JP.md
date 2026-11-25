@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.9.1 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.9.4 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **「Immutable Memory」とは？** 保存は発生した瞬間にディスクへ物理的にコミットされます。バッファリングも非同期書き込みもありません。保存直後にプロセスを強制終了してもデータは残ります。これが N3MC の設計原則です。
@@ -48,9 +48,9 @@
 **方法 A：指示書から作成（メイン・推奨）**
 
 1. **フォルダを作る**:エクスプローラーで、空のフォルダを 1 つ作ります(例:`C:\Users\<あなたの名前>\n3mc-free`)。コードはこのフォルダに作られ、セットアップのあとも使い続けます。あとで消したり動かしたりしないでください。
-2. **指示書を入れる**:ダウンロードした指示書 `N3MemoryCore_v1.9.1_Free_JP.md` を、そのフォルダに入れます(このフォルダには、指示書のほかに何も入れません)。
+2. **指示書を入れる**:ダウンロードした指示書 `N3MemoryCore_v1.9.4_Free_JP.md` を、そのフォルダに入れます(このフォルダには、指示書のほかに何も入れません)。
 3. **そのフォルダで Claude Code を開く**:Claude のデスクトップアプリで、サイドバー上部の **Code** タブを開き、**+ New** で新しいセッションを始めます。プロンプト欄の下の行で、環境は **Local** を選び、その横のフォルダの欄で **Open folder…** を選んで、1 のフォルダを選びます。(ターミナルで使うときは、そのフォルダに移って `claude` を起動します。)
-4. **頼む**:プロンプト欄に「この指示書 `N3MemoryCore_v1.9.1_Free_JP.md` に従って N3MemoryCore を実装してください」と書いて送ります。
+4. **頼む**:プロンプト欄に「この指示書 `N3MemoryCore_v1.9.4_Free_JP.md` に従って N3MemoryCore を実装してください」と書いて送ります。
    - コードの実装・フックの登録・設定ファイルの更新はすべて Claude Code が自動で行う。利用者の作業は、最初にインストール先のフォルダを確かめることだけ(下の「インストール先のフォルダの確認」)。
    - **💡 コード生成には Sonnet がおすすめです。** 速度とコストのバランスが良く、実装品質も十分です。
 
@@ -131,7 +131,7 @@ n3mc-free/                       # リポジトリルート
 ├── pyproject.toml               # ★ pip メタデータとエントリポイント宣言
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.9.1_Free_EN.md / _JP.md   # 本指示書
+├── N3MemoryCore_v1.9.4_Free_EN.md / _JP.md   # 本指示書
 ├── n3memorycore/                # ★ Python パッケージ（PEP 8 小文字）
 │   ├── __init__.py              # __version__ を公開
 │   ├── paths.py                 # import 時に ~/.n3mc/（または $N3MC_HOME）を解決
@@ -200,7 +200,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n3memorycore-free"
-version = "1.9.1"
+version = "1.9.4"
 description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -1643,7 +1643,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
 
 ---
 
-## 6. 自律評価（[N3MC v1.9.1 Evidence Report]）
+## 6. 自律評価（[N3MC v1.9.4 Evidence Report]）
 実装完了後、以下のテストを自律解決し、満点（⭐⭐⭐⭐⭐）で報告せよ。
 
 > **進め方（時間を減らす）**: 一時的なデータフォルダでテストを行うときは、次のとおりにする。
