@@ -1,4 +1,4 @@
-# N3MemoryCore (N3MC) v1.9.1 [Immutable Memory]
+# N3MemoryCore (N3MC) v1.9.4 [Immutable Memory]
 > A NeuralNexusNote™ product
 
 > **What is "Immutable Memory"?** Every save is physically committed to disk the instant it occurs — no buffering, no async writes. Even a forced kill of the process immediately after saving leaves the data intact. This is the core design principle of N3MC.
@@ -48,9 +48,9 @@ There are two ways to set it up. Method A, generating the code from this specifi
 **Method A: Generate from the spec (primary, recommended)**
 
 1. **Make a folder**: in File Explorer, create one empty folder (for example `C:\Users\<you>\n3mc-free`). The code is generated in this folder and stays in use after setup; do not delete or move it later.
-2. **Put the specification in it**: copy the downloaded specification `N3MemoryCore_v1.9.1_Free_EN.md` into that folder (put nothing else in it).
+2. **Put the specification in it**: copy the downloaded specification `N3MemoryCore_v1.9.4_Free_EN.md` into that folder (put nothing else in it).
 3. **Open Claude Code in that folder**: in the Claude desktop app, open the **Code** tab at the top of the sidebar and start a new session with **+ New**. In the row under the prompt box, choose **Local** as the environment, then click the folder control beside it, choose **Open folder…** and pick the folder from step 1. (In a terminal, change to that folder and run `claude`.)
-4. **Ask**: in the prompt box, send "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.1_Free_EN.md`."
+4. **Ask**: in the prompt box, send "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.4_Free_EN.md`."
    - Code implementation, hook registration, and configuration file updates are all done automatically by Claude Code. The only step for you is to confirm the install folder at the start (see "Install folder check" below).
    - **💡 Sonnet is recommended for code generation.** It offers a good balance of speed, cost, and implementation quality.
 
@@ -131,7 +131,7 @@ n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
 ├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
-├── N3MemoryCore_v1.9.1_Free_EN.md / _JP.md   # this specification
+├── N3MemoryCore_v1.9.4_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
 │   ├── paths.py                 # resolves ~/.n3mc/ (or $N3MC_HOME) at import time
@@ -200,7 +200,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n3memorycore-free"
-version = "1.9.1"
+version = "1.9.4"
 description = "Persistent hybrid-search memory store for Claude Code (Free Edition)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -1645,7 +1645,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 
 ---
 
-## 6. Autonomous Evaluation ([N3MC v1.9.1 Evidence Report])
+## 6. Autonomous Evaluation ([N3MC v1.9.4 Evidence Report])
 After implementation is complete, autonomously resolve the following tests and report a perfect score (⭐⭐⭐⭐⭐).
 
 > **How to run them (to save time)**: when the tests use a temporary data folder:

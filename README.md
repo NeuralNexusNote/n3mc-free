@@ -1,4 +1,4 @@
-# N3MemoryCore Free (n3mc-free) v1.9.1
+# N3MemoryCore Free (n3mc-free) v1.9.4
 
 **Give Claude Code a memory that does not fade — free, on your own PC.**
 
@@ -10,9 +10,9 @@ the hooks do both on every turn.
 Of the AI's memory, N3MC covers the **conversation history** layer (what was said, when, and in which conversation). It does not cover the rules that are always loaded, such as CLAUDE.md, or connections to external tools.
 
 1. In File Explorer, create an empty folder
-2. Put the specification `N3MemoryCore_v1.9.1_Free_EN.md` into it (put nothing else in it)
+2. Put the specification `N3MemoryCore_v1.9.4_Free_EN.md` into it (put nothing else in it)
 3. In the Claude desktop app, open the **Code** tab, start a new session with **+ New**, choose **Local**, then **Open folder…** and pick that folder (in a terminal, change to that folder and run `claude`)
-4. Send: "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.1_Free_EN.md`."
+4. Send: "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.4_Free_EN.md`."
 5. When it is done, restart Claude Code (closing the window may not be enough; see [Restart Claude Code](#4-restart-claude-code))
 
 After the restart, open the same session and send "I restarted". Claude Code checks that memory works and tells you what to do next.
@@ -207,8 +207,8 @@ Nothing is deleted or replaced automatically in either edition.
 
 | File | Description |
 |---|---|
-| `N3MemoryCore_v1.9.1_Free_JP.md` | Free edition (Japanese) |
-| `N3MemoryCore_v1.9.1_Free_EN.md` | Free edition (English) |
+| `N3MemoryCore_v1.9.4_Free_JP.md` | Free edition (Japanese) |
+| `N3MemoryCore_v1.9.4_Free_EN.md` | Free edition (English) |
 
 > 💡 **A note on annotations in the specification**
 > Throughout the specification file (Markdown), you'll find annotations describing the design intent behind each instruction — written to give you precise control over AI behavior. Before having Claude generate the code, take a moment to read through them. They contain more than just code: the logic behind how to work with AI effectively.
@@ -222,9 +222,9 @@ There are two ways to set it up. Method A, generating the code from the specific
 Let Claude Code generate the code from the specification:
 
 1. **Make a folder**: in File Explorer, create one empty folder (for example `C:\Users\<you>\n3mc-free`). The code is generated in this folder and stays in use after setup; do not delete or move it later.
-2. **Put the specification in it**: copy the downloaded specification `N3MemoryCore_v1.9.1_Free_EN.md` into that folder (put nothing else in it).
+2. **Put the specification in it**: copy the downloaded specification `N3MemoryCore_v1.9.4_Free_EN.md` into that folder (put nothing else in it).
 3. **Open Claude Code in that folder**: in the Claude desktop app, open the **Code** tab at the top of the sidebar and start a new session with **+ New**. In the row under the prompt box, choose **Local** as the environment, then click the folder control beside it, choose **Open folder…** and pick the folder from step 1. (In a terminal, change to that folder and run `claude`.)
-4. **Ask**: in the prompt box, send "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.1_Free_EN.md`."
+4. **Ask**: in the prompt box, send "Please implement N3MemoryCore according to the specification `N3MemoryCore_v1.9.4_Free_EN.md`."
 
 Claude Code shows the folder and asks you once to confirm it; then it writes the code, configures the hooks, and sets everything up. It stops instead if the folder holds other files, so that a project of yours is not overwritten.
 Setup takes roughly 15–30 minutes (varies by environment and model).
