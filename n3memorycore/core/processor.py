@@ -21,6 +21,9 @@ from .database import (
     get_memories_by_turn_id, # used by Q-A pairing
     strip_fts_punctuation,   # used by the /repair FTS migration
     get_vector,
+    fts_terms,
+    bigram_terms,
+    bigram_text,
 )
 
 DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-base"
@@ -304,10 +307,14 @@ def add_chunk_prefixes(chunks, role) -> list:
 
 _DEFAULTS = {
     "half_life_days": 90, "bm25_min_threshold": 0.1, "search_result_limit": 20, "min_score": 0.2,
-    "vector_min_cos": 0.85, "relative_min_score_ratio": 0.6, "min_results": 3, "pair_top_n": 3,
+    "vector_min_cos": 0.82, "relative_min_score_ratio": 0.6, "min_results": 3, "pair_top_n": 3,
     "pair_max_chars": 3000, "version_order_enabled": True, "version_sim_threshold": 0.98,
     "version_min_chars": 100, "reply_sim_rerank_enabled": False, "reply_sim_alpha": 0.3,
     "reply_sim_floor": 0.80, "reply_sim_span": 0.15,
+    # Search improvements (CPU only, not in the specification). The specification's behaviour comes
+    # back with n3memory.SPEC_SEARCH_SETTINGS (vector_min_cos 0.85, fts_stopwords false, 0 for the rest).
+    "fts_stopwords": True, "kw_only_min_terms": 3, "top_matches_max": 5, "cross_lang_min_cos": 0.80,
+    "semantic_rescue_min_cos": 0.80, "semantic_rescue_margin": 0.02,
 }
 
 def _cfg(cfg, key):
@@ -326,6 +333,29 @@ def _cos(a, b):
     if na == 0 or nb == 0:
         return 0.0
     return _dot(a, b) / (na * nb)
+
+
+def _matched_terms(content, terms):
+    """How many distinct question terms (trigram terms, bigram terms) occur in the record."""
+    tri, bi = terms
+    low = strip_fts_punctuation(content).lower()
+    toks = set(bigram_text(content).lower().split())
+    hit = {t.lower() for t in tri if t.lower() in low}
+    hit |= {t.lower() for t in bi if t.lower() in toks}
+    return len(hit)
+
+
+_CJK_LETTER_RE = re.compile(r'[぀-ヿ㐀-鿿가-힯]')
+_ROLE_PREFIX_RE = re.compile(r'^\[(?:user|claude)(?: \d+/\d+)?\] ')
+
+
+def _is_cjk_text(text):
+    """True when CJK characters are a fifth or more of the letters (role prefix left out)."""
+    body = _ROLE_PREFIX_RE.sub('', text or '')
+    letters = [ch for ch in body if ch.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for ch in letters if _CJK_LETTER_RE.match(ch)) * 5 >= len(letters)
 
 
 def _order_key(r):
@@ -543,13 +573,15 @@ def hybrid_search(conn, query, cfg=None, session_id=None, since=None, until=None
         except Exception as e:  # noqa: BLE001
             print(f"Warning: vector search failed ({type(e).__name__}: {e})", file=sys.stderr)
             vec_rows = []
+    # fts_stopwords: English function words are not keyword terms (not in the specification)
+    stop = bool(_cfg(cfg, "fts_stopwords"))
     try:
-        tri_rows = search_fts(conn, query, k, since, until)
+        tri_rows = search_fts(conn, query, k, since, until, stopwords=stop)
     except Exception as e:  # noqa: BLE001
         print(f"Warning: keyword search failed ({type(e).__name__}: {e})", file=sys.stderr)
         tri_rows = []
     try:
-        bi_rows = search_fts_bigram(conn, query, k, since, until)
+        bi_rows = search_fts_bigram(conn, query, k, since, until, stopwords=stop)
     except Exception as e:  # noqa: BLE001
         print(f"Warning: bigram keyword search failed ({type(e).__name__}: {e})", file=sys.stderr)
         bi_rows = []
@@ -587,13 +619,53 @@ def hybrid_search(conn, query, cfg=None, session_id=None, since=None, until=None
         d.update(score=score, filter_score=fscore, cos_sim=cos_value, keyword_relevance=kr)
         return d
 
+    # cross_lang_min_cos (not in the specification; 0 = off): the best vector hit written in the
+    # other script (CJK or not) counts as a vector match from this cosine on. e5 gives a question and
+    # a record in different languages a lower cosine than a same-language pair, so vector_min_cos
+    # alone never lets them through.
+    cross_floor = float(_cfg(cfg, "cross_lang_min_cos") or 0)
+    cross_best = None
+    if cross_floor and real_cos:
+        q_cjk = _is_cjk_text(query)
+        other = [(c, rid) for rid, c in real_cos.items()
+                 if c < vmin and _is_cjk_text(rows_by_rowid[rid]["content"]) != q_cjk]
+        if other:
+            c_top, rid_top = max(other)
+            if c_top >= cross_floor:
+                cross_best = rid_top
+    # semantic rescue (not in the specification; semantic_rescue_min_cos 0 = off): the closest exchange
+    # counts as a vector match below vector_min_cos when its cosine is at least semantic_rescue_min_cos
+    # and beats every other exchange by semantic_rescue_margin. A question with an answer usually has
+    # one exchange clearly ahead; for a question without one, the nearest records lie close together.
+    rescue_floor = float(_cfg(cfg, "semantic_rescue_min_cos") or 0)
+    rescued = None
+    if rescue_floor and real_cos:
+        best = {}
+        for rid, c in real_cos.items():
+            key = rows_by_rowid[rid].get("turn_id") or ("row", rid)
+            if key not in best or c > best[key][0]:
+                best[key] = (c, rid)
+        ranked = sorted(best.values(), reverse=True)
+        top_c, top_rid = ranked[0]
+        second = ranked[1][0] if len(ranked) > 1 else 0.0
+        if vmin > top_c >= rescue_floor and top_c - second >= float(_cfg(cfg, "semantic_rescue_margin")):
+            rescued = top_rid
+    # kw_only_min_terms (not in the specification; 0 or 1 = off): a row found only by the keywords
+    # goes to Top matches only when it holds that many distinct question terms; otherwise it can
+    # still be a weak match.
+    min_terms = int(_cfg(cfg, "kw_only_min_terms") or 0)
+    q_terms = (fts_terms(query, stop), bigram_terms(query, stop)) if min_terms > 1 else None
+
     main, weak_pool = [], {}
     for rowid in rows_by_rowid:
         rc = real_cos.get(rowid)
         in_fts = rowid in kw
-        if rc is not None and rc >= vmin:
+        if rc is not None and (rc >= vmin or rowid == cross_best or rowid == rescued):
             cand = make(rowid, rc)
         elif in_fts:
+            if q_terms and _matched_terms(rows_by_rowid[rowid]["content"], q_terms) < min_terms:
+                weak_pool[rowid] = make(rowid, rc or 0.0)
+                continue
             cand = make(rowid, 0.0)  # an FTS-only hit
         else:
             weak_pool[rowid] = make(rowid, rc or 0.0)  # step 1: below vector_min_cos
@@ -623,7 +695,9 @@ def hybrid_search(conn, query, cfg=None, session_id=None, since=None, until=None
                 weak_pool[r["rowid"]] = make(r["rowid"], rc if rc is not None else 0.0)
         main = kept
     main = _collapse_identical_content(main)  # 5
-    main = _cap_per_turn(main, limit)  # 6
+    # top_matches_max (not in the specification; 0 = none): a cap on Top matches only
+    strong_cap = min(limit, int(_cfg(cfg, "top_matches_max") or 0) or limit)
+    main = _cap_per_turn(main, strong_cap)  # 6
 
     target = min(int(_cfg(cfg, "min_results")), limit)  # 7
     weak_rows = []

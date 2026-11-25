@@ -90,7 +90,7 @@ DEFAULT_CONFIG = {
     "search_result_limit": 20,
     "min_score": 0.2,
     "search_query_max_chars": 2000,
-    "vector_min_cos": 0.85,
+    "vector_min_cos": 0.82,
     "relative_min_score_ratio": 0.6,
     "min_results": 3,
     "pair_top_n": 3,
@@ -102,7 +102,20 @@ DEFAULT_CONFIG = {
     "reply_sim_alpha": 0.3,
     "reply_sim_floor": 0.80,
     "reply_sim_span": 0.15,
+    # Search improvements (CPU only, not in the specification). The specification's behaviour comes
+    # back with SPEC_SEARCH_SETTINGS below (vector_min_cos 0.85, fts_stopwords false, 0 for the rest).
+    "fts_stopwords": True,
+    "kw_only_min_terms": 3,
+    "top_matches_max": 5,
+    "cross_lang_min_cos": 0.80,
+    "semantic_rescue_min_cos": 0.80,
+    "semantic_rescue_margin": 0.02,
 }
+
+# The specification's values for the search settings above that differ from it. Writing these into
+# config.json gives the search of the specification.
+SPEC_SEARCH_SETTINGS = {"vector_min_cos": 0.85, "fts_stopwords": False, "kw_only_min_terms": 0,
+                        "top_matches_max": 0, "cross_lang_min_cos": 0, "semantic_rescue_min_cos": 0}
 
 # key -> (kind, low, low_inclusive, high)   kind: "int" (JSON integer only) or "num" (int or float)
 _CONFIG_RANGES = {
@@ -122,6 +135,11 @@ _CONFIG_RANGES = {
     "reply_sim_alpha": ("num", 0, True, 1),
     "reply_sim_floor": ("num", 0, True, 1),
     "reply_sim_span": ("num", 0, False, None),
+    "kw_only_min_terms": ("int", 0, True, None),
+    "top_matches_max": ("int", 0, True, None),
+    "cross_lang_min_cos": ("num", 0, True, 1),
+    "semantic_rescue_min_cos": ("num", 0, True, 1),
+    "semantic_rescue_margin": ("num", 0, True, 1),
 }
 
 AGENT_NAME = "claude-code"

@@ -34,7 +34,27 @@ _CJK_RUN_RE = re.compile(r'[぀-ヿ㐀-鿿豈-﫿가-힯]+')
 _HIRAGANA_ONLY_RE = re.compile(r'^[぀-ゟー]+$')
 
 
-def _build_fts_query(query: str) -> str:
+# English function words (articles, pronouns, auxiliaries, question words, ...). They are in most
+# English records, so a question made of them matched almost everything ("Who is the CEO of the
+# company?" filled Top matches with unrelated rows through `the` / `of` / `is`). Dropped from the
+# keyword terms when config "fts_stopwords" is true (default; not in the specification).
+EN_STOPWORDS = frozenset("""
+a an the and or but if of to in on at by for with from as into onto about over under than then
+so too very just is are was were be been being am do does did done have has had having it its
+this that these those there here what which who whom whose when where why how i we you he she
+they me us our ours your yours my mine their theirs his her hers them not no can could should
+would will shall may might must also any some all each such only own same other more most
+get got please tell know let lets
+""".split())
+
+
+def _drop_stopwords(terms):
+    kept = [t for t in terms if t.lower() not in EN_STOPWORDS]
+    return kept or terms  # a question made only of function words is searched as typed
+
+
+def fts_terms(query: str, stopwords: bool = False) -> list:
+    """The trigram search terms of the question (in order, de-duplicated, at most 40)."""
     terms, seen = [], set()
     for word in _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or '')).split():
         if len(word) > 3 and _CJK_CHAR_RE.search(word):
@@ -48,7 +68,13 @@ def _build_fts_query(query: str) -> str:
             if g not in seen:
                 seen.add(g)
                 terms.append(g)
-    terms = terms[:_FTS_MAX_TERMS]
+    if stopwords:
+        terms = _drop_stopwords(terms)
+    return terms[:_FTS_MAX_TERMS]
+
+
+def _build_fts_query(query: str, stopwords: bool = False) -> str:
+    terms = fts_terms(query, stopwords)
     if not terms:
         return ""  # -> skip the trigram search
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
@@ -79,8 +105,8 @@ def bigram_text(text: str) -> str:
     return re.sub(r'\s+', ' ', joined).strip()
 
 
-def build_bigram_query(query: str) -> str:
-    """The bigram words of the question, quoted and joined with OR ('' = no search)."""
+def bigram_terms(query: str, stopwords: bool = False) -> list:
+    """The bigram-index search terms of the question (in order, de-duplicated, at most 40)."""
     cleaned = _FTS_PUNCT_RE.sub(' ', _FTS_CTRL_RE.sub(' ', query or ''))
     words = bigram_text(cleaned).split()
     seen, terms = set(), []
@@ -93,7 +119,14 @@ def build_bigram_query(query: str) -> str:
     non_hira = [t for t in terms if not _HIRAGANA_ONLY_RE.match(t)]
     if non_hira:
         terms = non_hira
-    terms = terms[:_FTS_MAX_TERMS]
+    if stopwords:
+        terms = _drop_stopwords(terms)
+    return terms[:_FTS_MAX_TERMS]
+
+
+def build_bigram_query(query: str, stopwords: bool = False) -> str:
+    """The bigram words of the question, quoted and joined with OR ('' = no search)."""
+    terms = bigram_terms(query, stopwords)
     if not terms:
         return ""
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
@@ -408,14 +441,15 @@ def _search_fts_table(conn, table, match, limit, since, until):
     return out
 
 
-def search_fts(conn, query, limit=60, since=None, until=None) -> list:
+def search_fts(conn, query, limit=60, since=None, until=None, stopwords=False) -> list:
     """Trigram FTS search; words are quoted and joined with OR."""
-    return _search_fts_table(conn, "memories_fts", _build_fts_query(query), limit, since, until)
+    return _search_fts_table(conn, "memories_fts", _build_fts_query(query, stopwords), limit, since, until)
 
 
-def search_fts_bigram(conn, query, limit=60, since=None, until=None) -> list:
+def search_fts_bigram(conn, query, limit=60, since=None, until=None, stopwords=False) -> list:
     """Search of the CJK bigram index."""
-    return _search_fts_table(conn, "memories_fts_bi", build_bigram_query(query), limit, since, until)
+    return _search_fts_table(conn, "memories_fts_bi", build_bigram_query(query, stopwords), limit, since,
+                             until)
 
 
 def get_memories_by_turn_id(conn, turn_id) -> list:

@@ -34,6 +34,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(n3memorycore.__file_
 
 def _cfg(**kw):
     c = dict(n3memory.DEFAULT_CONFIG)
+    c.update(n3memory.SPEC_SEARCH_SETTINGS)  # these tests check the search of the specification
     c.update(kw)
     return c
 
@@ -395,6 +396,7 @@ class TestWeakMatches:
 
     def test_search_endpoint_flags_weak(self, conn, cfg):
         self._base(conn)
+        n3memory._SERVER_STATE["cfg"] = dict(cfg, **n3memory.SPEC_SEARCH_SETTINGS)
         res = n3memory.api_search(n3memory.SearchRequest(query="q"))
         assert [r["weak"] for r in res["results"]] == [False, True, True]
 
@@ -973,7 +975,7 @@ class TestConfig:
     def test_wrong_type_only_that_key(self, isolate):
         p = self._write(isolate, {"vector_min_cos": "0.83", "server_port": TEST_PORT})
         cfg = n3memory._load_config()
-        assert cfg["vector_min_cos"] == 0.85 and cfg["server_port"] == TEST_PORT
+        assert cfg["vector_min_cos"] == n3memory.DEFAULT_CONFIG["vector_min_cos"] and cfg["server_port"] == TEST_PORT
         assert "vector_min_cos" in _notices()["config_type"]["message"]
         assert json.loads(p.read_text(encoding="utf-8"))["vector_min_cos"] == "0.83"
 
@@ -1633,3 +1635,103 @@ class TestHookEntryAudit:
         assert lines[0]["hook"] == module.HOOK_NAME and len(lines[0]["raw"]) == 4096
         assert lines[0]["payload"]["prompt"] == "x" * 5000
 
+
+class TestSearchImprovements:
+    """Search improvements on by default (CPU only, not in the specification). Each can be turned off in
+    config.json; SPEC_SEARCH_SETTINGS gives the search of the specification."""
+
+    def _imp(self, **kw):
+        c = dict(n3memory.DEFAULT_CONFIG)
+        c.update(kw)
+        return c
+
+    def test_defaults(self):
+        d = n3memory.DEFAULT_CONFIG
+        assert d["vector_min_cos"] == 0.82 and d["fts_stopwords"] is True and d["kw_only_min_terms"] == 3
+        assert d["top_matches_max"] == 5 and d["cross_lang_min_cos"] == 0.80
+        assert d["semantic_rescue_min_cos"] == 0.80 and d["semantic_rescue_margin"] == 0.02
+
+    def test_stopwords_dropped_from_terms(self):
+        assert database.fts_terms("Who is the CEO of the company?", True) == ["CEO", "company"]
+        assert "the" in database.fts_terms("Who is the CEO of the company?", False)
+        assert database.fts_terms("who is the", True) == ["who", "the"]  # only function words: kept
+        assert database.fts_terms("東京タワーの高さ", True) == database.fts_terms("東京タワーの高さ", False)
+
+    def test_function_words_alone_do_not_match(self, conn):
+        add(conn, "[claude] The release is on Friday and the notes are in the wiki.")
+        c = self._imp(min_results=0)
+        q = "Who is the CEO of the company?"
+        assert hybrid_search(conn, q, c, embed_fn=lambda t: basis(5))["results"] == []
+        off = dict(c, fts_stopwords=False, kw_only_min_terms=0)
+        assert hybrid_search(conn, q, off, embed_fn=lambda t: basis(5))["results"]
+
+    def test_keyword_only_rows_need_enough_terms(self, conn):
+        add(conn, "[claude] zebra crossing near the park")
+        add(conn, "[claude] zebra crossing station lights timing")
+        c = self._imp(relative_min_score_ratio=0, min_score=0)
+        q = "zebra crossing station lights"
+        r = hybrid_search(conn, q, c, embed_fn=lambda t: basis(5))["results"]
+        assert [x["content"] for x in r if not x["weak"]] == ["[claude] zebra crossing station lights timing"]
+        assert any(x["weak"] and "near the park" in x["content"] for x in r)
+        off = hybrid_search(conn, q, dict(c, kw_only_min_terms=0), embed_fn=lambda t: basis(5))["results"]
+        assert len([x for x in off if not x["weak"]]) == 2
+
+    def test_top_matches_max_caps_strong_rows_only(self, conn):
+        for i in range(8):
+            add(conn, f"[claude] record {i}", vec_with_cos(0.95, other=1 + i))
+        r = hybrid_search(conn, "anything", self._imp(top_matches_max=3), embed_fn=lambda t: basis(0))["results"]
+        assert len([x for x in r if not x["weak"]]) == 3
+        r = hybrid_search(conn, "anything", self._imp(top_matches_max=0), embed_fn=lambda t: basis(0))["results"]
+        assert len([x for x in r if not x["weak"]]) == 8
+
+    def test_is_cjk_text(self):
+        assert processor._is_cjk_text("[claude 1/2] ログの保存期間は 3 年です")
+        assert not processor._is_cjk_text("[user] How long are logs kept?")
+        assert not processor._is_cjk_text("The file 設定.json was renamed to config.json in the repository")
+        assert not processor._is_cjk_text("")
+
+    def test_best_other_language_row_is_rescued(self, conn):
+        add(conn, "[claude] The backup runs at 03:30 every night.", vec_with_cos(0.81, other=1))
+        add(conn, "[claude] The staging host moved last week.", vec_with_cos(0.80, other=2))
+        add(conn, "[claude] ログは 3 年残します。", vec_with_cos(0.81, other=3))
+        c = self._imp(min_results=0)
+        q = "バックアップは何時に動く？"
+        e0 = lambda t: basis(0)  # noqa: E731
+        got = [x["content"] for x in hybrid_search(conn, q, c, embed_fn=e0)["results"]]
+        assert got == ["[claude] The backup runs at 03:30 every night."]  # only the best, only the other script
+        assert hybrid_search(conn, q, dict(c, cross_lang_min_cos=0), embed_fn=e0)["results"] == []
+        assert hybrid_search(conn, q, dict(c, cross_lang_min_cos=0.82), embed_fn=e0)["results"] == []
+
+    def test_clear_leader_below_the_floor_is_rescued(self, conn):
+        e0 = lambda t: basis(0)  # noqa: E731
+        add(conn, "[claude] the answer", vec_with_cos(0.815, other=1), turn_id="T1")
+        add(conn, "[claude] something else", vec_with_cos(0.79, other=2), turn_id="T2")
+        c = self._imp(min_results=0)
+        got = [x["content"] for x in hybrid_search(conn, "q", c, embed_fn=e0)["results"]]
+        assert got == ["[claude] the answer"]
+        assert hybrid_search(conn, "q", dict(c, semantic_rescue_min_cos=0), embed_fn=e0)["results"] == []
+
+    def test_no_rescue_when_the_nearest_lie_close_together(self, conn):
+        e0 = lambda t: basis(0)  # noqa: E731
+        add(conn, "[claude] one", vec_with_cos(0.815, other=1), turn_id="T1")
+        add(conn, "[claude] two", vec_with_cos(0.805, other=2), turn_id="T2")
+        add(conn, "[user] same turn as one", vec_with_cos(0.81, other=3), turn_id="T1")
+        assert hybrid_search(conn, "q", self._imp(min_results=0), embed_fn=e0)["results"] == []
+
+    def test_spec_settings_restore_the_spec_behaviour(self, conn):
+        add(conn, "[claude] zebra here")
+        spec = dict(self._imp(min_results=0), **n3memory.SPEC_SEARCH_SETTINGS)
+        r = hybrid_search(conn, "zebra crossing station lights", spec, embed_fn=lambda t: basis(5))["results"]
+        assert [x["content"] for x in r if not x["weak"]] == ["[claude] zebra here"]
+
+    def test_new_keys_are_type_checked(self, isolate):
+        n3memory._load_config()
+        with open(n3memory.CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg.update({"fts_stopwords": "yes", "kw_only_min_terms": -1, "top_matches_max": 2.5,
+                    "cross_lang_min_cos": 1.5})
+        with open(n3memory.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        out = n3memory._load_config()
+        assert out["fts_stopwords"] is True and out["kw_only_min_terms"] == 3
+        assert out["top_matches_max"] == 5 and out["cross_lang_min_cos"] == 0.80

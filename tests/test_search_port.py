@@ -18,6 +18,7 @@ from tests.conftest import add, basis, fake_embed, vec_with_cos, FakeModel, use_
 
 def _cfg(**kw):
     c = dict(n3memory.DEFAULT_CONFIG)
+    c.update(n3memory.SPEC_SEARCH_SETTINGS)  # these tests check the search of the specification
     c.update(kw)
     return c
 
