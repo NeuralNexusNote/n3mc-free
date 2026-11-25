@@ -408,7 +408,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 
 #### サーバーの起動（`_start_server`）
 
-0. **起動する前に起動を予約する**：`Popen` の前に `open(..., "x")` で PID ファイルを作り、`Popen` が返るまで空のままにし、返ったら子プロセスの PID を書く。`FileExistsError` なら、ほかのプロセスがサーバーを起動している（または動かしている）：起動せず、上の「PID ファイルの扱い」に従う。`Popen` が例外を出したら、予約を消す。**空か読めない PID ファイル**（予約から書くまでの間）は、ファイルの更新時刻から 60 秒の間「起動中」として扱い、死んだプロセスとは扱わない。消さず、2 つ目のサーバーも起動しない。60 秒を過ぎたら死んだものとして扱う。PID ファイルを作らなかったプロセスは、それを上書きしない。自分の PID を書くのはサーバー自身だけ（下の `--run-server`）。（`_start_server` が先に `Popen` を呼び、そのあとで PID ファイルを作り、あれば上書きすると、同時に動いた 2 つのフックがどちらもサーバーを起動し、モデルを 2 回読み込み、2 つ目はポートを取れずに失敗し、PID ファイルがその失敗したプロセスを指すことがある。）
+0. **起動する前に起動を予約する**：`Popen` の前に `open(..., "x")` で PID ファイルを作り、`Popen` が返るまで空のままにし、返ったら子プロセスの PID を書く。`FileExistsError` なら、ほかのプロセスがサーバーを起動している（または動かしている）：起動せず、上の「PID ファイルの扱い」に従う。`Popen` が例外を出したら、予約を消す。**空か読めない PID ファイル**（予約から書くまでの間）は、ファイルの更新時刻から 60 秒の間「起動中」として扱い、死んだプロセスとは扱わない。消さず、2 つ目のサーバーも起動しない。60 秒を過ぎたら死んだものとして扱う。PID ファイルを作らなかったプロセスは、それに書かない。書くのは 2 つだけで、予約したプロセスが子の PID を書き、サーバー自身（`--run-server`）が起動したときに自分の PID で上書きする（ふつうは同じ番号）。（`_start_server` が先に `Popen` を呼び、そのあとで PID ファイルを作り、あれば上書きすると、同時に動いた 2 つのフックがどちらもサーバーを起動し、モデルを 2 回読み込み、2 つ目はポートを取れずに失敗し、PID ファイルがその失敗したプロセスを指すことがある。）
 1. 下の「Clean CLI」のとおり `subprocess.Popen` で `python -m n3memorycore.n3memory --run-server` を起動する。stdout と stdin は `DEVNULL`、**stderr は `.memory/server.log` に追記する**（ファイルが 1 MB を超えていたら起動前に切り詰める）。サーバーはフックのプロセスから**切り離し**、フックが終わっても動き続けるようにする: Windows では `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW`、それ以外では `start_new_session=True`。**作業フォルダはデータフォルダ（`HOME_DIR`）にする**（`cwd=_server_cwd()`）。サーバーは何日も動き、Windows ではプロセスの作業フォルダを消すことも名前を変えることもできないので、最初にサーバーを起動したフックのフォルダ（利用者のプロジェクトや作業ツリー）を指定しない。例外は、ソースのチェックアウトをその場で動かすとき（このパッケージの親フォルダが今のフォルダ。下の「安全なインポートパス」で `-P` を付けないとき）で、子はそこからしかパッケージを見つけられないので、そのフォルダにする。サーバーの中の処理は作業フォルダに頼らない。
 2. `/health` を 0.5 秒ごとに最大 60 秒見る。**待っている間に子プロセスが終了したら（`proc.poll() is not None`）、すぐに待つのをやめる** — ポートを N3MC 以外のプログラムが使っている、依存パッケージがない、DB を開けない、などの場合。**応答は、`ensure_server` と同じ確認を通ったときだけ使う**：`root` がこのフォルダであること（「ok」、または「stale」— このフォルダの、コードの違うサーバーで、次の呼び出しが入れ替える）。別のフォルダのサーバーが答えたとき（同じ `server_port` の 2 つのフォルダを同時に起動し、もう一方が先にポートを取った）や、`root` を返さないサーバーのときは、決して使わない。`_FOREIGN_SERVER_ROOT` を設定し、上の表と同じ `port_conflict` を出し、サーバーなしで進む（保存は `_buffer_direct`、検索はしない）。どんな応答でも待ちを終えると、その呼び出しの検索と保存が別のフォルダの記憶に向かってしまう。
 3. そうして早く終了したときは、知らせ `server_start_failed`（"The N3MC memory server could not start (exit code <n>). See <path of server.log> for the reason."）を出し、時刻を `.memory/server_start_failed`（マーカーファイル）に書き、PID ファイルが終了したその子プロセスの PID を持っていれば消し、サーバーなしで進める（直接保存 / `memory search unavailable`）。`Popen` そのものが例外を出したときも、サーバーなしで進む（stderr に 1 行。知らせとマーカーは書かない）。
@@ -424,7 +424,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 
 #### ポートが別のフォルダのサーバーのとき
 
-`ensure_server` は False を返し、モジュール変数 `_FOREIGN_SERVER_ROOT` にそのサーバーの `root` を入れ、知らせ `port_conflict` を出す。このとき **記録が別のフォルダの DB に混ざらないように**:
+`ensure_server` は False を返し、モジュール変数 `_FOREIGN_SERVER_ROOT` にそのサーバーの `root` を入れ、知らせ `port_conflict`（"Port <port> is used by the N3MC server of another folder (<root>). Memories of this folder (<HOME_DIR>) are saved directly and not searched until the port is free. Give each N3MC folder its own server_port in its config.json."）を出す。このとき **記録が別のフォルダの DB に混ざらないように**:
 
 - 保存（フック・`--buffer`・`--save-claude-turn`）は自分の DB に `_buffer_direct` で直接書く（埋め込みは、自分のサーバーが動いたときの `/repair` で付く）。
 - 検索（フック・`--search`）はしない。出力は `# Recalled Memory Context\n\n_(memory search unavailable: another N3MC folder's server is using port <port>)_\n`。
@@ -672,7 +672,7 @@ def _build_fts_query(query: str) -> str:
 - 質問の側（`build_bigram_query`）は、質問のバイグラムの語を引用符で囲んで OR でつなぐ。ひらがなだけの語は、ほかの語が残るなら捨てる。CJK でない 1 文字の語は捨てる。
 - `hybrid_search` は、いつも両方の表（`search_fts` と `search_fts_bigram`）を探し、「keyword_relevance」に書いたとおりに合わせる。バイグラムの検索が失敗したら、trigram の結果だけで続ける。
 - 表ができる前に保存された記録は、`--repair` が一度だけ索引する（`meta` 表のキー `fts_bigram`、§3.5。埋め込みを作らないので `max_records` で制限しない）。
-- **索引の文の決まりが変わったら、`/repair` が一度だけ作り直す**: `fts_index_text` と `_CJK_CHAR_RE` の決まりの版を定数 `FTS_TEXT_RULES = "2"` に持つ。`meta` のキー `fts_text_rules` がこれと違う（ないときも含む）とき、`/repair` は、すべての行を `rowid` の順に 200 行ずつ読み、`memories_fts` と `memories_fts_bi` のその rowid の行を消して、今の決まりの文で入れ直す（行がなかった表にも入れる）。進み方は FTS 句読点クリーニングと同じ（§3.5「マイグレーションのバッチ処理」。キーセット方式、位置は `meta` のキー `fts_text_cursor`、`max_records` に従う）。最後まで読んだら `fts_text_rules` を書き、`fts_text_cursor` を消す。新しい DB でも、最初の `/repair` が `fts_text_rules` を書く。作り直さないと、古い行は `[claude]` などの語を持ち続け、`佐々木` の 2 文字組も持たない。
+- **索引の文の決まりが変わったら、`/repair` が一度だけ作り直す**: `fts_index_text` と `_CJK_CHAR_RE` の決まりの版を定数 `FTS_TEXT_RULES = "2"` に持つ。`meta` のキー `fts_text_rules` がこれと違う（ないときも含む）とき、`/repair` は、すべての行を `rowid` の順に 200 行ずつ読み、`memories_fts` か `memories_fts_bi` の文が今の決まりの文と違う（または行がない）行について、両方の表のその rowid の行を消して、今の決まりの文で入れ直す（行がなかった表にも入れる）。2 つの FTS の行がすでにその文を持つ行は、そのままにする。進み方は FTS 句読点クリーニングと同じ（§3.5「マイグレーションのバッチ処理」。キーセット方式、位置は `meta` のキー `fts_text_cursor`、`max_records` に従う）。最後まで読んだら `fts_text_rules` を書き、`fts_text_cursor` を消す。新しい DB でも、最初の `/repair` が `fts_text_rules` を書く。作り直さないと、古い行は `[claude]` などの語を持ち続け、`佐々木` の 2 文字組も持たない。
 - 理由（N3MC-Pro で測定、ラベル付きの質問 138 問）: バイグラムの索引を外すと MRR が 0.046 下がった（95% 区間 −0.089〜−0.007）。
 
 > **⚠️ 語の引用符囲みは必須**: 句読点除去のあとも `\ / # = @ * $ % + ^ ~ |` などの ASCII 記号や、単独の `AND` / `OR` / `NOT` / `NEAR` が残る。これをそのまま `MATCH` に渡すと FTS5 の文法エラー（`fts5: syntax error near "\"` 等）になり、`/search` が HTTP 500 を返して記憶の差し込みが「memory search unavailable」になる（実測で質問の約 12% で発生）。各語を FTS5 の文字列として `"..."` で囲めば、記号も演算子も文字どおりに照合される。（引用符で囲んだ語は `OR` でつなぐ。語の間に書く `OR` は引用符の外にあるので演算子になり、語の中にあるユーザーの `OR` は文字どおりのまま。）
@@ -853,8 +853,8 @@ db_path = base_dir + "\\data\\memory.db" # NG
 | 場合 | 動作 |
 |---|---|
 | ファイルがない | 既定値に新しい `owner_id`・`local_id` を入れて保存する。**ファイルは排他的に作成する**（下記「config.json の書き込み」） |
-| JSON として読めない、または一番外がオブジェクトでない | **`config.json` は書き換えない。** その間は既定値で動く。`owner_id`・`local_id` は DB から復旧し（下記）、DB にもなければ**その回だけ**の新しい UUID を使う（保存しない）。知らせ `config_unreadable` を出す |
-| 値の型が既定値と違う（例 `"vector_min_cos": "0.83"` — 引用符付きの数値）、または値が許される範囲の外（下の表） | **その項目だけ**無視して既定値を使い、ほかの項目は使う。`config.json` は書き換えない。知らせ `config_type` に項目名を出す |
+| JSON として読めない、または一番外がオブジェクトでない | **`config.json` は書き換えない。** その間は既定値で動く。`owner_id`・`local_id` は DB から復旧し（下記）、DB にもなければ**その回だけ**の新しい UUID を使う（保存しない）。知らせ `config_unreadable`（"<config.json のパス> cannot be read (<reason>). N3MC runs with default settings and did not change the file. Fix the file; the notice disappears once it can be read."。`<reason>` は、読み込みか解析の失敗の `<例外の型>: <メッセージ>`、または `the top level is not a JSON object`）を出す |
+| 値の型が既定値と違う（例 `"vector_min_cos": "0.83"` — 引用符付きの数値）、または値が許される範囲の外（下の表） | **その項目だけ**無視して既定値を使い、ほかの項目は使う。`config.json` は書き換えない。知らせ `config_type` に項目名を出す（"<config.json のパス>: these settings have a wrong type or a value out of range and were ignored (the defaults are used): <keys>. Write numbers without quotes."。`<keys>` は無視した項目名を並べ替えて `, ` でつないだもの） |
 | 正しく読める | ID や既定のキーが足りなければ足して保存する。`config_unreadable`・`config_type` の知らせを消す |
 
 - 型の確認（`_config_value_ok(key, value)`）: 既定値が真偽値なら真偽値だけ、文字列なら文字列だけを受け付ける。数値は下の表に従う（真偽値は数値として扱わない）。既定値が `None` の項目（`owner_id`・`local_id`）と、既定値にない項目は確かめない。
@@ -892,7 +892,7 @@ db_path = base_dir + "\\data\\memory.db" # NG
 サーバー起動時（`lifespan`）には `PRAGMA integrity_check` を 1 回だけ実行する。一方 `_buffer_direct` フォールバック経路では **`PRAGMA quick_check`** を実行する（`integrity_check` は全テーブル全行走査で大型 DB ではフォールバックの度に数秒〜数分を要し、HTTP 失敗ごとに走らせる経路としては不適切なため、軽量な `quick_check` を使う）。**`quick_check` は 1 プロセスにつき最大 1 回**: 結果をモジュール変数に覚えておく。別のフォルダのサーバーがポートを使っている間はすべてのチャンクが `_buffer_direct` を通るので、呼び出しごとに確かめると、チャンクごとに `quick_check` を実行することになる。いずれも：
 
 1. 結果が `ok` でない場合、DB を `n3memory.db.corrupt-<YYYYmmddHHMMSS>.bak`（ローカル時刻。その名前がすでにあれば `…-2.bak`、`…-3.bak`、…）として退避する。
-2. `n3memory.db-wal` および `n3memory.db-shm` のサイドカーファイルは削除せず、同じ名前の形（`n3memory.db.corrupt-<YYYYmmddHHMMSS>.bak-wal`、`…-shm`）で一緒に**移動する**。新しい空 DB が古い WAL を読み込んではならない — 移動しておけば削除するのと同じくそれは防げる — うえ、WAL には最新の記録が入っていることがあり、バックアップの隣に名前をそろえて置いてあれば `sqlite3 <backup> ".recover"` でまだ読める（復旧の前に `<name>-wal` / `<name>-shm` に名前を戻す）。
+2. `n3memory.db-wal` および `n3memory.db-shm` のサイドカーファイルは削除せず、同じ名前の形（`n3memory.db.corrupt-<YYYYmmddHHMMSS>.bak-wal`、`…-shm`）で一緒に**移動する**。新しい空 DB が古い WAL を読み込んではならない — 移動しておけば削除するのと同じくそれは防げる — うえ、WAL には最新の記録が入っていることがあり、バックアップの隣に名前をそろえて置いてあれば `sqlite3 <backup> ".recover"` でまだ読める（復旧の前に `<name>-wal` / `<name>-shm` に名前を戻す）。**開く前に控えを取る**: 本体が DB でないと、SQLite は開くときに `-wal` / `-shm` を消すので、移すものが残らない。`_connect_checked`（下記）は DB を開くたびに、その前に、あるサイドカーごとに `<サイドカー>.n3mc-hold`（`n3memory.db-wal.n3mc-hold`）という名前のハードリンクを作る（ハードリンクを作れないときは写し）。DB を退避するときは、サイドカーがまだあればそれを、なければ控えを移す。控えはそのあとで消し、DB が問題なく開けたときも消す。
 3. 新しい空の DB を作成する。
 4. stderr に警告メッセージを出力し（復旧手順を含む）、知らせ `db_corrupt`（"The memory DB failed its integrity check and was set aside as <path>. A new empty DB is in use. To recover records: sqlite3 <path> .recover | sqlite3 recovered.db"）を出す。この知らせは、ほかの知らせと同じく検索結果の先頭に出る（§3「知らせ」）。
 
@@ -906,7 +906,7 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 **埋め込みの間は書き込みのロックを持たない**：ベクトルの修復は、バッチ全体の埋め込みを先に、トランザクションの外で計算し（開いているものは先にコミットする）、そのあとでバッチの `memories_vec` / `memories_fts` / `memories_fts_bi` の行を入れてコミットする — `--reembed` と同じ順序。（最初の `INSERT … memories_vec` が書き込みのトランザクションを開き、バッチの残り — 最大 200 件 — を埋め込む間ずっと開いたままにすると、その間に届いた `/buffer` は busy timeout まで待って `database is locked` で失敗し、`_buffer_direct` への切り替えも同じく失敗して、質問が保存されない。）**書き込む前にもう一度確かめる**: 埋め込みのあと、`BEGIN IMMEDIATE` で書き込みのロックを取ってから、バッチの行ごとに、`memories` の行がまだあって同じ記録であること（`id` か `content` が同じ）、`memories_fts` / `memories_fts_bi` / `memories_vec` にその rowid の行がまだないことを確かめ、足りないものだけを書く。ほかの呼び出し（別のウィンドウのフック、手動の `--repair`）が埋め終えた行や、消された行は飛ばす。（この確かめがないと、2 つの呼び出しが同じ未修復の行を読んだとき、あとの方が `UNIQUE constraint failed on memories_vec primary key` で止まる。）
 
-**フックからの呼び出しごとの上限**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。
+**フックからの呼び出しごとの上限**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。**上限の数え方**: `max_records` は 1 回の呼び出しで 1 つの枠で、FTS 句読点クリーニング、FTS の文の作り直し（§3「CJK バイグラムの索引」）、ベクトルの修復がこの順に分け合う。どの手順も、変えたかどうかにかかわらず、**読んだ**行の数だけ枠を使い、枠を使い切ったあとの手順は動かない。古い行のバイグラムの索引づけは上限を受けない（§3）。FTS の文の作り直しで、2 つの FTS の行がすでに今の決まりの文を持つ行は書き直さず、応答の `count` にも数えない（枠は使う）。
 
 ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。**続きから始める**: 終えた最後の rowid を `meta` のキー `fts_punct_cursor` に、各回の書き直しと同じトランザクションで書く。次の呼び出しは rowid 0 からではなく、その次から始める（`max_records` 付きの呼び出しが続いても、プロセスを起動し直しても進む）。最後まで読み終えたら `fts_punct_cleaned` を書き、`fts_punct_cursor` を消す。（この位置がないと、上限付きの呼び出しが毎回 rowid 0 から始まり、201 行目に届かず、マーカーも書かれない。）
 
@@ -978,7 +978,7 @@ python -m n3memorycore.n3memory --recall-thread <turn_id> [--before N] [--after 
 - 出力は `--list` と同じタブ区切り（`--format jsonl` も対応）で、最後に `Total: N records` を出す。
 - **どの行を出すか**: 対象のターンの、最小の `rowid` と最大の `rowid` を取る。前の N ターンは、`MAX(rowid)` が対象の最小の rowid より小さい `turn_id`（NULL でなく、対象でもないもの）のうち、`MAX(rowid)` が大きいものから N 個である。後の N ターンは、`MIN(rowid)` が対象の最大の rowid より大きい `turn_id` のうち、`MIN(rowid)` が小さいものから N 個である。`turn_id` が NULL の行は、ターンとして数えない。選んだターンのすべての行を、`rowid` の順に出す。
 - **前後のターンは同じ会話から取る**: 対象のターンの最初の行（最小の `rowid`）に `session_id` があれば、前後のターンには、最初の行の `session_id` が同じターンだけを選ぶ。`session_id` がなければ、対象のターンだけを出す。並行して動く別のセッションのターンは混ぜない（混ぜると、対象の直前の往復の代わりに別の会話の発言が「周辺会話」として出る）。DB のファイルがないときは、stderr に `No DB found at <path>` を出す。
-- **`--format jsonl` のキー**: `--list` は、記録ごとに 1 つのオブジェクトを出し、キーは `id, timestamp, agent_name, content` である。`--recall-thread` は `id, timestamp, agent_name, turn_id, content` である（`ensure_ascii=False`）。
+- **`--format jsonl` のキー**: `--list` は、記録ごとに 1 つのオブジェクトを出し、キーは `id, timestamp, agent_name, content` である。`--recall-thread` は `id, timestamp, agent_name, turn_id, content` である（`ensure_ascii=False`）。`--format jsonl` では、どちらも `Total:` の行を出さないので、標準出力のどの行も 1 つの JSON オブジェクトである。
 - **運用**: Claude は `--search` のスニペットで文脈不足と判断した場合、ヒットの `turn_id` を `--recall-thread` に渡して周辺会話を取得すること。ユーザーがこのコマンドを直接叩く必要はない。
 
 ---
@@ -1258,7 +1258,7 @@ Claude が直接呼び出すエントリポイントは 2 系統ある。**Claud
 
 **プロジェクトのフォルダ（`<project>`）**: 手順 1 と 2 は、フックが動いているフォルダではなく、プロジェクトのフォルダで行う。`<project>` は、環境変数 `CLAUDE_PROJECT_DIR` があり、実在するフォルダを指すときはその値（Claude Code が、自分の起動するフックのコマンドに渡す。セッションを始めたプロジェクトの根。Windows ではスラッシュで書かれる。例 `C:/Users/you/work`）。なければ（`--stop` を手で実行したときなど）`<cwd>`（プロセスの作業フォルダ）。理由: フックはセッションの今の作業フォルダで動き、Claude が `cd` したあとはそのサブフォルダになる。そのフォルダを使うと、`--stop` はサブフォルダにも `.claude/rules/n3mc-behavior.md` を作ってしまう。サブフォルダの規則ファイルは、Claude がそのフォルダのファイルを読むたびに、プロジェクトの規則ファイルに重ねて読み込まれ、この製品をアンインストールしたあとも残る。すでにサブフォルダにできたファイルには触れない（`--stop` は利用者のフォルダを探さない）。
 
-**プロジェクトのフォルダがホームのときは手順 1 と 2 をしない**: `<project>` がユーザーのホームフォルダ（`os.path.normcase(os.path.realpath(project)) == os.path.normcase(os.path.realpath(os.path.expanduser("~")))`）なら、`.claude/rules/n3mc-behavior.md` を作らず・変えず、`.claude/CLAUDE.md` も読まない。手順 3 はいつもどおり行い、何も出力しない。理由: ホームの `.claude/` は Claude Code のユーザー全体の設定のフォルダで、`~/.claude/rules/` の規則はすべてのプロジェクトで読み込まれる。利用者が Claude Code をホームで開いたとき（またはホームで `--stop` を手で実行したとき）に規則ファイルを書くと、すべてのプロジェクトでプロジェクトの規則ファイルと二重に読まれる。さらに、この製品をアンインストールしたあとも残り、もうないコマンドを使うよう指示し続ける。`~/.claude/CLAUDE.md` は利用者のファイルなので触れない（下の片付けの決まりと同じ）。ホームにすでにあるファイルは、読まず、消さない。
+**プロジェクトのフォルダがホームのときは手順 1 と 2 をしない**: `<project>` がユーザーのホームフォルダ（`os.path.normcase(os.path.realpath(project)) == os.path.normcase(os.path.realpath(os.path.expanduser("~")))`）なら、`.claude/rules/n3mc-behavior.md` を作らず・変えず、`.claude/CLAUDE.md` も読まない。手順 3 はいつもどおり行い、何も出力しない。理由: ホームの `.claude/` は Claude Code のユーザー全体の設定のフォルダで、`~/.claude/rules/` の規則はすべてのプロジェクトで読み込まれる。利用者が Claude Code をホームで開いたとき（またはホームで `--stop` を手で実行したとき）に規則ファイルを書くと、すべてのプロジェクトでプロジェクトの規則ファイルと二重に読まれる。さらに、この製品をアンインストールしたあとも残り、もうないコマンドを使うよう指示し続ける。`~/.claude/CLAUDE.md` は利用者のファイルなので触れない（下の片付けの決まりと同じ）。ホームにすでにあるファイルは、読まず、消さない。手順 2 はまるごと行わないので、このときは古い `~/.n3mc/.memory/memory_context.md`（下の片付けの手順 2）も消さない。次にプロジェクトのフォルダで動いた `--stop` が消す。
 
 1. `<project>/.claude/rules/n3mc-behavior.md`（AI 行動指針）を用意する（`_ensure_behavior_md`、下記「AI 行動指針ファイルの版」）。
 2. `<project>/.claude/CLAUDE.md` に旧版が書いた memory_context の `@import` 行があれば取り除く（`_retire_memory_context`、下記）。**N3MC は CLAUDE.md に何も書き足さない。** CLAUDE.md がなければ作らない。
@@ -1413,14 +1413,14 @@ stdin から UserPromptSubmit の JSON を読み取る。Claude Code は `sessio
   - **最後のブロックだけを取る理由**: Claude Code の Stop の入力には、返答の最後のテキストブロックだけが入る（測定では、6 件の Stop の入力は、どれもトランスクリプトのテキストブロック 1 つと一致し、そのターンのブロックをつなげたものと一致したものはなかった）。同じブロックを取れば、Stop が保存済みのときは完全一致の検査で飛ばされる。ブロックをつなげると、ツールを使ったターンごとに、少し違う写しがもう 1 つ保存される。同じ返答のうちツール呼び出しより前に書いたテキストは保存されない。Stop も保存しない。
   - **割り込みの印を飛ばす理由**: ユーザーが割り込むと、Claude Code は途中までの返答の後に、テキストが `[Request interrupted by user]`（または `… for tool use]`）の `user` 行を書く。これをプロンプトとして扱うと、たどるのがそこで止まり、割り込まれた返答（この読み取りが必要になる場面）が見つからない。
   - **末尾の 1 行だけを飛ばす理由**: テキストが新しいプロンプトと同じ本物のプロンプトの行を、すべて飛ばすと、返答のテキストが出る前に質問を止め、同じ文を送り直したとき、止めた質問の行も飛ばし、その前の往復の返答を返してしまう。その返答は、止めた往復の `turn_id` でもう一度保存される。トランスクリプトに今のプロンプトがあれば、それは最も新しい行である。割り込みの印や返答より前にある同じテキストの行は、前の質問である。
-  - ファイルは最後の 5 MB までしか読まない（末尾から seek する）。失敗（パスがない、ファイルを読めない、構造が想定と違う）はすべて「前の回答なし」として扱い、`audit.log` に `{"hook": "UserPromptSubmit", "stage": "transcript_unreadable", "reason": "<短い理由>"}` を書いて続ける。トランスクリプトは取り戻すための材料にすぎず、これでフックを失敗させてはならない。
+  - ファイルは最後の 5 MB までしか読まない（末尾から seek する）。失敗（パスがない、ファイルを読めない、構造が想定と違う）はすべて「前の回答なし」として扱い、`audit.log` に `{"hook": "UserPromptSubmit", "stage": "transcript_unreadable", "reason": "<短い理由>"}` を書いて続ける。入力に `transcript_path` がないときも、同じように記録する（`"reason": "no transcript_path"`）。トランスクリプトは取り戻すための材料にすぎず、これでフックを失敗させてはならない。
   - 回答は `turn_id_<session>.txt` の turn_id（1 つ前の往復）で、通常のチャンク分割（全文に `purify_text` をかけてから `[claude]` / `[claude i/N]`）を通して保存する。Stop フックがすでに保存していれば、チャンクは同じものになり、同じ `turn_id` の中での完全一致の確認（§5.4）がすべてのチャンクを飛ばすので、二重には保存されない。
   - **実測した入力**: Pro 版と Free 版の監査ログで調べた UserPromptSubmit の入力は、どれもキー `session_id, transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode, hook_event_name, prompt`（+ `session_title`）を持ち、`last_assistant_message` を持つものはなかった。トランスクリプトの行は、上に書いたとおり `type`、`isSidechain`、`message.role` / `message.content` を持つ。
 
 > **⚠️ 理由**: Claude Code は UserPromptSubmit の入力に `last_assistant_message` を決して送らない。手順 2 がそこから読もうとすると、Q-A 契約の「回復経路」は一度も動かず、Stop フックが動かなかった返答（中断したターン、クラッシュ）は DB にも `audit.log` にも残らない。
 
 - **画像だけの質問**: `_extract_text()` が何も返さない（質問が画像だけ）ときも、**新しい** `turn_id` を作って `turn_id_<session>.txt` に書く。飛ばすのは `[user]` の保存だけ。そうしないと、画像への返答が 1 つ前の質問の `turn_id` で保存され（Stop フックはファイルを消さない）、関係のない往復の一部として出てしまう。
-- **JSON として読める入力**: `_extract_text()` が文字列の `prompt` をマルチモーダルの配列として扱うのは、**空でない JSON 配列として読め、すべての要素が文字列の `type` キーを持つオブジェクトであるときだけ**（`[{"type":"text",…},{"type":"image",…}]`）。それ以外はユーザーが入力した文章なので、そのまま返す。JSON として読める文章（`[1, 2, 3]`、`["apple", "banana"]`、`[]`、`[{"id": 1}]`）も同じ。JSON 配列として読める文字列をすべてマルチモーダルの配列として扱うと、そのような配列だけの質問は空になり、検索もされず、DB にも保存されない（`audit.log` にだけ残る）。
+- **JSON として読める入力**: `_extract_text()` が文字列の `prompt` をマルチモーダルの配列として扱うのは、**空でない JSON 配列として読め、すべての要素が文字列の `type` キーを持つオブジェクトであるときだけ**（`[{"type":"text",…},{"type":"image",…}]`）。それ以外はユーザーが入力した文章なので、そのまま返す。JSON として読める文章（`[1, 2, 3]`、`["apple", "banana"]`、`[]`、`[{"id": 1}]`）も同じ。JSON 配列として読める文字列をすべてマルチモーダルの配列として扱うと、そのような配列だけの質問は空になり、検索もされず、DB にも保存されない（`audit.log` にだけ残る）。マルチモーダルの配列の文は `_strip_images(payload)` が取り出す。`type` が `"text"` の部分の `text`（と、ただの文字列の部分）を `\n` でつなぎ、画像とほかの部分は捨て、文が残らなければ `""` を返す。文字列はそのまま返す。`--save-claude-turn` も、`last_assistant_message` が配列のときにこれを使う。
 
 - **システムの入力は飛ばす**: ユーザー発言が `_SYSTEM_PROMPT_PREFIXES`（`<task-notification>`、`<agent-message from=`、`<system-reminder>`）で始まる場合（バックグラウンド処理の完了通知、サブエージェントの報告、アプリのお知らせなど、ユーザーが打ったものではない入力）は、repair・保存・検索をせず、**新しい `turn_id` も振らない**（その通知への Claude の返答は、今の往復の `turn_id` に入る）。`audit.log` に `{"hook": "UserPromptSubmit", "stage": "skipped", "reason": "system_prompt"}` の行を書き、空の結果（`_No relevant memories found._`）を stdout に出して終わる。ほかのシステムの入力が見つかったら `_SYSTEM_PROMPT_PREFIXES` に足す。**先頭の `<system-reminder>` の塊のあとに利用者の文があるとき**：アプリは、利用者の発言の前に `<system-reminder>…</system-reminder>` の塊を付けて送ることがある（例: デスクトップアプリのサイドチャットの最初の発言）。発言が `<system-reminder>` で始まるときは、先に、先頭に続けて並ぶ `<system-reminder>…</system-reminder>` の塊をすべて取り除き、残りの前後の空白を落とす。残りが空でなく、`_SYSTEM_PROMPT_PREFIXES` のどれかで始まりもしなければ、それは利用者が打った文である。その残りの文をユーザー発言として、いつもどおり repair・保存・検索をし、新しい `turn_id` を振る（保存も検索も、塊を取り除いた文で行う）。残りが空のとき、残りがまたシステムの入力で始まるとき、閉じタグ `</system-reminder>` がないときは、今までどおり飛ばす。
 - ポートが別のフォルダのサーバーのときは §3「ポートが別のフォルダのサーバーのとき」に従う（保存は直接、検索はしない）。
@@ -1531,7 +1531,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   - **ポートが別のフォルダのサーバー** → §3 の文面。
   - **検索成功** → レンダリング済み markdown（Top matches、弱い候補があればその見出し、Q-A exchanges の順。§5「Q-A ペアリング契約」5）。
   - どの場合も、出す知らせ（§3「知らせ」）があれば、見出し `# Recalled Memory Context` の直後（検索結果では `Search query:` の行の直後）に入れる。
-- **【実装仕様】stdin 入力**: `--buffer` は引数の代わりに `-` を指定すると標準入力からテキストを読み取る（例: `cat file.txt | n3mc --buffer -`）。ただし Stop フック（`n3memorycore/n3mc_stop_hook.py`）内では `--buffer -` を使用してはならない。Stop フック自身が stdin から Claude Code の JSON を受け取るため、二重消費になり壊れる。オプションで `--agent-id NAME` 引数を指定すると、レコードの **`agent_name`**（表示名）を設定できる（例: `n3mc --buffer "テキスト" --agent-id "claude-code"`）。名前に反して `local_id` は設定しない。名前は互換のために残している（§3.7）。
+- **【実装仕様】stdin 入力**: `--buffer` は引数の代わりに `-` を指定すると標準入力からテキストを読み取る（例: `cat file.txt | n3mc --buffer -`）。ただし Stop フック（`n3memorycore/n3mc_stop_hook.py`）内では `--buffer -` を使用してはならない。Stop フック自身が stdin から Claude Code の JSON を受け取るため、二重消費になり壊れる。オプションで `--agent-id NAME` 引数を指定すると、レコードの **`agent_name`**（表示名）を設定できる（例: `n3mc --buffer "テキスト" --agent-id "claude-code"`）。名前に反して `local_id` は設定しない。名前は互換のために残している（§3.7）。手で実行した `--buffer` は、文を**1 件の記録**として保存する。分割せず、`[user]` / `[claude]` の接頭辞も `turn_id` も付けない。
 - **【実装仕様】複数行コードブロックは `[code omitted]` に置換される**: 複数行コードブロック（```...```）は文書設計に従い `[code omitted]` に置換される——N3MemoryCore は会話テキストを記録する製品であり、ソースコードは記録対象外。インラインコード（`...`）はそのまま保持。コード以外の会話テキストは長さフィルタ／スキップパターンフィルタなしで一字一句保存される（上記「完全記録契約」参照）。`purify_text` / `_purify` の `_CODE_BLOCK_RE` は閉じた複数行フェンスのみを置換し、インラインコードと未閉フェンスは触らない。
   - **メッセージ全体を purify してから分割する**: ユーザー発言と Claude の回答のどちらも、`purify_text` を **`chunk_text` の前に全文に 1 回**かける。先に分割してから各チャンクを purify すると、チャンクをまたいで分かれたフェンスや、40 字の重なりで繰り返された閉じフェンスが間違った開きフェンスと組になり、2 つのコードブロックの間の文章が `[code omitted]` に置き換えられて失われ、2 つ目のブロックのコードが保存されてしまう。また、400 字より長いコードブロックはフェンスが別々のチャンクに入るので、そのまま保存されてしまう。`/buffer` と `_buffer_direct` でのレコードごとの purify は残す（手動の `--buffer` のため。全文に一度かけたあとは組になるフェンスが残らないので、フックのレコードには何も変えない）。
 - **【カスタマイズ】言語ローカライズ**: 該当なし。完全記録契約により `_SKIP_PATTERNS` は**なく**、フックフィルタ層に言語依存の対象は存在しない。
@@ -1677,6 +1677,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
    - カラム間はシングルタブ（`\t`）で連結する。半角空白ではない。
    - 「content の先頭 80 文字」は `content[:80]` を意味する — **content 全体の先頭 80 文字**であり、「先頭行の 80 文字」ではない。その 80 文字内に改行（`\n`、`\r`）が含まれる場合は単一の半角スペースに置換し、タブ区切りレイアウトが 1 レコード = 1 行を保つようにすること。
    - `agent_name` が `NULL` の場合は `-` を出力する。
+   - 記録は `rowid` の昇順（保存した順）に出力する。
    - 末尾に総件数 `Total: N records` を出力すること。
    - コードレビュー時に `write_buffer`・`batch_insert`・非同期書き込み・遅延COMMITが存在しないことを静的に確認せよ。
 
@@ -1795,6 +1796,9 @@ python -m pytest tests/ -v
 | `TestRefresh` | `exact_duplicate_not_inserted`, `below_threshold_not_duplicate` | 重複の扱い（完全一致のみ） |
 | `TestBiasScoring` | `session_match`, `session_mismatch_lower`, `full_score_formula` | ランキング式（`b_session` のみ。Free に `b_local` はない） |
 
+- `floor_value`: 3,650 日前の記録（`half_life_days` 90）でも `time_decay` は 0 より大きい（`1e-10` 未満）。下限はなく、古さで重みが 0 になることはない。
+- `zero_max`: 割る数は `max(1.0, 最大値)` なので、最大値が 1 未満でも値は上がらない（最大値 `0.5` で `-0.5` は `0.5`）。記録が 2 件以下の DB の決まりでは、最大値が 0 なら `0.0`（0 で割らない）。
+
 ### Layer 3: `test_api.py`（22テスト）
 
 | テストクラス | テスト内容 | カバレッジ |
@@ -1802,13 +1806,13 @@ python -m pytest tests/ -v
 | `TestHealth` | `health_ok` | サーバー状態 |
 | `TestBuffer` | `save_content`, `empty_content_skipped`, `agent_name_saved`, `exact_dedup`, `code_block_purified` | 保存API |
 | `TestSearch` | `empty_db_search`, `save_then_search`, `empty_query`, `score_returned` | 検索API |
-| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API。埋め込みを計算できないとき `count` は 0。`/repair` がバッチを埋め込んでいる間（1 件 0.2 秒の代役のモデル）に、別の接続が 0.5 秒以内に `BEGIN IMMEDIATE` を取れる。`BUSY_TIMEOUT_SECONDS` は 10。最初の修復が埋め込みを計算している間に、2 つ目の修復が同じ行を修復しても、どちらもエラーなく終わり、ベクトルは 1 つだけ残る。`_start_server` は、`/health` が別のフォルダを返すサーバーを使わない（`port_conflict`、False を返す） |
+| `TestRepair` | `repair_runs`, `count_excludes_unrepaired_records` | 修復API（2 回目は `count` 0）。埋め込みを計算できないとき `count` は 0。ロックの確かめは `TestRepairLocking`（Layer 5）にある |
 | `TestList` | `list_returns_records`, `list_after_save` | 一覧API |
 | `TestDelete` | `delete_returns_403`, `delete_nonexistent_also_403`, `delete_detail_is_pro` | Pro 専用エンドポイント → 403 |
 | `TestGC` | `gc_returns_403`, `gc_detail_is_pro` | Pro 専用エンドポイント → 403 |
 | `TestImport` | `import_returns_403`, `import_with_data_returns_403`, `import_detail_is_pro` | Pro 専用エンドポイント → 403 |
 
-### Layer 4: `test_hooks.py`（21テスト）と `test_hooks_encoding.py`（10テスト）
+### Layer 4: `test_hooks.py`（23テスト）と `test_hooks_encoding.py`（10テスト）
 
 | テストクラス | テスト内容 | カバレッジ |
 |---|---|---|
@@ -1816,7 +1820,7 @@ python -m pytest tests/ -v
 | `TestStripImages` | `plain_text_unchanged`, `base64_image_stripped`, `image_only_payload_returns_empty` | 画像ペイロード除去 |
 | `TestExtractText` | `plain_string`, `multimodal_json_list`, `image_only_empty`, `empty_input`, `json_text_is_kept_as_typed` | マルチモーダル抽出。JSON として読める入力をマルチモーダルの配列として扱わない |
 | `TestCompleteRecording` | `short_claude_response_saved`, `short_user_message_saved`, `skip_pattern_abolished`, `code_block_replaced_in_purify`, `inline_code_preserved_in_purify` | 完全記録契約（フィルタ廃止） |
-| `TestStopIdempotency` | `no_import_added`, `rules_file_created`, `home_folder_untouched` | --stop冪等性。作業フォルダがホームのとき、`--stop` は `.claude/rules/` に何も作らず、`.claude/CLAUDE.md` に触れない（すでにあるファイルはバイト単位で変わらない）。**プロジェクトのフォルダ**: `CLAUDE_PROJECT_DIR` が別の一時フォルダを指すときは、規則ファイルをそこに作り、`<cwd>` には何も作らない。変数がないときは `<cwd>` に作る。変数がホームを指すときは何も作らない |
+| `TestStopIdempotency` | `no_import_added`, `rules_file_created`, `home_folder_untouched`, `project_dir_from_environment` | --stop冪等性。作業フォルダがホームのとき、`--stop` は `.claude/rules/` に何も作らず、`.claude/CLAUDE.md` に触れない（すでにあるファイルはバイト単位で変わらない）。**プロジェクトのフォルダ**: `CLAUDE_PROJECT_DIR` が別の一時フォルダを指すときは、規則ファイルをそこに作り、`<cwd>` には何も作らない。変数がないときは `<cwd>` に作る。変数がホームを指すときは何も作らない |
 | `TestSanitizerUnit` | `strips_lone_high_surrogate`, `strips_lone_low_surrogate`, `clean_japanese_unchanged`, `complete_emoji_pair_preserved`, `recursive_dict`, `recursive_list`, `none_passthrough` | サロゲート除去（`test_hooks_encoding.py`） |
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |
@@ -1849,13 +1853,14 @@ python -m pytest tests/ -v
 | `TestHookSubmit` | `<task-notification>` で始まる入力は保存も検索もせず `turn_id` を変えない、Stop で `turn_id` を消さない、前の Claude の回答をサンプルの `transcript_path` の JSONL から読み（最後のテキストブロックだけ。`tool_result` だけの user の行、`isMeta` の行、`[Request interrupted by user]` の印、スラッシュコマンドの行、`thinking`、`tool_use`、`isSidechain` の行は飛ばす。今の質問も飛ばす（末尾の 1 行だけ。止めた質問を送り直しても、その前の返答は返らない）。割り込まれた返答も見つかる）、前の `turn_id` で保存する、Stop がすでに保存していれば何も重複しない、ないか壊れたトランスクリプトは `transcript_unreadable` として記録され、フックはそれでも検索して質問を保存する、画像だけの質問は新しい `turn_id` を書く、`<system-reminder>…</system-reminder>` の塊のあとに利用者の文がある入力は、塊を取り除いた文を保存して検索し、新しい `turn_id` を書く（塊だけの入力、塊のあとがまた `<task-notification>` などで始まる入力、閉じタグのない入力は今までどおり飛ばす）。トランスクリプトで、そのような `user` の行は本物のプロンプトとして扱い、それより前の返答は返さない。検索（`/search` を例外を出す偽物に差し替え）で例外が起きても、`memory search unavailable` を出し、質問を保存して新しい `turn_id` を書く。`--save-claude-turn` は、`ensure_server` の間に `turn_id` のファイルが書き換えられても（差し替えた `ensure_server` の中で書き換える）、読み始めたときの `turn_id` で保存する |
 | `TestPurifyBeforeChunk` | 2 つのコードブロックとその間の文章を持つ 500 字を超えるユーザー発言で、文章は残り、どちらのコードブロックも保存されない、400 字より長いコードブロックは保存されず置き換えられる |
 | `TestChunkSentences` | 空行のない日本語の文章が、文の途中ではなく `。` / `！` / `？` のあとで分かれる |
-| `TestTimeBounds` | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（UTC 以外の固定のタイムゾーンで）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー、`astimezone()` が `OSError` を投げるとき（差し替え）、`--since 1969-01-01` と `--until 9999-12-31` は例外にならず UTC として読まれる |
+| `TestTimeBounds` | 日付だけの `--since` はローカルの 0 時を UTC に直したもの（その機械のローカルのタイムゾーンで確かめる。プロセスのタイムゾーンを替えられる環境（`TZ` と `time.tzset`。Windows ではできない）では、さらに UTC 以外の固定のタイムゾーンでも）、オフセット付きの値はそのオフセットを守る、`T` と空白の区切りで同じ境界になる、`yesterday` はエラーの行を出して終了ステータス 2、`since > until` はエラー、`astimezone()` が `OSError` を投げるとき（差し替え）、`--since 1969-01-01` と `--until 9999-12-31` は例外にならず UTC として読まれる |
 | `TestDbCorrupt` | 2 回の破損で 2 つのバックアップ（`n3memory.db.corrupt-<time>.bak`）ができ、`-wal` / `-shm` は削除されずに隣へ移される、知らせ `db_corrupt` が出る、`quick_check` は 1 プロセスに 1 回。中身がごみのファイルと、先頭のページが壊れた DB は、次の直接保存と起動時の確認で退避され、`db_corrupt` の通知が出る。`OperationalError` と sqlite-vec の失敗は破損として扱わない |
 | `TestInit`（一時的な `settings.json` だけ） | このパッケージの外の Pro 形式のフック `python ".../N3MemoryCore/n3mc_hook.py"` は残して知らせる、自分のエントリポイント（`.exe` 付きでもなしでも）と `-m` のエントリは重複せず置き換える、再実行では何も書かない、変える前に控えを取る、不正な `settings.json` は変えずに終了ステータス 1、§4 ② のルールを既存のルールを取り除かずに `permissions.allow` に足す、`PATH` を空にしても、差し替えた scripts フォルダにあるエントリポイントが見つかり、素のパスで書かれる、`-m` の形は Python のパスに空白が無ければ引用符で始まらず、空白があれば引用符で囲まれる、`--init` が書く 2 つの項目に `"timeout": 120` がある、再実行しても項目が増えない、`timeout` のない自分の項目は `timeout` のある項目に置き換わる、`command` が `null` の項目は残り例外にならない、cp932 の `settings.json` は変えずに終了ステータス 1、BOM 付きの `settings.json` は読める |
 | `TestSaveFailedNotice` | 直接の保存が 1 回失敗したあと（`save_failed` がある）、サーバー経由の保存（`/buffer` を `ok` と答える偽物に差し替え）で知らせが消える。`skipped` と答えたときも消える |
 | `TestHousekeeping` | `--stop` が 30 日より古い `turn_id_*.txt` を消し、新しいものは残す、50 MB を超えた `audit.log` を `audit.log.1` にローテーションする（テストではサイズのしきい値を差し替える） |
 | `TestModelRetry` | モデルの読み込みに失敗したあと、`get_model()` は 60 秒間再試行しない（読み込み関数は偽物に差し替え）、`$N3MC_EMBED_MODEL` は効かない |
 | `TestPackaging` | `psutil` が `pyproject.toml` の `dependencies` に入っている |
+| `TestRepairLocking` | `BUSY_TIMEOUT_SECONDS` は 10。`/repair` がバッチを埋め込んでいる間（1 件 0.2 秒の代役のモデル）に、別の接続が 0.5 秒以内に `BEGIN IMMEDIATE` を取れる。同じ未インデックスの行に対して 2 つの修復を同時に動かしても、どちらもエラーなく終わり、どの行もベクトルは 1 つだけ残る。`_start_server` は、`/health` が別のフォルダを返すサーバーを使わない（`port_conflict`、False を返す） |
 | `TestWeakMatches` | 下限を通った結果が 1 件で `min_results: 3` なら弱い候補が 2 件足され、`filter_score` の順に並び、`/search` で `"weak": true` が付き、普通の行の後に来る、`vector_min_cos` 未満の候補は実際の cos で足される（`filter_score` もその cos で計算）、`min_results: 0` では何も足さない、十分な件数が通ったときは足さない、`search_result_limit` が `min_results` より小さければ合計はその上限まで、結果の行と同じ content の候補や、すでに 2 件ある `turn_id` の候補は飛ばす、`filter_score` が `1e-6` 未満の候補（直交するベクトル）は足さない、弱い候補は `pairs` に使わない、空のクエリでは弱い候補も返さない |
 
 ### 安全なインポートパス: `test_safe_path.py`（モデル不要）
