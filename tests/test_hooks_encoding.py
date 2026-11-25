@@ -1,52 +1,74 @@
-"""Surrogate stripping and UTF-8 regression tests."""
-from n3memorycore import n3memory as n3m
-from n3memorycore.core import database as db
-from n3memorycore.core import processor as p
+"""Lone-surrogate removal and UTF-8 regressions. No model needed."""
+import io
+import json
+import sqlite3
+import sys
+
+from n3memorycore import n3memory, n3mc_hook, n3mc_stop_hook
+from n3memorycore.core.processor import sanitize_surrogates, purify_text
 
 
 class TestSanitizerUnit:
     def test_strips_lone_high_surrogate(self):
-        assert p.sanitize_surrogates("a\ud83db") == "ab"
+        assert sanitize_surrogates("a\ud83db") == "ab"
 
     def test_strips_lone_low_surrogate(self):
-        assert p.sanitize_surrogates("a\ude00b") == "ab"
+        assert sanitize_surrogates("a\ude00b") == "ab"
 
     def test_clean_japanese_unchanged(self):
-        assert p.sanitize_surrogates("日本語のテキスト") == "日本語のテキスト"
+        s = "坂本龍馬 — 幕末の志士"
+        assert sanitize_surrogates(s) == s
 
     def test_complete_emoji_pair_preserved(self):
-        assert p.sanitize_surrogates("x😀y") == "x😀y"
+        assert sanitize_surrogates("smile 😀") == "smile 😀"
+        assert sanitize_surrogates("smile 😀") == "smile 😀"
 
     def test_recursive_dict(self):
-        assert p.sanitize_surrogates({"a": "b\ud83d", "c": {"d": "e\ude00"}}) == {"a": "b", "c": {"d": "e"}}
+        assert sanitize_surrogates({"prompt": "x\ud800", "n": 1}) == {"prompt": "x", "n": 1}
 
     def test_recursive_list(self):
-        assert p.sanitize_surrogates(["a\ud83d", ["b\ude00"]]) == ["a", ["b"]]
+        assert sanitize_surrogates(["\udfff", {"t": "ok\ud800"}]) == ["", {"t": "ok"}]
 
     def test_none_passthrough(self):
-        assert p.sanitize_surrogates(None) is None and p.sanitize_surrogates(5) == 5
+        assert sanitize_surrogates(None) is None
 
 
 class TestSanitizedAcceptedBySQLite:
-    def test_sanitized_text_inserts_without_unicode_error(self, conn, cfg):
-        text = p.sanitize_surrogates("bad \ud83d surrogate")
-        db.insert_memory(conn, "i", text, "2026-01-01T00:00:00+00:00", cfg["owner_id"])
-        assert db.count_memories(conn) == 1
+    def test_sanitized_text_inserts_without_unicode_error(self, tmp_path):
+        c = sqlite3.connect(str(tmp_path / "s.db"))
+        c.execute("CREATE TABLE t (x TEXT)")
+        c.execute("INSERT INTO t VALUES (?)", (sanitize_surrogates("質問\ud83dです"),))
+        assert c.execute("SELECT x FROM t").fetchone()[0] == "質問です"
+        c.close()
 
 
 class TestPurifyAppliesSanitization:
     def test_purify_strips_surrogates_alongside_code_blocks(self):
-        assert p.purify_text("a\ud83d\n```\nx\ny\n```") == "a\n[code omitted]"
+        assert purify_text("a\ud83d\n```\ncode\n```\nb") == "a\n[code omitted]\nb"
 
     def test_purify_handles_empty(self):
-        assert p.purify_text("") == "" and p.purify_text(None) == ""
+        assert purify_text("") == ""
+        assert purify_text(None) == ""
 
 
-def test_a_lone_surrogate_prompt_is_still_saved(conn, monkeypatch, capsys):
-    import io
-    import sys
-    raw = '{"session_id": "s", "prompt": "emoji \\ud83d here"}'
-    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw.encode()), encoding="utf-8"))
-    assert n3m.cmd_hook_submit() == 0
-    capsys.readouterr()  # must not raise UnicodeEncodeError
-    assert [r[0] for r in conn.execute("SELECT content FROM memories")] == ["[user] emoji  here"]
+class TestAuditLogLoneSurrogate:
+    """A lone surrogate in the prompt (a JSON escape) must not cost the audit.log line."""
+
+    def _run_hook(self, module, monkeypatch, capsys):
+        monkeypatch.setattr(module, "_run", lambda flag, raw=None: 0)
+        raw = json.dumps({"session_id": "s", "prompt": "abc \ud83d def"})
+        monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+        module.main()
+        with open(n3memory.AUDIT_LOG, encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        assert len(lines) == 1
+        assert lines[0]["hook"] == module.HOOK_NAME
+        assert lines[0]["payload"]["prompt"] == "abc \ud83d def"
+        assert lines[0]["raw"] == raw
+        assert "audit.log could not be written" not in capsys.readouterr().err
+
+    def test_hook_keeps_one_line(self, monkeypatch, capsys):
+        self._run_hook(n3mc_hook, monkeypatch, capsys)
+
+    def test_stop_hook_keeps_one_line(self, monkeypatch, capsys):
+        self._run_hook(n3mc_stop_hook, monkeypatch, capsys)

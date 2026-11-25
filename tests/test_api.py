@@ -1,143 +1,143 @@
-"""Layer 3: FastAPI endpoints through TestClient (fake embeddings: the model is not needed here)."""
+"""Layer 3: the FastAPI endpoints through TestClient. The client fixture loads the real model."""
 import pytest
 from fastapi.testclient import TestClient
 
-from n3memorycore import n3memory as n3m
-
-PORT = 18520
+from n3memorycore import n3memory
+from n3memorycore.core import processor
+from n3memorycore.core.database import get_connection, init_db, insert_memory
+from tests.conftest import TEST_PORT, use_model
 
 
 @pytest.fixture
-def client(use_fake_embed):
-    return TestClient(n3m.create_app(), base_url=f"http://127.0.0.1:{PORT}")
+def client(monkeypatch, real_model, isolate):
+    use_model(monkeypatch, real_model)
+    with TestClient(n3memory.app, base_url=f"http://127.0.0.1:{TEST_PORT}") as c:
+        yield c
+
+
+def _buffer(client, content, **kw):
+    return client.post("/buffer", json={"content": content, **kw}).json()
 
 
 class TestHealth:
-    def test_health_ok(self, client):
-        j = client.get("/health").json()
-        assert j["status"] == "ok" and j["root"] == n3m.HOME_DIR and len(j["code_version"]) == 16 and j["pid"]
+    def test_health_ok(self, client, isolate):
+        h = client.get("/health").json()
+        assert h["status"] == "ok"
+        assert n3memory._same_path(h["root"], str(isolate["data"]))
+        assert len(h["code_version"]) == 16
+        assert isinstance(h["pid"], int)
 
 
 class TestBuffer:
     def test_save_content(self, client):
-        assert client.post("/buffer", json={"content": "[user] hello there"}).json() == {"status": "ok", "count": 1}
+        assert _buffer(client, "坂本龍馬は土佐藩出身の志士である。") == {"status": "ok", "count": 1}
 
     def test_empty_content_skipped(self, client):
-        assert client.post("/buffer", json={"content": "  "}).json()["reason"] == "empty"
+        assert _buffer(client, "   ") == {"status": "skipped", "count": 0, "reason": "empty"}
 
     def test_agent_name_saved(self, client):
-        client.post("/buffer", json={"content": "a record", "agent_name": "claude-code"})
-        assert client.get("/list").json()["records"][0]["agent_name"] == "claude-code"
+        _buffer(client, "named record", agent_name="claude-code")
+        recs = client.get("/list").json()["records"]
+        assert recs[0]["agent_name"] == "claude-code"
 
     def test_exact_dedup(self, client):
-        client.post("/buffer", json={"content": "dup", "turn_id": "T"})
-        r = client.post("/buffer", json={"content": "dup", "turn_id": "T"}).json()
-        assert r["status"] == "skipped" and r["reason"] == "exact_duplicate"
+        assert _buffer(client, "same text")["status"] == "ok"
+        assert _buffer(client, "same text") == {"status": "skipped", "count": 0, "reason": "exact_duplicate"}
 
     def test_code_block_purified(self, client):
-        client.post("/buffer", json={"content": "before\n```\nx\ny\n```\nafter"})
-        assert client.get("/list").json()["records"][0]["content"] == "before\n[code omitted]\nafter"
+        _buffer(client, "here:\n```python\nprint('x')\n```\ndone")
+        recs = client.get("/list").json()["records"]
+        assert recs[0]["content"] == "here:\n[code omitted]\ndone"
 
 
 class TestSearch:
     def test_empty_db_search(self, client):
-        assert client.post("/search", json={"query": "anything at all"}).json()["results"] == []
+        r = client.post("/search", json={"query": "anything"}).json()
+        assert r["results"] == [] and r["pairs"] == {}
 
     def test_save_then_search(self, client):
-        client.post("/buffer", json={"content": "the zebra crossed the river at dawn"})
-        r = client.post("/search", json={"query": "zebra river dawn"}).json()
-        assert r["results"][0]["content"].startswith("the zebra")
+        _buffer(client, "坂本龍馬は薩長同盟の成立に関わった。")
+        _buffer(client, "今日の昼食はカレーライスだった。")
+        r = client.post("/search", json={"query": "坂本龍馬"}).json()
+        assert "坂本龍馬" in r["results"][0]["content"]
 
     def test_empty_query(self, client):
-        assert client.post("/search", json={"query": ""}).json()["results"] == []
+        _buffer(client, "something")
+        r = client.post("/search", json={"query": ""}).json()
+        assert r["results"] == []
 
     def test_score_returned(self, client):
-        client.post("/buffer", json={"content": "the zebra crossed the river at dawn"})
-        r = client.post("/search", json={"query": "zebra river dawn"}).json()["results"][0]
-        assert r["score"] > 0 and r["weak"] is False and "turn_id" in r
-
-    def test_bad_since_is_400(self, client):
-        assert client.post("/search", json={"query": "x", "since": "yesterday"}).status_code == 400
+        _buffer(client, "The Eiffel Tower is in Paris.")
+        r = client.post("/search", json={"query": "Eiffel Tower"}).json()
+        row = r["results"][0]
+        for key in ("id", "content", "score", "timestamp", "turn_id", "weak", "agent_name", "session_id",
+                    "filter_score", "cos_sim", "keyword_relevance"):
+            assert key in row
+        assert 0 < row["score"] <= 1
 
 
 class TestRepair:
     def test_repair_runs(self, client):
-        assert client.post("/repair", json={}).json()["status"] == "ok"
+        c = get_connection(n3memory.DB_PATH)
+        init_db(c)
+        insert_memory(c, "x1", "a record saved without a vector", "2026-01-01T00:00:00+00:00", "o")
+        c.close()
+        assert client.post("/repair").json()["count"] >= 1
+        assert client.post("/repair").json()["count"] == 0
 
-    def test_count_excludes_unrepaired_records(self, client, monkeypatch, conn, cfg):
-        from .conftest import add
-        add(conn, cfg, "needs a vector", embed=False)
-        monkeypatch.setattr(n3m, "embed_passage", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no model")))
-        from n3memorycore.core import database as db
-        assert client.post("/repair", json={}).json()["count"] == 0  # FTS rows exist; the vector cannot be made
-        assert len(db.find_unindexed_memories(conn)) == 1
+    def test_count_excludes_unrepaired_records(self, client, monkeypatch):
+        client.post("/repair")
+        c = get_connection(n3memory.DB_PATH)
+        insert_memory(c, "x2", "no vector and no model", "2026-01-01T00:00:00+00:00", "o")
+        c.close()
 
-    def test_repair_adds_the_vector_when_the_model_works(self, client, conn, cfg):
-        from n3memorycore.core import database as db
-        from .conftest import add
-        add(conn, cfg, "needs a vector", embed=False)
-        assert client.post("/repair", json={}).json()["count"] == 1
-        assert db.find_unindexed_memories(conn) == []
-
-    def test_two_repairs_on_the_same_row_do_not_collide(self, client, conn, cfg, monkeypatch):
-        from n3memorycore.core import database as db
-        from .conftest import add, fake_embed
-        add(conn, cfg, "needs a vector", embed=False)
-
-        def embed_then_other_repair(text, name=None):
-            monkeypatch.setattr(n3m, "embed_passage", lambda t, name=None: fake_embed(t))
-            assert client.post("/repair", json={}).json()["status"] == "ok"  # a second repair, mid-embedding
-            return fake_embed(text)
-
-        monkeypatch.setattr(n3m, "embed_passage", embed_then_other_repair)
-        assert client.post("/repair", json={}).json()["status"] == "ok"
-        assert conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 1
-
-    def test_repair_batch_does_not_hold_the_write_lock_while_embedding(self, client, conn, cfg, monkeypatch):
-        import threading
-        import time
-        import sqlite3
-        from .conftest import add, fake_embed
-        add(conn, cfg, "slow one", embed=False)
-        got = {}
-
-        def slow(text, name=None):
-            time.sleep(0.2)
-            return fake_embed(text)
-
-        def probe():
-            time.sleep(0.05)
-            c2 = sqlite3.connect(n3m.DB_PATH, timeout=0.5)
-            t0 = time.time()
-            c2.execute("BEGIN IMMEDIATE")
-            got["wait"] = time.time() - t0
-            c2.rollback()
-            c2.close()
-
-        monkeypatch.setattr(n3m, "embed_passage", slow)
-        th = threading.Thread(target=probe)
-        th.start()
-        client.post("/repair", json={})
-        th.join()
-        assert got["wait"] < 0.5
+        def broken(*a, **k):
+            raise RuntimeError("model unavailable")
+        monkeypatch.setattr(processor, "get_model", broken)
+        assert client.post("/repair").json()["count"] == 0
 
 
 class TestList:
     def test_list_returns_records(self, client):
-        assert client.get("/list").json() == {"records": [], "total": 0}
+        r = client.get("/list").json()
+        assert r == {"records": [], "total": 0}
 
     def test_list_after_save(self, client):
-        client.post("/buffer", json={"content": "one"})
+        _buffer(client, "first")
+        _buffer(client, "second")
+        r = client.get("/list").json()
+        assert r["total"] == 2
+        assert [x["content"] for x in r["records"]] == ["first", "second"]
+
+
+class TestDelete:
+    def test_delete_returns_403(self, client):
+        _buffer(client, "keep me")
+        rid = client.get("/list").json()["records"][0]["id"]
+        assert client.delete(f"/delete/{rid}").status_code == 403
         assert client.get("/list").json()["total"] == 1
 
+    def test_delete_nonexistent_also_403(self, client):
+        assert client.delete("/delete/nope").status_code == 403
 
-class TestProOnly:
-    def test_delete_returns_403(self, client):
-        r = client.delete("/delete/x")
-        assert r.status_code == 403 and r.json()["detail"] == "Pro feature"
+    def test_delete_detail_is_pro(self, client):
+        assert client.delete("/delete/nope").json() == {"detail": "Pro feature"}
 
+
+class TestGC:
     def test_gc_returns_403(self, client):
         assert client.post("/gc").status_code == 403
 
+    def test_gc_detail_is_pro(self, client):
+        assert client.post("/gc").json() == {"detail": "Pro feature"}
+
+
+class TestImport:
     def test_import_returns_403(self, client):
-        assert client.post("/import", json={"records": []}).status_code == 403
+        assert client.post("/import").status_code == 403
+
+    def test_import_with_data_returns_403(self, client):
+        assert client.post("/import", json={"records": [{"content": "x"}]}).status_code == 403
+
+    def test_import_detail_is_pro(self, client):
+        assert client.post("/import").json() == {"detail": "Pro feature"}

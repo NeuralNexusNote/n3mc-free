@@ -1,113 +1,137 @@
-"""Layer 2: ranking maths, purify, chunking, embedding (the real model is used only in TestEmbedding)."""
-from datetime import datetime, timedelta, timezone
+"""Layer 2: ranking math, purify, embeddings (TestEmbedding loads the real model), duplicates."""
+import math
 
 import pytest
 
-from n3memorycore.core import processor as p
+from n3memorycore.core import processor
+from n3memorycore.core.processor import (
+    cosine_sim_from_l2, compute_time_decay, keyword_relevance, purify_text, combined_score, b_session,
+    embed_passage, embed_query,
+)
+from n3memorycore.core.database import insert_memory_once, check_exact_duplicate, count_memories
+from tests.conftest import ts_days_ago, use_model
 
 
 class TestCosineSim:
     def test_identical_vectors(self):
-        assert p.cosine_sim_from_l2(0.0) == 1.0
+        assert cosine_sim_from_l2(0.0) == 1.0
 
     def test_orthogonal_vectors(self):
-        assert abs(p.cosine_sim_from_l2(2 ** 0.5)) < 1e-9
+        assert cosine_sim_from_l2(math.sqrt(2)) == pytest.approx(0.0, abs=1e-9)
 
     def test_negative_clamped(self):
-        assert p.cosine_sim_from_l2(2.0) == 0.0
+        assert cosine_sim_from_l2(2.0) == 0.0
 
     def test_midpoint(self):
-        assert abs(p.cosine_sim_from_l2(1.0) - 0.5) < 1e-9
+        assert cosine_sim_from_l2(1.0) == pytest.approx(0.5)
 
 
 class TestTimeDecay:
     def test_current_time_is_one(self):
-        assert abs(p.time_decay(datetime.now(timezone.utc).isoformat(), 90) - 1.0) < 1e-3
+        assert compute_time_decay(ts_days_ago(0), 90) == pytest.approx(1.0, abs=1e-6)
 
     def test_half_life(self):
-        ts = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
-        assert abs(p.time_decay(ts, 90) - 0.5) < 1e-3
+        assert compute_time_decay(ts_days_ago(90), 90) == pytest.approx(0.5, abs=1e-4)
 
     def test_floor_value(self):
-        ts = (datetime.now(timezone.utc) - timedelta(days=36500)).isoformat()
-        assert 0 <= p.time_decay(ts, 90) < 1e-6
+        v = compute_time_decay(ts_days_ago(3650), 90)
+        assert 0 < v < 1e-10
 
     def test_bad_timestamp_returns_one(self):
-        assert p.time_decay("not a date", 90) == 1.0
+        assert compute_time_decay("not a time", 90) == 1.0
 
 
 class TestKeywordRelevance:
     def test_below_threshold_is_zero(self):
-        assert p.keyword_relevances({"a": -0.05, "b": -3.0}, 0.1)["a"] == 0.0
+        assert keyword_relevance(-0.05, 5.0, threshold=0.1) == 0.0
 
     def test_full_relevance(self):
-        assert p.keyword_relevances({"a": -5.0}, 0.1)["a"] == 1.0
+        assert keyword_relevance(-5.0, 5.0, threshold=0.1) == 1.0
 
     def test_partial_relevance(self):
-        r = p.keyword_relevances({"a": -5.0, "b": -2.5}, 0.1)
-        assert abs(r["b"] - 0.5) < 1e-9
+        assert keyword_relevance(-2.5, 5.0, threshold=0.1) == pytest.approx(0.5)
 
     def test_zero_max(self):
-        assert p.keyword_relevances({}, 0.1) == {}
-
-    def test_small_db_best_match_is_one(self):
-        assert p.keyword_relevances({"a": -2e-6}, 0.1, small_db=True)["a"] == 1.0
+        # the divisor is max(1.0, max): a maximum below 1 does not raise the value
+        assert keyword_relevance(-0.5, 0.5, threshold=0.1) == pytest.approx(0.5)
+        # a DB with 2 records or fewer: a maximum of 0 gives 0.0 (no division by zero)
+        assert keyword_relevance(0.0, 0.0, threshold=0.1, small_db=True) == 0.0
+        assert keyword_relevance(-2e-6, 2e-6, threshold=0.1, small_db=True) == pytest.approx(1.0)
 
 
 class TestPurification:
     def test_code_block_replaced(self):
-        assert p.purify_text("a\n```py\nx=1\ny=2\n```\nb") == "a\n[code omitted]\nb"
+        assert purify_text("before\n```python\nprint(1)\n```\nafter") == "before\n[code omitted]\nafter"
 
     def test_inline_code_preserved(self):
-        assert p.purify_text("use `x = 1` here") == "use `x = 1` here"
+        assert purify_text("run `n3mc --list` now") == "run `n3mc --list` now"
 
     def test_multiple_blocks_replaced(self):
-        t = "p\n```\na\nb\n```\nmiddle text\n```\nc\nd\n```\nq"
-        assert p.purify_text(t) == "p\n[code omitted]\nmiddle text\n[code omitted]\nq"
+        out = purify_text("a\n```\nx\n```\nb\n```js\ny\n```\nc")
+        assert out == "a\n[code omitted]\nb\n[code omitted]\nc"
 
     def test_no_code_block_unchanged(self):
-        assert p.purify_text("plain 日本語") == "plain 日本語"
+        text = "plain text with ``` an unclosed fence"
+        assert purify_text(text) == text
 
-    def test_unclosed_fence_untouched(self):
-        assert p.purify_text("```\nnever closed") == "```\nnever closed"
+    def test_backticks_in_prose_are_not_a_fence(self):
+        text = ("To start a block type ``` then the language\nSome explanation that matters.\n"
+                "```python\nprint(1)\n```\nAfter.")
+        assert purify_text(text) == ("To start a block type ``` then the language\n"
+                                     "Some explanation that matters.\n[code omitted]\nAfter.")
+
+    def test_backticks_inside_code_do_not_close(self):
+        text = ("First:\n```python\nprint(\"```\")\n```\nText between the blocks.\n"
+                "```python\ny = 2\n```\nEnd.")
+        assert purify_text(text) == "First:\n[code omitted]\nText between the blocks.\n[code omitted]\nEnd."
+        # a shorter ``` line inside a block opened with 4 backticks does not close it
+        assert purify_text("a\n````md\n```\ninner\n```\n````\nb") == "a\n[code omitted]\nb"
 
 
 class TestEmbedding:
+    @pytest.fixture(autouse=True)
+    def _model(self, monkeypatch, real_model):
+        use_model(monkeypatch, real_model)
+
     def test_passage_embedding_shape(self):
-        assert len(p.embed_passage("hello world")) == 768
+        v = embed_passage("坂本龍馬は幕末の志士である。")
+        assert len(v) == 768
+        assert math.sqrt(sum(x * x for x in v)) == pytest.approx(1.0, abs=1e-3)
 
     def test_query_embedding_shape(self):
-        v = p.embed_query("hello world")
-        assert len(v) == 768 and abs(sum(x * x for x in v) - 1.0) < 1e-3
+        assert len(embed_query("坂本龍馬")) == 768
 
     def test_same_text_similar(self):
-        a, b = p.embed_passage("東京は日本の首都です"), p.embed_query("日本の首都は東京")
-        assert sum(x * y for x, y in zip(a, b)) > 0.8
+        a = embed_passage("The capital of France is Paris.")
+        b = embed_passage("Paris is the capital city of France.")
+        c = embed_passage("Bananas are rich in potassium.")
+        dot = lambda x, y: sum(p * q for p, q in zip(x, y))  # noqa: E731
+        assert dot(a, b) > dot(a, c)
 
 
 class TestRefresh:
-    def test_exact_duplicate_not_inserted(self, conn, cfg):
-        from n3memorycore import n3memory as n3m
-        assert n3m._store_record(conn, cfg, "[user] x", turn_id="t", embed=False)["status"] == "ok"
-        assert n3m._store_record(conn, cfg, "[user] x", turn_id="t", embed=False)["status"] == "skipped"
+    def test_exact_duplicate_not_inserted(self, conn):
+        assert insert_memory_once(conn, "a", "[claude] same", ts_days_ago(0), "o", turn_id="t") is not None
+        assert insert_memory_once(conn, "b", "[claude] same", ts_days_ago(0), "o", turn_id="t") is None
+        assert count_memories(conn) == 1
 
-    def test_below_threshold_not_duplicate(self, conn, cfg):
-        from n3memorycore import n3memory as n3m
-        n3m._store_record(conn, cfg, "[user] x", turn_id="t", embed=False)
-        assert n3m._store_record(conn, cfg, "[user] x!", turn_id="t", embed=False)["status"] == "ok"
+    def test_below_threshold_not_duplicate(self, conn):
+        # near-identical text is not a duplicate: only exactly the same text is skipped
+        insert_memory_once(conn, "a", "The server port is 18520.", ts_days_ago(0), "o")
+        assert not check_exact_duplicate(conn, "The server port is 18521.")
+        assert insert_memory_once(conn, "b", "The server port is 18521.", ts_days_ago(0), "o") is not None
+        assert count_memories(conn) == 2
 
 
 class TestBiasScoring:
     def test_session_match(self):
-        assert p.b_session("s1", "s1") == 1.0
+        assert b_session("s1", "s1") == 1.0
 
     def test_session_mismatch_lower(self):
-        assert p.b_session("s1", "s2") == 0.6 and p.b_session(None, "s2") == 0.6
+        assert b_session("s2", "s1") == 0.6
+        assert b_session(None, "s1") == 0.6
 
-    def test_full_score_formula(self, conn, cfg):
-        from .conftest import add, fake_embed
-        add(conn, cfg, "unique zebra sentence", session_id="s1")
-        r = p.hybrid_search(conn, "unique zebra sentence", cfg, session_id="s1", embed_fn=fake_embed)["results"][0]
-        assert abs(r["score"] - r["filter_score"] * p.time_decay(r["timestamp"], 90) * 1.0) < 1e-6
-        r2 = p.hybrid_search(conn, "unique zebra sentence", cfg, session_id="other", embed_fn=fake_embed)["results"][0]
-        assert abs(r2["score"] - 0.6 * r["score"]) < 1e-4 and r2["filter_score"] == r["filter_score"]
+    def test_full_score_formula(self):
+        score, fscore = combined_score(0.9, 0.5, 0.5, 0.6)
+        assert fscore == pytest.approx(0.9 * 0.7 + 0.5 * 0.3)
+        assert score == pytest.approx(fscore * 0.5 * 0.6)

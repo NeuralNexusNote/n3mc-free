@@ -1,3 +1,3 @@
-"""N3MemoryCore (Free Edition): persistent hybrid-search memory for Claude Code."""
+"""N3MemoryCore Free: a persistent hybrid-search memory store for Claude Code."""
 
-__version__ = "1.9.3"
+__version__ = "1.9.4"

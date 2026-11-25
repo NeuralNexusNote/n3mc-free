@@ -1,30 +1,45 @@
-"""Paths for the N3MemoryCore data folder (resolved at import time)."""
+"""Resolve the data folder (~/.n3mc or $N3MC_HOME) and the paths derived from it.
+
+The code lives in this package; the personal data lives outside the repository.
+"""
 import os
 
-HOME_DIR = os.path.abspath(os.path.expanduser(os.environ.get("N3MC_HOME") or os.path.join("~", ".n3mc")))
+
+def _resolve_home_dir() -> str:
+    env = os.environ.get("N3MC_HOME")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return os.path.join(os.path.expanduser("~"), ".n3mc")
+
+
+HOME_DIR = _resolve_home_dir()
 MEMORY_DIR = os.path.join(HOME_DIR, ".memory")
+CONFIG_FILE = os.path.join(HOME_DIR, "config.json")
+CONFIG_LOCK = os.path.join(MEMORY_DIR, "config.lock")
 DB_PATH = os.path.join(MEMORY_DIR, "n3memory.db")
 PID_FILE = os.path.join(MEMORY_DIR, "n3mc.pid")
 AUDIT_LOG = os.path.join(MEMORY_DIR, "audit.log")
-CONFIG_FILE = os.path.join(HOME_DIR, "config.json")
+SERVER_LOG = os.path.join(MEMORY_DIR, "server.log")
+SERVER_START_FAILED = os.path.join(MEMORY_DIR, "server_start_failed")
 NOTICES_FILE = os.path.join(MEMORY_DIR, "notices.json")
 TURN_ID_FILE = os.path.join(MEMORY_DIR, "turn_id.txt")
-SERVER_LOG = os.path.join(MEMORY_DIR, "server.log")
-SERVER_START_FAILED_FILE = os.path.join(MEMORY_DIR, "server_start_failed")
-CONTEXT_FILE = os.path.join(MEMORY_DIR, "memory_context.md")  # retired in v1.4.0; used only for cleanup
+VEC_MODEL_FILE = os.path.join(MEMORY_DIR, "vec_model.txt")
+# memory_context.md is no longer written; the constant is kept for the clean-up only.
+CONTEXT_FILE = os.path.join(MEMORY_DIR, "memory_context.md")
 CONTEXT_RETIRED_MARKER = os.path.join(MEMORY_DIR, ".memory_context_retired")
 
 
-def claude_paths(cwd=None):
-    """Project-specific .claude/ paths, resolved from the current directory."""
-    base = os.path.abspath(cwd or os.getcwd())
+def claude_paths(project_dir=None) -> dict:
+    """The project's .claude/ paths, resolved from project_dir (default: the current folder)."""
+    base = os.path.abspath(project_dir if project_dir is not None else os.getcwd())
     claude_dir = os.path.join(base, ".claude")
+    rules_dir = os.path.join(claude_dir, "rules")
     return {
+        "project": base,
         "claude_dir": claude_dir,
-        "rules_dir": os.path.join(claude_dir, "rules"),
-        "behavior_md": os.path.join(claude_dir, "rules", "n3mc-behavior.md"),
+        "rules_dir": rules_dir,
+        "behavior_md": os.path.join(rules_dir, "n3mc-behavior.md"),
         "claude_md": os.path.join(claude_dir, "CLAUDE.md"),
-        "settings": os.path.join(claude_dir, "settings.json"),
     }
 
 

@@ -1,30 +1,54 @@
-"""Processing layer: embeddings, ranking, purify, chunking, hybrid search, rendering."""
+"""Processing layer: embeddings, ranking, chunking, purify and rendering of the recalled context."""
 import math
 import re
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 
 from .database import (
-    get_connection, init_db, insert_memory, search_vector, search_fts, search_fts_bigram,
-    get_all_memories, delete_memory, count_memories, check_exact_duplicate,
-    find_unindexed_memories, serialize_vector, get_memories_by_turn_id, strip_fts_punctuation,
-    deserialize_vector, fts_terms, bigram_terms, bigram_text,
+    get_connection,
+    init_db,
+    insert_memory,
+    search_vector,
+    search_fts,
+    search_fts_bigram,
+    get_all_memories,
+    delete_memory,
+    count_memories,
+    check_exact_duplicate,
+    find_unindexed_memories,
+    serialize_vector,        # used by /repair
+    get_memories_by_turn_id, # used by Q-A pairing
+    strip_fts_punctuation,   # used by the /repair FTS migration
+    get_vector,
 )
 
-DEFAULT_MODEL = "intfloat/multilingual-e5-base"
+DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-base"
 MODEL_RETRY_SECONDS = 60
+
+W_COS = 0.7
+W_KEYWORD = 0.3
+B_SESSION_MATCH = 1.0
+B_SESSION_MISMATCH = 0.6
+WEAK_MIN_FILTER_SCORE = 1e-6
+
+# ---------------------------------------------------------------------------
+# Embedding model
+# ---------------------------------------------------------------------------
 
 _model = None
 _model_name = None
+_configured_model = DEFAULT_EMBED_MODEL
 _model_failed_at = None
-_model_error = None
-_model_lock = threading.Lock()
-_warned_embed = False
+_model_failed_name = None
+_model_last_error = None
 
 
-# ---------------------------------------------------------------- embeddings
+def set_embed_model(name):
+    """Set the model named by config.json (embed_model). There is no environment override."""
+    global _configured_model
+    _configured_model = name or DEFAULT_EMBED_MODEL
+
 
 def _load_model(name):
     from sentence_transformers import SentenceTransformer
@@ -32,100 +56,119 @@ def _load_model(name):
 
 
 def get_model(name=None):
-    """Load the embedding model lazily. After a failed load, do not retry for MODEL_RETRY_SECONDS."""
-    global _model, _model_name, _model_failed_at, _model_error
-    name = name or _current_model_name()
-    with _model_lock:
-        if _model is not None and _model_name == name:
-            return _model
-        if _model_failed_at is not None and time.monotonic() - _model_failed_at < MODEL_RETRY_SECONDS:
-            raise RuntimeError(f"embedding model unavailable ({_model_error})")
-        try:
-            _model = _load_model(name)
-            _model_name = name
-            _model_failed_at = None
-            return _model
-        except Exception as e:  # noqa: BLE001
-            _model = None
-            _model_failed_at = time.monotonic()
-            _model_error = f"{type(e).__name__}: {e}"
-            print(f"N3MC: could not load embedding model {name}: {_model_error}", file=sys.stderr)
-            raise
-
-
-def _current_model_name():
+    """Load the embedding model once. After a failure, raise at once for MODEL_RETRY_SECONDS."""
+    global _model, _model_name, _model_failed_at, _model_failed_name, _model_last_error
+    name = name or _configured_model
+    if _model is not None and _model_name == name:
+        return _model
+    if (_model_failed_at is not None and _model_failed_name == name
+            and time.monotonic() - _model_failed_at < MODEL_RETRY_SECONDS):
+        raise RuntimeError(f"embedding model unavailable (retry later): {_model_last_error}")
     try:
-        from .. import n3memory
-        return n3memory.get_config().get("embed_model", DEFAULT_MODEL)
-    except Exception:  # noqa: BLE001
-        return DEFAULT_MODEL
+        model = _load_model(name)
+    except Exception as e:  # noqa: BLE001
+        _model_failed_at = time.monotonic()
+        _model_failed_name = name
+        _model_last_error = f"{type(e).__name__}: {e}"
+        print(f"N3MC: the embedding model {name} could not be loaded ({_model_last_error})", file=sys.stderr)
+        raise
+    _model, _model_name = model, name
+    _model_failed_at = None
+    return model
 
 
 def _encode(text, name=None):
-    vec = get_model(name).encode([text], normalize_embeddings=True)[0]
+    vec = get_model(name).encode(text, normalize_embeddings=True)
     return [float(x) for x in vec]
 
 
-def embed_passage(text, name=None):
-    return _encode("passage: " + text, name)
+def embed_passage(content, name=None):
+    return _encode("passage: " + content, name)
 
 
-def embed_query(text, name=None):
-    return _encode("query: " + text, name)
+def embed_query(keyword, name=None):
+    return _encode("query: " + keyword, name)
 
 
-def cosine_sim_from_l2(distance):
-    return max(0.0, 1.0 - (distance * distance) / 2.0)
+# ---------------------------------------------------------------------------
+# Ranking math
+# ---------------------------------------------------------------------------
 
+def cosine_sim_from_l2(l2_distance) -> float:
+    return max(0.0, 1.0 - (l2_distance ** 2) / 2.0)
 
-# ------------------------------------------------------------------- ranking
 
 def _parse_ts(ts):
-    dt = datetime.fromisoformat(ts)
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
 
-def time_decay(timestamp, half_life_days=90, now=None):
-    try:
-        then = _parse_ts(timestamp)
-    except Exception:  # noqa: BLE001
+def compute_time_decay(timestamp, half_life_days=90, now=None) -> float:
+    dt = _parse_ts(timestamp)
+    if dt is None:
         return 1.0
     now = now or datetime.now(timezone.utc)
-    days = max(0.0, (now - then).total_seconds() / 86400.0)
+    days = max(0.0, (now - dt).total_seconds() / 86400.0)
     return 2.0 ** (-days / float(half_life_days))
 
 
-def keyword_relevances(raw_scores, bm25_min_threshold=0.1, small_db=False):
-    """raw_scores: {key: bm25 raw (negative)}. Returns {key: [0,1]} normalised by this table's max."""
-    if not raw_scores:
-        return {}
-    mx = max(-v for v in raw_scores.values())
-    out = {}
+def keyword_relevance(bm25_score, max_abs, threshold=0.1, small_db=False) -> float:
+    """Normalize a raw FTS5 bm25() value (negative = better) into [0, 1]."""
+    raw = -float(bm25_score)
     if small_db:
-        for k, v in raw_scores.items():
-            out[k] = (-v / mx) if mx > 0 else 0.0
-        return out
-    denom = max(1.0, mx)
-    for k, v in raw_scores.items():
-        out[k] = 0.0 if abs(v) < bm25_min_threshold else max(0.0, -v) / denom
-    return out
+        if max_abs <= 0:
+            return 0.0
+        return max(0.0, min(1.0, raw / max_abs))
+    if abs(bm25_score) < threshold:
+        return 0.0
+    return max(0.0, min(1.0, raw / max(1.0, max_abs)))
 
 
-def b_session(record_session, current_session):
-    return 1.0 if (current_session and record_session and record_session == current_session) else 0.6
+def b_session(record_session, current_session) -> float:
+    if current_session is not None and record_session == current_session:
+        return B_SESSION_MATCH
+    return B_SESSION_MISMATCH
 
 
-# ------------------------------------------------------------ text processing
+def combined_score(cos_sim, kw, decay, bias):
+    filter_score = cos_sim * W_COS + kw * W_KEYWORD
+    return filter_score * decay * bias, filter_score
 
-_SURR_RE = re.compile('[\ud800-\udfff]')
+
+# ---------------------------------------------------------------------------
+# Text: surrogates, purify, chunking
+# ---------------------------------------------------------------------------
+
+def _sanitize_str(s: str) -> str:
+    if not any(0xD800 <= ord(c) <= 0xDFFF for c in s):
+        return s
+    out, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        o = ord(c)
+        if 0xD800 <= o <= 0xDBFF and i + 1 < n and 0xDC00 <= ord(s[i + 1]) <= 0xDFFF:
+            out.append(chr(0x10000 + ((o - 0xD800) << 10) + (ord(s[i + 1]) - 0xDC00)))
+            i += 2
+            continue
+        if 0xD800 <= o <= 0xDFFF:
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def sanitize_surrogates(obj):
-    """Remove lone surrogate code points (recursively through dicts and lists)."""
+    """Remove lone surrogates from strings, recursively through dicts and lists."""
+    if obj is None:
+        return None
     if isinstance(obj, str):
-        return _SURR_RE.sub('', obj)
+        return _sanitize_str(obj)
     if isinstance(obj, dict):
         return {sanitize_surrogates(k): sanitize_surrogates(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -133,460 +176,553 @@ def sanitize_surrogates(obj):
     return obj
 
 
-_CODE_BLOCK_RE = re.compile(r"```[^\n`]*\n.*?```", re.DOTALL)
+# Fences are whole lines. Opening: up to 3 spaces, 3+ backticks, an optional info string without
+# backticks. Closing: only backticks, at least as many as the opening (spaces around allowed).
+_FENCE_OPEN_RE = re.compile(r" {0,3}(`{3,})[^`]*")
+_FENCE_CLOSE_RE = re.compile(r"[ \t]*(`{3,})[ \t\r]*")
+_CODE_OMITTED = "[code omitted]"
 
 
-def purify_text(text):
-    if text is None:
-        return ""
-    text = sanitize_surrogates(text)
-    return _CODE_BLOCK_RE.sub("[code omitted]", text)
+def _replace_code_blocks(text):
+    """Replace each closed fenced block (opening line .. first closing line) with [code omitted].
+    A ``` in the middle of a line, or a shorter ``` line inside code, is not a fence; an opening
+    line that is never closed is left as it is and the search goes on from the next line."""
+    lines = text.split("\n")
+    n = len(lines)
+    close_width = [0] * n
+    for k, line in enumerate(lines):
+        m = _FENCE_CLOSE_RE.fullmatch(line)
+        if m:
+            close_width[k] = len(m.group(1))
+    widest_after = [0] * (n + 1)  # widest closing fence at line k or later
+    for k in range(n - 1, -1, -1):
+        widest_after[k] = max(close_width[k], widest_after[k + 1])
+    out = []
+    i = 0
+    while i < n:
+        m = _FENCE_OPEN_RE.fullmatch(lines[i])
+        if m:
+            width = len(m.group(1))
+            if widest_after[i + 1] >= width:
+                j = i + 1
+                while close_width[j] < width:
+                    j += 1
+                out.append(_CODE_OMITTED)
+                i = j + 1
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
 
 
-_SENT_RE = re.compile(r'(?<=[.!?])\s+|(?<=[。！？])')
+def purify_text(text) -> str:
+    if not text:
+        return "" if text is None else sanitize_surrogates(text)
+    return _replace_code_blocks(sanitize_surrogates(text))
 
 
-def _hard_windows(s, max_chars, overlap):
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+|(?<=[。！？])')
+
+
+def _split_sentences(paragraph):
+    return [s.strip() for s in _SENTENCE_RE.split(paragraph) if s and s.strip()]
+
+
+def _hard_windows(text, max_chars, overlap):
+    if len(text) <= max_chars:
+        return [text]
     step = max(1, max_chars - overlap)
-    out, i = [], 0
-    while True:
-        out.append(s[i:i + max_chars])
-        if i + max_chars >= len(s):
+    out = []
+    i = 0
+    while i < len(text):
+        out.append(text[i:i + max_chars])
+        if i + max_chars >= len(text):
             break
         i += step
     return out
 
 
-def _split_parts(text, max_chars, overlap):
-    """Return [(part, sep_before, hard)] where every part is <= max_chars."""
-    parts = []
-    paras = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-    for pi, para in enumerate(paras):
-        psep = "\n\n"
-        if len(para) <= max_chars:
-            parts.append((para, psep, False))
-            continue
-        sents = [s.strip() for s in _SENT_RE.split(para) if s and s.strip()]
-        first = True
-        for s in sents:
-            sep = psep if first else " "
-            first = False
-            if len(s) <= max_chars:
-                parts.append((s, sep, False))
-            else:
-                for w in _hard_windows(s, max_chars, overlap):
-                    parts.append((w, sep, True))
-    return parts
-
-
-def chunk_text(text, max_chars=400, overlap=40):
-    """Split into chunks of at most max_chars (paragraph -> sentence -> hard window), with overlap."""
-    text = (text or "").strip()
+def chunk_text(text, max_chars=400, overlap=40) -> list:
+    """Split text into overlapping chunks: paragraph -> sentence -> hard window.
+    No chunk is longer than max_chars; every character of the text is kept in order."""
+    if text is None:
+        return []
+    text = text.strip()
     if not text:
         return []
     if len(text) <= max_chars:
         return [text]
-    chunks = []
-    cur = None
-    cur_has_tail = False
-
-    def start(part, sep):
-        if chunks and overlap > 0:
-            room = max_chars - len(sep) - len(part)
-            tl = min(overlap, room)
-            if tl > 0:
-                tail = chunks[-1][-tl:]
-                return tail + sep + part, True
-        return part, False
-
-    for part, sep, hard in _split_parts(text, max_chars, overlap):
-        if hard:
-            if cur is not None:
-                chunks.append(cur)
-                cur = None
-            chunks.append(part)
+    # pieces: (separator before the piece, piece, is_window)
+    pieces = []
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    for pi, para in enumerate(paragraphs):
+        psep = "\n\n" if pi > 0 else ""
+        if len(para) <= max_chars:
+            pieces.append((psep, para, False))
             continue
-        if cur is None:
-            cur, cur_has_tail = start(part, sep)
+        for si, sent in enumerate(_split_sentences(para)):
+            ssep = psep if si == 0 else " "
+            if len(sent) <= max_chars:
+                pieces.append((ssep, sent, False))
+            else:
+                for wi, win in enumerate(_hard_windows(sent, max_chars, overlap)):
+                    pieces.append((ssep if wi == 0 else "", win, True))
+    chunks, cur = [], ""
+    for sep, piece, is_window in pieces:
+        if not cur:
+            cur = piece
             continue
-        if len(cur) + len(sep) + len(part) <= max_chars:
-            cur = cur + sep + part
+        if not is_window and len(cur) + len(sep) + len(piece) <= max_chars:
+            cur = cur + sep + piece
+            continue
+        chunks.append(cur)
+        if is_window:
+            cur = piece  # hard windows already overlap each other
+            continue
+        sep2 = sep if sep else " "
+        room = max_chars - len(piece) - len(sep2)
+        tail_len = min(overlap, room, len(cur))
+        if tail_len > 0:
+            cur = cur[-tail_len:] + sep2 + piece
         else:
-            chunks.append(cur)
-            cur, cur_has_tail = start(part, sep)
-    if cur is not None:
+            cur = piece
+    if cur:
         chunks.append(cur)
     return chunks
 
 
-def add_chunk_prefixes(role, chunks):
-    n = len(chunks)
-    if n == 1:
+def add_chunk_prefixes(chunks, role) -> list:
+    if len(chunks) == 1:
         return [f"[{role}] {chunks[0]}"]
+    n = len(chunks)
     return [f"[{role} {i}/{n}] {c}" for i, c in enumerate(chunks, 1)]
 
 
-# ------------------------------------------------------------------- searching
+# ---------------------------------------------------------------------------
+# Hybrid search
+# ---------------------------------------------------------------------------
 
-def _as_row(rec, cos, kw, session_id, cfg, now):
-    td = time_decay(rec["timestamp"], cfg["half_life_days"], now)
-    bs = b_session(rec.get("session_id"), session_id)
-    filt = cos * 0.7 + kw * 0.3
-    return {
-        "rowid": rec.get("rowid"), "id": rec["id"], "content": rec["content"], "timestamp": rec["timestamp"],
-        "turn_id": rec.get("turn_id"), "agent_name": rec.get("agent_name"), "session_id": rec.get("session_id"),
-        "cos_sim": cos, "keyword_relevance": kw, "filter_score": filt, "score": filt * td * bs, "weak": False,
-    }
+_DEFAULTS = {
+    "half_life_days": 90, "bm25_min_threshold": 0.1, "search_result_limit": 20, "min_score": 0.2,
+    "vector_min_cos": 0.85, "relative_min_score_ratio": 0.6, "min_results": 3, "pair_top_n": 3,
+    "pair_max_chars": 3000, "version_order_enabled": True, "version_sim_threshold": 0.98,
+    "version_min_chars": 100, "reply_sim_rerank_enabled": False, "reply_sim_alpha": 0.3,
+    "reply_sim_floor": 0.80, "reply_sim_span": 0.15,
+}
 
-
-def _matched_terms(content, terms):
-    """How many distinct query terms (trigram terms, bigram terms) occur in ``content``."""
-    tri, bi = terms
-    low = strip_fts_punctuation(content).lower()
-    toks = set(bigram_text(content).lower().split())
-    hit = {t.lower() for t in tri if t.lower() in low}
-    hit |= {t.lower() for t in bi if t.lower() in toks}
-    return len(hit)
-
-
-_CJK_RE = re.compile(r'[぀-ヿ㐀-鿿가-힯]')
-_PREFIX_RE = re.compile(r'^\[(?:user|claude)(?: \d+/\d+)?\] ')
-
-
-def _is_cjk_text(text):
-    """True when the text (without its [user] / [claude i/N] tag) has CJK characters in a fifth or
-    more of its letters."""
-    body = _PREFIX_RE.sub('', text or '')
-    letters = [ch for ch in body if ch.isalpha()]
-    if not letters:
-        return False
-    return sum(1 for ch in letters if _CJK_RE.match(ch)) * 5 >= len(letters)
-
-
-def _sort_key(r):
-    return (r["score"], r["timestamp"], r["id"])
+def _cfg(cfg, key):
+    if cfg and key in cfg:
+        return cfg[key]
+    return _DEFAULTS[key]
 
 
 def _dot(a, b):
     return sum(x * y for x, y in zip(a, b))
 
 
-def _stored_vector(conn, rowid):
-    row = conn.execute("SELECT embedding FROM memories_vec WHERE rowid=?", (rowid,)).fetchone()
-    return deserialize_vector(row[0]) if row and row[0] is not None else None
+def _cos(a, b):
+    na = math.sqrt(_dot(a, a))
+    nb = math.sqrt(_dot(b, b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return _dot(a, b) / (na * nb)
 
 
-def _turn_representative(conn, turn_id, min_chars):
-    for r in conn.execute("SELECT rowid, content FROM memories WHERE turn_id=? AND content LIKE '[claude%' "
-                          "ORDER BY rowid", (turn_id,)).fetchall():
-        if len(r["content"]) >= min_chars:
-            return _stored_vector(conn, r["rowid"])
+def _order_key(r):
+    return (r["score"], r.get("timestamp") or "", r.get("id") or "")
+
+
+def _first_row_key(conn, turn_id, cache):
+    if turn_id not in cache:
+        row = conn.execute("SELECT timestamp, id FROM memories WHERE turn_id = ? ORDER BY rowid LIMIT 1",
+                           (turn_id,)).fetchone()
+        cache[turn_id] = (row[0], row[1]) if row else ("", "")
+    return cache[turn_id]
+
+
+def _representative_vector(conn, turn_id, min_chars):
+    rows = conn.execute("SELECT rowid, content FROM memories WHERE turn_id = ? ORDER BY rowid",
+                        (turn_id,)).fetchall()
+    for rowid, content in rows:
+        if content.startswith("[claude") and len(content) >= min_chars:
+            return get_vector(conn, rowid)  # the first such row; None when it has no vector
     return None
 
 
 def _order_versions_newest_first(conn, results, cfg):
-    """Group results whose turns hold near-identical replies and put the newest version first."""
+    """Group turns whose representative [claude row vectors are nearly identical and put the newest
+    version at the highest position of the group. Positions keep their score and filter_score."""
+    threshold = _cfg(cfg, "version_sim_threshold")
+    min_chars = _cfg(cfg, "version_min_chars")
     turns = []
     for r in results:
-        if r.get("turn_id") and r["turn_id"] not in turns:
-            turns.append(r["turn_id"])
+        t = r.get("turn_id")
+        if t and t not in turns:
+            turns.append(t)
     reps = {}
     for t in turns:
-        v = _turn_representative(conn, t, cfg["version_min_chars"])
+        v = _representative_vector(conn, t, min_chars)
         if v is not None:
             reps[t] = v
-    ts = list(reps)
-    parent = {t: t for t in ts}
+    keys = list(reps)
+    parent = {t: t for t in keys}
 
     def find(x):
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-
-    for i in range(len(ts)):
-        for j in range(i + 1, len(ts)):
-            if _dot(reps[ts[i]], reps[ts[j]]) >= cfg["version_sim_threshold"]:
-                parent[find(ts[i])] = find(ts[j])
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            if _cos(reps[keys[i]], reps[keys[j]]) >= threshold:
+                parent[find(keys[i])] = find(keys[j])
     groups = {}
-    for t in ts:
+    for t in keys:
         groups.setdefault(find(t), []).append(t)
+    cache = {}
+    out = list(results)
     for members in groups.values():
         if len(members) < 2:
             continue
-        first_row = {}
-        for t in members:
-            r0 = conn.execute("SELECT timestamp, id FROM memories WHERE turn_id=? ORDER BY rowid LIMIT 1",
-                              (t,)).fetchone()
-            first_row[t] = (r0["timestamp"], r0["id"]) if r0 else ("", "")
-        order = sorted(members, key=lambda t: first_row[t], reverse=True)
-        positions = [i for i, r in enumerate(results) if r.get("turn_id") in members]
-        new_rows = []
-        for t in order:
-            new_rows.extend(r for r in results if r.get("turn_id") == t)
-        old = [results[p] for p in positions]
-        for p, row, o in zip(positions, new_rows, old):
-            results[p] = {**row, "score": o["score"], "filter_score": o["filter_score"], "_version_group": True}
-    return results
-
-
-def _collapse_identical_content(results):
-    first_pos, newest = {}, {}
-    for i, r in enumerate(results):
-        c = r["content"]
-        first_pos.setdefault(c, i)
-        if c not in newest or (r["timestamp"], r["id"]) > (newest[c]["timestamp"], newest[c]["id"]):
-            newest[c] = r
-    out = []
-    for i, r in enumerate(results):
-        if first_pos[r["content"]] != i:
-            continue
-        n = newest[r["content"]]
-        out.append({**r, "id": n["id"], "timestamp": n["timestamp"], "turn_id": n["turn_id"],
-                    "rowid": n.get("rowid")})
+        member_set = set(members)
+        positions = [i for i, r in enumerate(out) if r.get("turn_id") in member_set]
+        ordered_turns = sorted(members, key=lambda t: _first_row_key(conn, t, cache), reverse=True)
+        rows_by_turn = {t: [out[i] for i in positions if out[i].get("turn_id") == t] for t in members}
+        new_rows = [row for t in ordered_turns for row in rows_by_turn[t]]
+        slots = [(out[i]["score"], out[i]["filter_score"]) for i in positions]
+        for pos, row, (score, fscore) in zip(positions, new_rows, slots):
+            moved = dict(row)
+            moved["score"] = score
+            moved["filter_score"] = fscore
+            moved["_version_group"] = True
+            out[pos] = moved
     return out
 
 
-def _rerank_by_reply(conn, query_vec, results, cfg):
+def rerank_by_reply_similarity(conn, results, query_vec, cfg):
+    """2b: mix the score with how close the turn's [claude reply is to the question (stored vectors only)."""
+    if not results or query_vec is None:
+        return results
     try:
-        if query_vec is None or not results:
-            return results
-        alpha, floor, span = cfg["reply_sim_alpha"], cfg["reply_sim_floor"], cfg["reply_sim_span"]
-        sims = {}
-        for t in {r["turn_id"] for r in results if r.get("turn_id")}:
-            vecs = []
-            for r in conn.execute("SELECT rowid FROM memories WHERE turn_id=? AND content LIKE '[claude%'",
-                                  (t,)).fetchall():
-                v = _stored_vector(conn, r["rowid"])
-                if v:
-                    vecs.append(v)
-            if vecs:
-                mean = [sum(c) / len(vecs) for c in zip(*vecs)]
-                sims[t] = _dot(query_vec, mean)
-        top = max((r["score"] for r in results), default=0.0) or 1.0
+        alpha = _cfg(cfg, "reply_sim_alpha")
+        floor = _cfg(cfg, "reply_sim_floor")
+        span = _cfg(cfg, "reply_sim_span")
+        turns = sorted({r["turn_id"] for r in results if r.get("turn_id")})
+        reply_vecs = {}
+        if turns:
+            marks = ",".join("?" * len(turns))
+            rows = conn.execute(
+                f"SELECT m.turn_id, v.embedding FROM memories m JOIN memories_vec v ON v.rowid = m.rowid "
+                f"WHERE m.turn_id IN ({marks}) AND m.content LIKE '[claude%'", turns).fetchall()
+            from .database import deserialize_vector
+            acc = {}
+            for t, blob in rows:
+                vec = deserialize_vector(blob)
+                if t not in acc:
+                    acc[t] = [0.0] * len(vec)
+                    reply_vecs[t] = 0
+                acc[t] = [a + b for a, b in zip(acc[t], vec)]
+                reply_vecs[t] += 1
+            reply_vecs = {t: [x / reply_vecs[t] for x in acc[t]] for t in acc}
+        top = max(r["score"] for r in results) or 1.0
         out = []
         for r in results:
-            s = sims.get(r.get("turn_id"))
-            bonus = max(0.0, (s - floor) / span) if s is not None else 0.0
-            out.append({**r, "score": (1 - alpha) * r["score"] / top + alpha * bonus})
-        out.sort(key=_sort_key, reverse=True)
+            rr = dict(r)
+            comp = 0.0
+            v = reply_vecs.get(r.get("turn_id"))
+            if v is not None:
+                comp = max(0.0, (_cos(v, query_vec) - floor) / span)
+            rr["score"] = (1 - alpha) * r["score"] / top + alpha * comp
+            out.append(rr)
+        out.sort(key=_order_key, reverse=True)
         return out
     except Exception:  # noqa: BLE001
         return results
 
 
-def hybrid_search(conn, query, cfg, session_id=None, since=None, until=None, embed_fn=None):
-    """Hybrid (vector + trigram FTS + bigram FTS) search with the v1.6 shaping pipeline."""
-    global _warned_embed
-    limit = cfg["search_result_limit"]
-    now = datetime.now(timezone.utc)
-    if not (query or "").strip():
-        return {"results": [], "pairs": {}, "pairs_omitted": {}}
-    embed_fn = embed_fn or embed_query
-
-    # --- vector candidates
-    qvec = None
-    vec_hits = []  # (rec, cos)
-    try:
-        qvec = embed_fn(query)
-        for rec, dist in search_vector(conn, qvec, k=3 * limit, since=since, until=until):
-            vec_hits.append((rec, cosine_sim_from_l2(dist)))
-    except Exception as e:  # noqa: BLE001
-        qvec = None
-        if not _warned_embed:
-            _warned_embed = True
-        print(f"Warning: vector search degraded (embed_query failed: {e})", file=sys.stderr)
-
-    # --- keyword candidates (per table normalisation)
-    # Search improvements of 2026-11-22 (not in the spec; each can be turned off in config.json):
-    # fts_stopwords drops English function words from the keyword terms; kw_only_min_terms keeps a
-    # row that only the keywords found (cosine under vector_min_cos) out of Top matches unless it
-    # contains that many distinct query terms (it can still come back as a weak match).
-    stop = bool(cfg.get("fts_stopwords", False))
-    min_terms = int(cfg.get("kw_only_min_terms", 0) or 0)
-    q_terms = (fts_terms(query, stop), bigram_terms(query, stop)) if min_terms > 1 else None
-    small = count_memories(conn) <= 2
-    kw = {}   # id -> relevance
-    recs = {}
-    for fn in (search_fts, search_fts_bigram):
-        try:
-            hits = fn(conn, query, limit=3 * limit, since=since, until=until, stopwords=stop)
-        except Exception as e:  # noqa: BLE001
-            print(f"N3MC: keyword search failed ({type(e).__name__}: {e}); continuing without it", file=sys.stderr)
+def _collapse_identical_content(results):
+    """Keep one row per identical content at the highest position, with the newest record's data."""
+    by_content = {}
+    for r in results:
+        by_content.setdefault(r["content"], []).append(r)
+    out, done = [], set()
+    for r in results:
+        c = r["content"]
+        if c in done:
             continue
-        raw = {rec["id"]: s for rec, s in hits}
-        for rec, _ in hits:
-            recs[rec["id"]] = rec
-        for k, v in keyword_relevances(raw, cfg["bm25_min_threshold"], small).items():
-            kw[k] = max(kw.get(k, 0.0), v)
-
-    actual_cos = {}
-    for rec, c in vec_hits:
-        recs[rec["id"]] = rec
-        actual_cos[rec["id"]] = c
-
-    floor = cfg["vector_min_cos"]
-    # cross_lang_min_cos (2026-11-22, not in the spec; 0 = off): the best vector hit written in the
-    # other script (CJK vs. not) counts as a vector match from this cosine on, below vector_min_cos.
-    # A query and a record in different languages score lower with e5 than a same-language pair.
-    cross_floor = float(cfg.get("cross_lang_min_cos", 0) or 0)
-    cross_best = None
-    if cross_floor and actual_cos:
-        q_cjk = _is_cjk_text(query)
-        other = [(c, rid) for rid, c in actual_cos.items()
-                 if c < floor and _is_cjk_text(recs[rid]["content"]) != q_cjk]
-        if other:
-            c_top, rid_top = max(other)
-            if c_top >= cross_floor:
-                cross_best = rid_top
-    main, pool = [], []
-    for rid, rec in recs.items():
-        c_act = actual_cos.get(rid, 0.0)
-        k = kw.get(rid, 0.0)
-        pool.append(_as_row(rec, c_act, k, session_id, cfg, now))
-        c_main = c_act if (c_act >= floor or rid == cross_best) else 0.0
-        in_vec = c_main > 0.0
-        if not in_vec and rid not in kw:
+        done.add(c)
+        group = by_content[c]
+        if len(group) == 1:
+            out.append(r)
             continue
-        if not in_vec and q_terms and _matched_terms(rec["content"], q_terms) < min_terms:
-            continue  # keyword-only with too few query terms: stays a weak-match candidate
-        main.append(_as_row(rec, c_main, k, session_id, cfg, now))
+        newest = max(group, key=lambda g: (g.get("timestamp") or "", g.get("id") or ""))
+        merged = dict(r)
+        for k in ("id", "timestamp", "turn_id", "agent_name", "session_id", "rowid"):
+            merged[k] = newest.get(k)
+        out.append(merged)
+    return out
 
-    # step 2: min_score on filter_score
-    results = [r for r in main if r["filter_score"] >= cfg["min_score"]]
-    results.sort(key=_sort_key, reverse=True)
-    if cfg.get("reply_sim_rerank_enabled"):
-        results = _rerank_by_reply(conn, qvec, results, cfg)
-    # step 3
-    if cfg.get("version_order_enabled", True):
-        try:
-            results = _order_versions_newest_first(conn, results, cfg)
-        except Exception as e:  # noqa: BLE001
-            print(f"N3MC: version ordering skipped ({e})", file=sys.stderr)
-    # step 4
-    if results:
-        top = max(r["filter_score"] for r in results)
-        ratio = cfg["relative_min_score_ratio"]
-        if ratio > 0:
-            results = [r for r in results if r.get("_version_group") or r["filter_score"] >= ratio * top]
-    # step 5
-    results = _collapse_identical_content(results)
-    # step 6 (top_matches_max, 2026-11-22, not in the spec: a cap on Top matches only; 0 = none, the
-    # vector candidates and the weak matches still use search_result_limit)
-    strong_cap = min(limit, int(cfg.get("top_matches_max", 0) or 0) or limit)
-    capped, per_turn = [], {}
+
+def _cap_per_turn(results, limit, cap=2):
+    counts, out = {}, []
     for r in results:
         t = r.get("turn_id")
-        if t:
-            if per_turn.get(t, 0) >= 2:
+        if t is not None:
+            if counts.get(t, 0) >= cap:
                 continue
-            per_turn[t] = per_turn.get(t, 0) + 1
-        capped.append(r)
-        if len(capped) >= strong_cap:
+            counts[t] = counts.get(t, 0) + 1
+        out.append(r)
+        if len(out) >= limit:
             break
-    results = capped
-    # step 7: weak fill
-    target = min(cfg["min_results"], limit)
-    if cfg["min_results"] > 0 and len(results) < target:
-        have_ids = {r["id"] for r in results}
-        have_content = {r["content"] for r in results}
-        pool = [p for p in pool if p["id"] not in have_ids and p["filter_score"] >= 1e-6]
-        pool.sort(key=lambda p: (p["filter_score"], p["timestamp"], p["id"]), reverse=True)
-        for p in pool:
-            if len(results) >= target:
-                break
-            if p["content"] in have_content:
-                continue
-            t = p.get("turn_id")
-            if t and per_turn.get(t, 0) >= 2:
-                continue
-            if t:
-                per_turn[t] = per_turn.get(t, 0) + 1
-            have_content.add(p["content"])
-            results.append({**p, "weak": True})
-    pairs, omitted = _build_pairs(conn, results, cfg)
-    return {"results": results, "pairs": pairs, "pairs_omitted": omitted}
-
-
-def _role_order(rec):
-    return 0 if rec["content"].startswith("[user") else 1
+    return out
 
 
 def _build_pairs(conn, results, cfg):
+    top_n = _cfg(cfg, "pair_top_n")
+    max_chars = _cfg(cfg, "pair_max_chars")
     pairs, omitted = {}, {}
-    total, seen = 0, []
+    seen = []
     for r in results:
-        t = r.get("turn_id")
-        if r.get("weak") or not t or t in seen:
+        if r.get("weak"):
             continue
-        seen.append(t)
-        if len(seen) > cfg["pair_top_n"]:
+        t = r.get("turn_id")
+        if t and t not in seen:
+            seen.append(t)
+        if len(seen) >= top_n:
             break
-        sibs = sorted(get_memories_by_turn_id(conn, t), key=_role_order)  # stable: rowid order inside a role
-        taken = []
-        for i, s in enumerate(sibs):
-            if total + len(s["content"]) > cfg["pair_max_chars"]:
-                omitted[t] = len(sibs) - i
+    total = 0
+    for t in seen[:top_n]:
+        siblings = get_memories_by_turn_id(conn, t)
+        if not siblings:
+            continue
+        rows = []
+        stop = False
+        for i, s in enumerate(siblings):
+            if total + len(s["content"]) > max_chars:
+                omitted[t] = len(siblings) - i
+                stop = True
                 break
             total += len(s["content"])
-            taken.append({"id": s["id"], "content": s["content"], "timestamp": s["timestamp"]})
-        if taken:
-            pairs[t] = taken
-        if t in omitted:
+            rows.append({"id": s["id"], "content": s["content"], "timestamp": s["timestamp"]})
+        if rows:
+            pairs[t] = rows
+        if stop:
             break
     return pairs, omitted
 
 
-# -------------------------------------------------------------------- render
+def _public_row(r, weak=False):
+    return {
+        "id": r["id"], "content": r["content"], "score": r["score"], "timestamp": r["timestamp"],
+        "turn_id": r.get("turn_id"), "weak": weak, "agent_name": r.get("agent_name"),
+        "session_id": r.get("session_id"), "filter_score": r["filter_score"],
+        "cos_sim": r.get("cos_sim", 0.0), "keyword_relevance": r.get("keyword_relevance", 0.0),
+    }
 
-def _fmt_saved(ts):
+
+def hybrid_search(conn, query, cfg=None, session_id=None, since=None, until=None, query_vec=None,
+                  embed_fn=None):
+    """Vector + FTS search with the ranking formula and the result shaping of §5.
+    Returns {"results", "pairs", "pairs_omitted"}."""
+    empty ={"results": [], "pairs": {}, "pairs_omitted": {}}
+    if not query or not query.strip():
+        return empty
+    limit = int(_cfg(cfg, "search_result_limit"))
+    k = 3 * limit
+    if query_vec is None:
+        try:
+            query_vec = (embed_fn or embed_query)(query)
+        except Exception as e:  # noqa: BLE001
+            query_vec = None
+            print(f"Warning: vector search degraded (embed_query failed: {type(e).__name__}: {e})",
+                  file=sys.stderr)
+    vec_rows = []
+    if query_vec is not None:
+        try:
+            vec_rows = search_vector(conn, query_vec, k, since, until)
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: vector search failed ({type(e).__name__}: {e})", file=sys.stderr)
+            vec_rows = []
     try:
-        dt = _parse_ts(ts).astimezone()
-        off = dt.strftime("%z") or "+0000"
-        return f"{dt.strftime('%Y-%m-%d %H:%M')} (UTC{off})"
-    except Exception:  # noqa: BLE001
+        tri_rows = search_fts(conn, query, k, since, until)
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: keyword search failed ({type(e).__name__}: {e})", file=sys.stderr)
+        tri_rows = []
+    try:
+        bi_rows = search_fts_bigram(conn, query, k, since, until)
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: bigram keyword search failed ({type(e).__name__}: {e})", file=sys.stderr)
+        bi_rows = []
+
+    small_db = count_memories(conn) <= 2
+    threshold = _cfg(cfg, "bm25_min_threshold")
+    kw = {}
+    rows_by_rowid = {}
+    for table_rows in (tri_rows, bi_rows):
+        if not table_rows:
+            continue
+        max_abs = max(-r["bm25"] for r in table_rows)
+        for r in table_rows:
+            rel = keyword_relevance(r["bm25"], max_abs, threshold, small_db)
+            kw[r["rowid"]] = max(kw.get(r["rowid"], 0.0), rel)
+            rows_by_rowid.setdefault(r["rowid"], r)
+    real_cos = {}
+    for r in vec_rows:
+        real_cos[r["rowid"]] = cosine_sim_from_l2(r["distance"])
+        rows_by_rowid.setdefault(r["rowid"], r)
+
+    vmin = _cfg(cfg, "vector_min_cos")
+    half_life = _cfg(cfg, "half_life_days")
+    min_score = _cfg(cfg, "min_score")
+    now = datetime.now(timezone.utc)
+
+    def make(rowid, cos_value):
+        base = rows_by_rowid[rowid]
+        kr = kw.get(rowid, 0.0)
+        decay = compute_time_decay(base["timestamp"], half_life, now)
+        bias = b_session(base.get("session_id"), session_id)
+        score, fscore = combined_score(cos_value, kr, decay, bias)
+        d = {k2: base.get(k2) for k2 in ("rowid", "id", "content", "timestamp", "agent_name",
+                                         "session_id", "turn_id")}
+        d.update(score=score, filter_score=fscore, cos_sim=cos_value, keyword_relevance=kr)
+        return d
+
+    main, weak_pool = [], {}
+    for rowid in rows_by_rowid:
+        rc = real_cos.get(rowid)
+        in_fts = rowid in kw
+        if rc is not None and rc >= vmin:
+            cand = make(rowid, rc)
+        elif in_fts:
+            cand = make(rowid, 0.0)  # an FTS-only hit
+        else:
+            weak_pool[rowid] = make(rowid, rc or 0.0)  # step 1: below vector_min_cos
+            continue
+        if cand["filter_score"] < min_score:  # step 2
+            weak_pool[rowid] = make(rowid, rc if rc is not None else 0.0)
+            continue
+        main.append(cand)
+    main.sort(key=_order_key, reverse=True)
+
+    if _cfg(cfg, "reply_sim_rerank_enabled"):  # 2b
+        main = rerank_by_reply_similarity(conn, main, query_vec, cfg)
+    if _cfg(cfg, "version_order_enabled"):  # 3
+        try:
+            main = _order_versions_newest_first(conn, main, cfg)
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: version ordering skipped ({type(e).__name__}: {e})", file=sys.stderr)
+    ratio = _cfg(cfg, "relative_min_score_ratio")  # 4
+    if main and ratio > 0:
+        top = max(r["filter_score"] for r in main)
+        kept = []
+        for r in main:
+            if r["filter_score"] >= ratio * top or r.get("_version_group"):
+                kept.append(r)
+            else:
+                rc = real_cos.get(r["rowid"])
+                weak_pool[r["rowid"]] = make(r["rowid"], rc if rc is not None else 0.0)
+        main = kept
+    main = _collapse_identical_content(main)  # 5
+    main = _cap_per_turn(main, limit)  # 6
+
+    target = min(int(_cfg(cfg, "min_results")), limit)  # 7
+    weak_rows = []
+    if target > 0 and len(main) < target:
+        in_main = {r["rowid"] for r in main}
+        pool = [w for rid, w in weak_pool.items() if rid not in in_main
+                and w["filter_score"] >= WEAK_MIN_FILTER_SCORE]
+        pool.sort(key=lambda w: (w["filter_score"], w.get("timestamp") or "", w.get("id") or ""), reverse=True)
+        contents = {r["content"] for r in main}
+        counts = {}
+        for r in main:
+            if r.get("turn_id") is not None:
+                counts[r["turn_id"]] = counts.get(r["turn_id"], 0) + 1
+        for w in pool:
+            if len(main) + len(weak_rows) >= target:
+                break
+            if w["content"] in contents:
+                continue
+            t = w.get("turn_id")
+            if t is not None and counts.get(t, 0) >= 2:
+                continue
+            contents.add(w["content"])
+            if t is not None:
+                counts[t] = counts.get(t, 0) + 1
+            w["_weak"] = True
+            weak_rows.append(w)
+
+    results = [_public_row(r) for r in main] + [_public_row(r, weak=True) for r in weak_rows]
+    pairs, omitted = _build_pairs(conn, results, cfg)  # 8
+    return {"results": results, "pairs": pairs, "pairs_omitted": omitted}
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _fmt_saved(ts) -> str:
+    dt = _parse_ts(ts)
+    if dt is None:
         return str(ts)
+    try:
+        local = dt.astimezone()
+    except (OSError, OverflowError, ValueError):
+        local = dt
+    return f"{local:%Y-%m-%d %H:%M} (UTC{local:%z})"
 
 
-def render_memory_context(query, results, pairs=None, pairs_omitted=None, notices=None):
-    pairs, pairs_omitted = pairs or {}, pairs_omitted or {}
-    lines = ["# Recalled Memory Context", f"Search query: {query}", ""]
-    for n in notices or []:
-        lines += [f"> ⚠️ N3MC notice: {n}", ""]
-    normal = [r for r in results if not r.get("weak")]
+HEADER = "# Recalled Memory Context"
+NO_RESULTS = "_No relevant memories found._"
+VERSION_NOTE = ("_If several versions of the same content appear, the one with the newest `saved` "
+                "time is the current one._")
+
+
+def _notice_lines(notices):
+    return "".join(f"> ⚠️ N3MC notice: {m}\n\n" for m in (notices or []))
+
+
+def render_memory_context(query, data, notices=None) -> str:
+    results = (data or {}).get("results") or []
+    pairs = (data or {}).get("pairs") or {}
+    omitted = (data or {}).get("pairs_omitted") or {}
+    strong = [r for r in results if not r.get("weak")]
     weak = [r for r in results if r.get("weak")]
-    num = 0
-
-    def row(r):
-        nonlocal num
-        num += 1
-        return [f"## [{num}] score={r['score']:.4f} saved={_fmt_saved(r['timestamp'])} "
-                f"{r.get('agent_name') or '-'}", r["content"], ""]
-
-    if normal:
-        lines += ["## Top matches (use these to answer the question)", "",
-                  "_If several versions of the same content appear, the one with the newest `saved` "
-                  "time is the current one._", ""]
-        for r in normal:
-            lines += row(r)
+    out = [f"{HEADER}\nSearch query: {query}\n\n", _notice_lines(notices)]
+    n = 0
+    if strong:
+        out.append("## Top matches (use these to answer the question)\n\n")
+        out.append(VERSION_NOTE + "\n\n")
+        for r in strong:
+            n += 1
+            out.append(f"## [{n}] score={r['score']:.4f} saved={_fmt_saved(r['timestamp'])} "
+                       f"{r.get('agent_name') or '-'}\n{r['content']}\n\n")
     else:
-        lines += ["_No relevant memories found._", ""]
+        out.append(NO_RESULTS + "\n\n")
     if weak:
-        lines += ["## Possibly related (weak matches — may be unrelated)", ""]
+        out.append("## Possibly related (weak matches — may be unrelated)\n\n")
         for r in weak:
-            lines += row(r)
-    if pairs or pairs_omitted:
-        lines += ["## Previous matching Q-A exchanges (supplementary context)", ""]
-        for t in list(pairs) + [t for t in pairs_omitted if t not in pairs]:
-            first = pairs.get(t, [{}])[0].get("timestamp")
-            head = f"### turn_id: {t}"
-            if first:
-                head += f" saved={_fmt_saved(first)}"
-            lines.append(head)
-            for s in pairs.get(t, []):
-                lines.append(s["content"])
-            if pairs_omitted.get(t):
-                lines.append(f"_({pairs_omitted[t]} more chunk(s) of this exchange omitted. Full text: "
-                             f"`python -m n3memorycore.n3memory --show-turn {t}`)_")
-            lines.append("")
-    return "\n".join(lines).rstrip("\n") + "\n"
+            n += 1
+            out.append(f"## [{n}] score={r['score']:.4f} saved={_fmt_saved(r['timestamp'])} "
+                       f"{r.get('agent_name') or '-'}\n{r['content']}\n\n")
+    turn_ids = list(pairs)
+    for t in omitted:
+        if t not in turn_ids:
+            turn_ids.append(t)
+    if turn_ids:
+        out.append("## Previous matching Q-A exchanges (supplementary context)\n\n")
+        for t in turn_ids:
+            rows = pairs.get(t) or []
+            saved = f" saved={_fmt_saved(rows[0]['timestamp'])}" if rows else ""
+            out.append(f"### turn_id: {t}{saved}\n")
+            for row in rows:
+                out.append(row["content"] + "\n")
+            if t in omitted:
+                out.append(f"_({omitted[t]} more chunk(s) of this exchange omitted. Full text: "
+                           f"`python -m n3memorycore.n3memory --show-turn {t}`)_\n")
+            out.append("\n")
+    return "".join(out).rstrip("\n") + "\n"
+
+
+def render_placeholder(text, notices=None) -> str:
+    """Output without results: the header, the notices, then the placeholder line."""
+    return f"{HEADER}\n\n{_notice_lines(notices)}{text}\n"
