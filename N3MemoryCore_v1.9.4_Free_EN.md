@@ -37,7 +37,7 @@ By using this software, you agree to the terms above.
 | Item | Requirement |
 | :--- | :--- |
 | Python | 3.10 or higher |
-| pip packages | `fastapi` `uvicorn` `sqlite-vec` `sentence-transformers` `uuid7` `psutil` (**required** — the CLI uses it to tell whether the process in the PID file is this folder's server while it is still starting; see §3 "PID file handling") |
+| pip packages | `fastapi` `uvicorn` `pydantic` `sqlite-vec` `sentence-transformers` `uuid7` `psutil` (**required** — the CLI uses it to tell whether the process in the PID file is this folder's server while it is still starting; see §3 "PID file handling") |
 | Claude Code | Any recent version (hook support required — configured automatically, no prior knowledge needed) |
 | Git | Only for Method B (`git clone`); Method A does not use it |
 
@@ -85,7 +85,7 @@ Exclude source code and accumulate high-density "intent, conclusions, and evalua
 
 > **⚠️ Install folder check (Method A — do this first, before anything else)**: Method A writes the code into the folder Claude Code is open in (the current working directory): `pyproject.toml`, `README.md`, `tests/`, `n3memorycore/` and the other files of §2. That folder stays in use after setup: with `pip install -e .` the hooks run the code from it, so deleting or moving it later stops the memory from working.
 > 1. Show the user the absolute path of the current working directory and this message: "N3MemoryCore will be installed in this folder: <absolute path>. The code will stay here; deleting or moving this folder later stops the memory hooks. Continue? (yes/no)". **Wait for the user's answer.** Continue only on a clear yes. This is the only confirmation of the setup; everything after it runs automatically.
-> 2. Before asking, look at the folder. If it contains anything other than this specification file, `.claude/`, `.git/` and the files of an earlier setup of this product (`n3memorycore/`, `pyproject.toml` whose `name` is this package's), **do not ask: abort** and display: "This folder already contains other files (for example a project of yours). Setting up here could overwrite them. Create an empty folder such as `~/n3mc-free`, open Claude Code there, and run this setup again." Never overwrite or mix into an existing project.
+> 2. Before asking, look at the folder. The files of §2 that are not generated — this specification in either language, `README.md`, `README_JP.md`, `LICENSE`, `NOTICE`, `PHILOSOPHY.md`, `SECURITY.md`, `CHANGELOG.md`, `.github/`, `.gitignore` — and `.claude/`, `.git/` do not stop the setup; do not overwrite them. Abort only when the folder contains something the generated files collide with (`n3memorycore/`, `tests/`, `pyproject.toml` or another generated path of §2) and it is not the files of an earlier setup of this product (`n3memorycore/` with a `pyproject.toml` whose `name` is this package's). Then **do not ask: abort** and display: "This folder already contains other files (for example a project of yours). Setting up here could overwrite them. Create an empty folder such as `~/n3mc-free`, open Claude Code there, and run this setup again." Never overwrite or mix into an existing project.
 > 3. Do not install into the home folder itself (`~`) or a system folder.
 
 > **⚠️ Python check**: Before starting implementation, run `python --version` or `python3 --version` to verify Python 3.10+ is available. If not found, display: "Python 3.10 or higher is required. Install from https://www.python.org/" and **abort setup**.
@@ -130,7 +130,9 @@ Code lives in the repository (under `n3memorycore/`). Personal data lives outsid
 n3mc-free/                       # Repository root
 ├── pyproject.toml               # ★ pip metadata + entry-point declarations
 ├── README.md / README_JP.md
-├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md
+├── LICENSE / NOTICE / CHANGELOG.md / PHILOSOPHY.md / SECURITY.md
+├── .gitignore
+├── .github/                     # issue templates and the PyPI publish workflow
 ├── N3MemoryCore_v1.9.4_Free_EN.md / _JP.md   # this specification
 ├── n3memorycore/                # ★ The Python package (PEP 8 lowercase)
 │   ├── __init__.py              # exposes __version__
@@ -345,24 +347,45 @@ from .database import (
     serialize_vector,        # Required for /repair endpoint
     get_memories_by_turn_id, # Required for Q-A pairing
     strip_fts_punctuation,   # Required for /repair FTS migration
+    search_fts_bigram,       # CJK bigram index (§3 "CJK bigram index")
+    get_vector,              # get_vector(conn, rowid): stored vector of a row, or None (reply re-rank, §5)
+    deserialize_vector,      # inverse of serialize_vector
 )
 ```
 
 ```python
 # n3memorycore/n3memory.py
-from .paths import HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE, claude_paths
+from .paths import (HOME_DIR, MEMORY_DIR, DB_PATH, PID_FILE, AUDIT_LOG, CONFIG_FILE, NOTICES_FILE,
+                    claude_paths, SERVER_LOG, SERVER_START_FAILED, TURN_ID_FILE, python_cmd)
 from .core.database import (
     get_connection, init_db, migrate_schema, insert_memory, insert_memory_once,
     check_exact_duplicate, search_vector, find_unindexed_memories,
-    strip_fts_punctuation, serialize_vector,
+    strip_fts_punctuation, serialize_vector, fts_index_text, bigram_text,
+    get_meta, set_meta, delete_meta, vec_table_dim,
+    count_memories, get_all_memories, get_memories_by_turn_id,
+    FTS_TEXT_RULES, _FTS_PUNCT_RE,
 )
 from .core.processor import (
     embed_passage, cosine_sim_from_l2, hybrid_search,
     chunk_text, add_chunk_prefixes, purify_text, render_memory_context,
+    render_placeholder, sanitize_surrogates, set_embed_model, _fmt_saved, NO_RESULTS,
 )
+from .core import processor
+```
+
+```python
+# n3memorycore/n3mc_hook.py and n3memorycore/n3mc_stop_hook.py
+from .paths import AUDIT_LOG, python_cmd
 ```
 
 `paths.py` resolves `HOME_DIR` from `$N3MC_HOME` if set, otherwise `~/.n3mc/`. All `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, etc. derive from it. Per-project `.claude/` paths come from `claude_paths()` which uses the current working directory.
+
+The names not described elsewhere in this document:
+
+- `core/database.py`: `get_meta(conn, key)` returns the value of a `meta` key or `None`; `set_meta(conn, key, value, commit=True)` and `delete_meta(conn, key, commit=True)` write and delete one key (§3.5 "Index metadata"); `vec_table_dim(conn)` returns the dimension of `memories_vec` read from the table itself, or `None`.
+- `core/processor.py`: `set_embed_model(name)` sets the model named by `embed_model` of `config.json` (used when `get_model()` is called without a name); `NO_RESULTS` is the line `_No relevant memories found._`; `_fmt_saved(ts)` formats the `saved=` time (local time).
+- `sanitize_surrogates(obj)` lives in `core/processor.py`: it removes lone surrogates from a string, and recursively from the strings of a `dict` or `list` (keeps a complete surrogate pair as its character; `None` and other values are returned as they are). `purify_text` calls it on its input before it replaces code blocks, so every path that saves through `purify_text` is cleaned too.
+- `paths.py`: `SERVER_LOG` (`.memory/server.log`), `SERVER_START_FAILED` (the marker `.memory/server_start_failed`, §3 "Starting the server"), `TURN_ID_FILE` (`.memory/turn_id.txt`, used when there is no `session_id`) and `python_cmd()` ("Safe import path" below).
 
 ### Resident FastAPI Server
 - **Port**: Default `18520` (configurable via `server_port` in `config.json`). When running another N3MC (e.g. the Pro edition) on the same PC, give each data folder its own `server_port`.
@@ -408,7 +431,7 @@ The CLI classifies the `/health` response as follows (`_health_decision(health)`
 
 #### Starting the server (`_start_server`)
 
-0. **Reserve the start before launching**: create the PID file with `open(..., "x")` before `Popen` and keep it empty until `Popen` returns, then write the child's PID into it. On `FileExistsError` another process is starting (or runs) the server: do not launch; follow "PID file handling" above. If `Popen` raises, delete the reservation. **An empty or unreadable PID file** (the moment between the reservation and the write) is treated as "still starting" for 60 seconds after the file's modification time, never as a dead process: it is not deleted and no second server is started; after 60 seconds it is treated as dead. A process that did not create the PID file never writes to it. Only two writers exist: the process that made the reservation writes the child's PID, and the server itself (`--run-server`), when it starts, overwrites the file with its own PID (normally the same number). (If `_start_server` called `Popen` first and created the PID file afterwards, overwriting it when it existed, two hooks starting together would both launch a server — two model loads, the second one failing to bind, and a PID file that could name the process that failed.)
+0. **Reserve the start before launching**: create the PID file with `open(..., "x")` before `Popen` and keep it empty until `Popen` returns, then write the child's PID into it. On `FileExistsError` another process is starting (or runs) the server: do not launch; follow "PID file handling" above. If `Popen` raises, delete the reservation. **An empty or unreadable PID file** (the moment between the reservation and the write) is treated as "still starting" for 60 seconds after the file's modification time, never as a dead process: it is not deleted and no second server is started; after 60 seconds it is treated as dead. A process that did not create the PID file never writes to it. Only two writers exist: the process that made the reservation writes the child's PID, and the server itself (`--run-server`), when it starts, overwrites the file with its own PID (normally the same number; with a venv on Windows, the `python` that `Popen` starts can be a launcher that runs the real interpreter as its child, so the two numbers can differ). (If `_start_server` called `Popen` first and created the PID file afterwards, overwriting it when it existed, two hooks starting together would both launch a server — two model loads, the second one failing to bind, and a PID file that could name the process that failed.)
 1. Launch `python -m n3memorycore.n3memory --run-server` with `subprocess.Popen` as in "Clean CLI" below: stdout and stdin to `DEVNULL`, **stderr appended to `.memory/server.log`** (if the file is larger than 1 MB, truncate it before starting). The server is **detached** from the hook process so that it keeps running when the hook exits: on Windows `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW`, elsewhere `start_new_session=True`. **The working folder is the data folder (`HOME_DIR`)** (`cwd=_server_cwd()`). The server runs for days, and on Windows a process's working folder can be neither deleted nor renamed, so do not give it the folder of the hook that first started it (the user's project or a worktree). The exception is a source checkout run in place (the parent folder of this package is the current folder; "Safe import path" below then adds no `-P`): the child can find the package only there, so use that folder. Nothing in the server depends on its working folder. Give the child the data folder as an absolute path in `N3MC_HOME` (a relative value set by the user would point to another folder from the new working folder).
 2. Poll `/health` every 0.5 s for up to 60 seconds. **If the child process exits while waiting (`proc.poll() is not None`), stop waiting at once** — the port is held by a program other than N3MC, a dependency is missing, the DB cannot be opened, etc. **An answer counts only when it passes the same check as `ensure_server`**: `root` is this folder ("ok", or "stale" — this folder's server with other code, which the next call replaces). When another folder's server answers (two folders with the same `server_port` started at the same time, and the other one bound the port first), or a server that does not report its `root`, never use it: set `_FOREIGN_SERVER_ROOT`, emit `port_conflict` as in the table above, and go on without the server (saves go to `_buffer_direct`, no search). If any answer ended the wait, that call would send its search and save to the other folder's memory.
 3. On that early exit: emit the notice `server_start_failed` ("The N3MC memory server could not start (exit code <n>). See <path of server.log> for the reason."), write the time to `.memory/server_start_failed` (a marker file), delete the PID file if it holds the PID of the child that just exited, and proceed without the server (direct save / `memory search unavailable`). If `Popen` itself raises, proceed without the server as well (one stderr line; no notice or marker).
@@ -433,7 +456,7 @@ The CLI classifies the `/health` response as follows (`_health_decision(health)`
 
 #### Notices (`_notify`)
 
-Notices that require human action (`stale_server`, `port_conflict`, `server_start_failed`, `config_unreadable`, `config_type`, `db_corrupt`, `behavior_md_edited:<hash>`) are emitted with `_notify(key, message)`:
+Notices that require human action (`stale_server`, `port_conflict`, `server_start_failed`, `config_unreadable`, `config_type`, `db_corrupt`, `embed_model_mismatch`, `save_failed`, `behavior_md_edited:<hash>`) are emitted with `_notify(key, message)`:
 
 1. Print to stderr.
 2. Record `{"ts", "hook": "notice", "key", "message"}` in `audit.log` (only once for the same key and message).
@@ -531,6 +554,19 @@ Complete `config.json` schema (auto-initialize any missing fields with the defau
 ```
 Final Score = (cos_sim × 0.7 + keyword_relevance × 0.3) × time_decay × b_session
 ```
+
+**Function names (`core/processor.py`)**: the parts of the formula and of the search are these functions; the tests of §7 call them by these names and arguments:
+
+| Function | Returns |
+|---|---|
+| `cosine_sim_from_l2(l2_distance)` | `cos_sim` (below) |
+| `compute_time_decay(ts, half_life_days, now=None)` | `time_decay` (below). `ts` is the record's `timestamp` (ISO 8601; without a time zone it is read as UTC); `now` defaults to the current UTC time; a `ts` that cannot be read gives `1.0` |
+| `keyword_relevance(bm25, max_abs, threshold, small_db=False)` | `keyword_relevance` (below). `bm25` is the raw `bm25()` value, `max_abs` the largest `-bm25` of that table's results, `threshold` is `bm25_min_threshold`, `small_db` is true while `memories` holds 2 or fewer rows (the exception below) |
+| `b_session(record_session, current_session)` | `1.0` when both are equal and `current_session` is not `None`, otherwise `0.6` |
+| `combined_score(cos_sim, keyword_relevance, time_decay, b_session)` | the pair `(score, filter_score)` (table "`time_decay` and `b_session` order; they do not filter" below) |
+| `hybrid_search(conn, query, cfg, session_id=None, since=None, until=None)` | the whole search of §5 "Search Result Filtering and Ordering": `{"results", "pairs", "pairs_omitted"}` as in §4.5 "Response Format"; an empty query gives empty values |
+| `render_memory_context(query, data, notices=None)` | the `# Recalled Memory Context` text made from that `data` (§5), with `notices` (a list of messages) at the top |
+| `render_placeholder(text, notices=None)` | the output without results: the heading `# Recalled Memory Context`, a blank line, the notices, then the line `text` (for example `_(memory search unavailable: …)_`) |
 
 **cos_sim (Mathematical Correctness)**:
 
@@ -858,6 +894,8 @@ Users edit `config.json` by hand (e.g. to tune `vector_min_cos`), so assume it m
 | A value's type differs from the default (e.g. `"vector_min_cos": "0.83"` — a quoted number), or the value is outside its allowed range (table below) | Ignore **only that key** and use its default; use the other keys. Do not rewrite `config.json`. Emit the notice `config_type` naming the key ("<path of config.json>: these settings have a wrong type or a value out of range and were ignored (the defaults are used): <keys>. Write numbers without quotes.", where `<keys>` are the ignored keys, sorted and joined with `, `) |
 | Reads correctly | Add any missing IDs or default keys and save. Clear the `config_unreadable` and `config_type` notices |
 
+- **Both at once** (a value of a wrong type or out of range, and missing IDs or default keys): add the missing keys and save as in the last row, and leave the wrong value in the file as it is (it is not replaced by its default). That key alone still uses its default, and the `config_type` notice stays.
+
 - Type check (`_config_value_ok(key, value)`): if the default is a boolean, accept only booleans; if a string, accept only strings; numbers follow the table below (booleans are never numbers). Keys whose default is `None` (`owner_id`, `local_id`) and keys not in the defaults are not checked.
 
 **Allowed values**:
@@ -909,7 +947,7 @@ Bulk migrations inside `/repair` (vector re-indexing, FTS punctuation cleaning) 
 
 **Per-call limit for hooks**: `/repair` accepts an optional body `{"max_records": int}`. `--hook-submit` sends `{"max_records": 200}` (one batch), so a large backlog — e.g. many records saved through `_buffer_direct` while another folder's server held the port — is worked off a batch per turn instead of blocking one prompt for minutes. `n3mc --repair` sends no limit and processes everything. The one-time migrations (FTS punctuation cleaning, vector re-index) follow the same limit; their markers are written only when the migration has finished. **How the limit is counted**: `max_records` is one budget per call, shared in this order by the FTS punctuation cleaning, the FTS text rebuild (§3 "CJK bigram index") and the vector repair. Each step uses up the number of rows it **read**, whether or not it changed them, and a step that finds the budget used up does not run. The bigram fill is not limited (§3).
 
-The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`. **Carry on where the last call stopped**: write the last rowid done to the `meta` key `fts_punct_cursor` in the same transaction as each batch's rewrites; the next call starts after it, not at rowid 0 (so calls with `max_records` keep moving on, also across restarts). When the last row has been read, write `fts_punct_cleaned` and delete `fts_punct_cursor`. (Without the cursor, every call with a limit would start again at rowid 0, never reach row 201, and never write the marker.)
+The **FTS punctuation cleaning** is the exception: processed rows do not drop out of its result set (they are only UPDATEd), so `OFFSET 0` would never finish. Page it with a keyset instead: `WHERE rowid > <last rowid of the previous batch> ORDER BY rowid LIMIT 200`. **Carry on where the last call stopped**: write the last rowid done to the `meta` key `fts_punct_cursor` in the same transaction as each batch's rewrites; the next call starts after it, not at rowid 0 (so calls with `max_records` keep moving on, also across restarts). When the last row has been read, write `fts_punct_cleaned` and delete `fts_punct_cursor`. (Without the cursor, every call with a limit would start again at rowid 0, never reach row 201, and never write the marker.) **Which rows it rewrites**: a row was "indexed with punctuation" when its `memories_fts` row still contains a character matched by `_FTS_PUNCT_RE`. Only such a row is deleted from `memories_fts` and inserted again with `strip_fts_punctuation(fts_index_text(content))`, and each rewritten row counts in the `count` of `/repair`; other rows are read (they use up the budget) but not changed.
 
 ### Index metadata (`meta` table) and `--reembed`
 
@@ -977,7 +1015,7 @@ python -m n3memorycore.n3memory --recall-thread <turn_id> [--before N] [--after 
 - Defaults: `--before 2`, `--after 2`.
 - Uses the existing `idx_memories_turn_id` index. No new index required.
 - Output format matches `--list` (tab-separated; `--format jsonl` supported), ending with `Total: N records`.
-- **Which rows**: take the smallest and the largest `rowid` of the target turn. The N preceding turns are the N distinct `turn_id`s (not NULL, not the target) with the largest `MAX(rowid)` below the target's smallest rowid; the N following turns are those with the smallest `MIN(rowid)` above the target's largest rowid. Rows whose `turn_id` is NULL are never counted as a turn. Print every row of the selected turns in `rowid` order. When there is no DB file, print `No DB found at <path>` to stderr.
+- **Which rows**: take the smallest and the largest `rowid` of the target turn. The N preceding turns are the N distinct `turn_id`s (not NULL, not the target) with the largest `MAX(rowid)` below the target's smallest rowid; the N following turns are those with the smallest `MIN(rowid)` above the target's largest rowid. Rows whose `turn_id` is NULL are never counted as a turn. Print every row of the selected turns in `rowid` order. When there is no DB file, print `No DB found at <path>` to stderr and exit with status 1.
 - **`--format jsonl` keys**: `--list` prints one object per record with the keys `id, timestamp, agent_name, content`; `--recall-thread` prints `id, timestamp, agent_name, turn_id, content` (`ensure_ascii=False`). With `--format jsonl`, neither command prints the `Total:` line, so every line of stdout is one JSON object.
 - **Operational rule**: When the snippet returned by `--search` is insufficient, Claude SHOULD pass the hit's `turn_id` to `--recall-thread` to retrieve surrounding context. End users do not need to invoke this command directly.
 
@@ -1414,7 +1452,7 @@ Reads the UserPromptSubmit JSON from stdin. Claude Code sends `session_id`, `tra
   - **Why the interruption marker is skipped**: when the user interrupts, Claude Code writes a `user` line with the text `[Request interrupted by user]` (or `… for tool use]`) after the partial reply. Treating it as a prompt would stop the walk right there, and the interrupted reply — the case this lookup exists for — would never be found.
   - **Why the trailing line only**: if every real-prompt line whose text is the new prompt were skipped, then when the user interrupts a prompt before any reply text and sends the same text again, the walk would skip the interrupted prompt as well and return the reply of the exchange before it, which would then be saved again under the interrupted exchange's `turn_id`. When the transcript contains the current prompt, it is the newest line; a line with the same text behind an interruption marker or a reply is an earlier prompt.
   - Read at most the last 5 MB of the file (seek from the end), and treat any failure (missing path, unreadable file, unexpected structure) as "no previous response": write `{"hook": "UserPromptSubmit", "stage": "transcript_unreadable", "reason": "<short reason>"}` to `audit.log` and continue. An input without `transcript_path` is recorded the same way (`"reason": "no transcript_path"`). The transcript is only a recovery source; it must never make the hook fail.
-  - Save the response with the turn_id from `turn_id_<session>.txt` (the previous exchange), through the normal chunking (`purify_text` on the whole text, then `[claude]` / `[claude i/N]`). When the Stop hook already saved it, the chunks are identical and the exact-match check within the same `turn_id` (§5.4) skips every chunk, so nothing is stored twice.
+  - Save the response with the turn_id from `turn_id_<session>.txt` (the previous exchange; when the file is missing, with a new UUID4 that is not written to the file), through the normal chunking (`purify_text` on the whole text, then `[claude]` / `[claude i/N]`). When the Stop hook already saved it, the chunks are identical and the exact-match check within the same `turn_id` (§5.4) skips every chunk, so nothing is stored twice.
   - **Measured input**: the UserPromptSubmit inputs examined in the audit logs of the Pro and Free editions all had the keys `session_id, transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode, hook_event_name, prompt` (+ `session_title`), and none had `last_assistant_message`. The transcript lines carry `type`, `isSidechain` and `message.role` / `message.content` as described above.
 
 > **⚠️ Why**: Claude Code never sends `last_assistant_message` in the UserPromptSubmit input. If step 2 read it from there, the "Recovery path" of the Q-A contract would never run: a reply whose Stop hook did not run (interrupted turn, crash) would be neither in the DB nor in `audit.log`.
@@ -1508,7 +1546,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   2. `python -m n3memorycore.n3memory --stop` — prepares the AI behavioral guidelines and cleans up the old memory_context (see §4 "`--stop` Hook Specification").
 
   Total subprocesses per turn: `UserPromptSubmit` × 1 (`--hook-submit`) + `Stop` × 2 (`--save-claude-turn` + `--stop`) = 3 calls.
-- **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (both indexes checked, written as `m.rowid NOT IN (SELECT rowid FROM memories_vec)` and the same for `memories_fts`; **do not LEFT JOIN `memories_vec`**: in a join, sqlite-vec looks up the vec0 table once per `memories` row, about 0.5 ms per record on a file DB, so the check would grow with the DB — 0.5 s at 1,600 records, about 10 s at 20,000 — and, because `--hook-submit` calls `/repair` before every prompt, every prompt would wait that long even with nothing to repair. Each `NOT IN` subquery is read once: 3.6 ms at 1,600 records, the same rows as the join). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records (into `memories_fts`, and into `memories_fts_bi` when its row is missing too). Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired. **`count`**: the `count` of the `/repair` response and of the warning is the number of records this call actually changed — an FTS row cleaned or re-inserted, or a vector added. A record that was looked at but not changed (its embedding could not be computed and its FTS row was already there) is not counted. Counting every record looked at would make each call report `Repaired N record(s)` while the embedding model is unavailable, though it repaired none. **Two repairs at once**: the embeddings are computed outside any write transaction (§3.5 "No write lock while embedding"), so two repairs (two chats, a hook and `--repair`) may pick the same rows. Write each batch inside `BEGIN IMMEDIATE` and, for every row, check again there whether its `memories_fts` row and its `memories_vec` row already exist; insert only what is still missing. Without this the second repair would fail with `UNIQUE constraint failed on memories_vec primary key` (nothing would be lost).
+- **[Implementation Specs] Detection of unindexed data**: Detect records that exist in the `memories` table but not in `memories_vec` **or** `memories_fts` as unindexed data (both indexes checked, written as `m.rowid NOT IN (SELECT rowid FROM memories_vec)` and the same for `memories_fts`; **do not LEFT JOIN `memories_vec`**: in a join, sqlite-vec looks up the vec0 table once per `memories` row, about 0.5 ms per record on a file DB, so the check would grow with the DB — 0.5 s at 1,600 records, about 10 s at 20,000 — and, because `--hook-submit` calls `/repair` before every prompt, every prompt would wait that long even with nothing to repair. Each `NOT IN` subquery is read once: 3.6 ms at 1,600 records, the same rows as the join). Generate embeddings for vec-missing records and re-insert into FTS for fts-missing records (into `memories_fts`, and into `memories_fts_bi` when its row is missing too). Also runs the one-time FTS punctuation cleaning migration on first execution (see §3 "FTS punctuation stripping"). Output a warning only if 1 or more records were repaired (`n3mc --repair` prints `Repaired N record(s)` to stdout only when the count is 1 or more, and nothing when it is 0; `--hook-submit` prints `N3MC: Repaired N record(s)` to stderr). **`count`**: the `count` of the `/repair` response and of the warning is the number of records this call actually changed — an FTS row cleaned or re-inserted, or a vector added. A record that was looked at but not changed (its embedding could not be computed and its FTS row was already there) is not counted. Counting every record looked at would make each call report `Repaired N record(s)` while the embedding model is unavailable, though it repaired none. **Two repairs at once**: the embeddings are computed outside any write transaction (§3.5 "No write lock while embedding"), so two repairs (two chats, a hook and `--repair`) may pick the same rows. Write each batch inside `BEGIN IMMEDIATE` and, for every row, check again there whether its `memories_fts` row and its `memories_vec` row already exist; insert only what is still missing. Without this the second repair would fail with `UNIQUE constraint failed on memories_vec primary key` (nothing would be lost).
 ### 5.3 AI Behavioral Guidelines
 
 - **[AI Behavioral Guidelines] Fully Automatic Saving**: All conversations are automatically saved by hooks (UserPromptSubmit / Stop). Claude does not need to judge what to save or manually call `--buffer`. **Every non-empty user message and every non-empty Claude response is recorded in FULL, character-for-character, with no truncation.** There is no length filter (no `len(text) >= 10` / `>= 3` threshold) and no skip-pattern filter (no `_SKIP_PATTERNS` "ok / yes / thanks" routine-response filter). Short acknowledgements such as `ok` or `yes` are recorded like any other input.
@@ -1523,6 +1561,8 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Implementation Specs] Fatal failure warning**: Only when a DB write fails, or the DB record count does not change after INSERT, display the following prominently:
   > ⚠️ Physical save failed. Current memories may be lost.
 
+  The program prints (to stderr) this English sentence. The template of the behavior guidelines file (§4, `## Fatal-Failure Warning`) contains the same English sentence.
+
   When the direct save (`_buffer_direct`) fails as well, also call `_notify('save_failed', "A record could not be saved (<ErrorType>: <message>). Current memories may be lost; if it happens again, check that no other program holds the memory database.")`, so the next search output shows it (the warning on the hook's stderr is read by nobody). **Clearing it**: every save that ends `ok` or `skipped` — through the server (`/buffer`, `_save_record`) or `_buffer_direct` — calls `_clear_notice('save_failed')`. (If only a successful `_buffer_direct` cleared it, then after one failed direct save, saves through the server would succeed but the notice would be shown once a day for good.)
 - **[Implementation Spec] Context injection (stdout only)**: `--search` results must be **printed to stdout via `print()`**. Claude Code adds the stdout of the UserPromptSubmit hook to that turn's context. Without stdout output, Claude cannot see the search results and will respond "I don't have that memory" even when the data exists in the DB. **Do not write to `memory_context.md` or any other file** (§4 "Retirement of memory_context.md").
 - **[Implementation Spec] Output on every invocation (including degraded states)**: `cmd_search` MUST print to stdout on **every** invocation, regardless of outcome. Failure paths emit a degraded-state placeholder so the state of the memory layer is visible to Claude:
@@ -1532,7 +1572,9 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
   - **Successful results** → the rendered markdown (Top matches, then weak matches if any, then Q-A exchanges; §5 "Q-A Pairing Contract" 5).
   - In every case, any pending notices (§3 "Notices") are inserted right after the `# Recalled Memory Context` heading (right after the `Search query:` line in search results).
 - **[Implementation Spec] stdin input**: `--buffer` accepts `-` in place of a text argument to read from standard input (e.g., `cat file.txt | n3mc --buffer -`). Do NOT use `--buffer -` inside the Stop hook (`n3memorycore/n3mc_stop_hook.py`) — the Stop hook itself reads Claude Code's JSON from stdin, so using `-` would double-consume it and break the hook. `--buffer` also accepts an optional `--agent-id NAME` argument that sets the record's **`agent_name`** display label (e.g., `n3mc --buffer "text" --agent-id "claude-code"`). Despite its name it does not set `local_id`; the name is kept for compatibility (§3.7). A manual `--buffer` saves the text as **one record**: it is not chunked and gets no `[user]` / `[claude]` prefix and no `turn_id`.
-- **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `_CODE_BLOCK_RE` in `purify_text` / `_purify` substitutes closed fenced blocks only; inline code and unclosed fences are left untouched.
+- **[Implementation Specs] Fenced code blocks are substituted with `[code omitted]`**: Fenced code blocks are replaced with `[code omitted]` per documented product design: N3MemoryCore records conversation text, not source code. Inline backtick spans are preserved. All non-code content is stored verbatim (no length filter, no skip-pattern filter, see Complete-Recording Contract above). `purify_text` / `_purify` substitute closed fenced blocks only; inline code and unclosed fences are left untouched.
+  - **Fence definition**: an opening fence is a line that holds only a run of 3 or more backticks at the start of the line (up to 3 spaces before it) and an optional info string (without backticks). A closing fence is a line that holds only backticks, at least as many as the opening fence (spaces before and after are allowed; a `\r` at the end of the line counts as a space). Everything from the opening line to the first closing line after it is replaced by one `[code omitted]` (the newline after the closing line is kept). A `` ``` `` in the middle of a sentence (not at the start of a line) and a `` ``` `` line inside code that is shorter than the opening fence are not fences. An opening line that is never closed is not replaced: it stays as prose, and the search continues from the next line. `~~~` fences are not handled.
+    > **⚠️ Reason**: closing at the next `` ``` `` wherever it appears turns a `` ``` `` in prose into an opening fence, so the prose is replaced by `[code omitted]` and the code is kept. A `` ``` `` inside code closes the block there, so the prose between two blocks is lost.
   - **Purify the whole message, then chunk**: for both the user message and Claude's response, `purify_text` runs **once on the full text before `chunk_text`**. Chunking first and purifying each chunk does not work: a fence split across chunks, or a closing fence repeated in the 40-character overlap, pairs with the wrong opening fence, so prose between two code blocks would be replaced by `[code omitted]` and lost while the code of the second block was stored, and a code block longer than 400 characters would be stored as-is because its fences land in different chunks. The per-record purify in `/buffer` and `_buffer_direct` stays (it handles manual `--buffer`; after the whole-text pass no paired fence is left, so it changes nothing for hook records).
 - **[Customization] Language localization**: Not applicable. There are no skip patterns (`_SKIP_PATTERNS`), by the complete-recording contract; there is nothing language-specific to localize in the hook filter layer.
 - **[Implementation Specs] Deduplication & HTTP-failure fallback**:
@@ -1544,7 +1586,7 @@ N3MC is marketed as **complete preservation** (完全保存). The hook write pat
 - **[Implementation Specs] HTTP timeout**: `_post()` uses a 30-second timeout for HTTP requests to the server. This accommodates CPU-based embedding inference which can take 4–5 seconds under load.
 - **[Implementation Specs] Other waits**: `/health` and `/shutdown` requests time out after 5 seconds. After asking a server to stop, wait until its port is free for at most 15 seconds, polling every 0.3 seconds; a process that must be ended is `terminate()`d, waited for 5 seconds, then `kill()`ed. `/shutdown` answers first and ends the process 0.3 seconds later. The PID file is removed only when it still holds the number of the process that was stopped. uvicorn runs with `log_level='error'`.
 - **[Implementation Specs] `turn_id_<session>.txt` file name**: `<session>` is the hook's `session_id` with every character outside `[a-zA-Z0-9_-]` replaced by `_`, cut to the first 64 characters. The value comes from the hook's JSON, so it must never reach the file system unchanged (a path separator in it would leave `.memory/`).
-- **[Implementation Specs] audit.log `raw`**: in `{"ts", "hook", "raw", "payload"}`, `raw` is only the **first 4,096 characters** of stdin; `payload` is the parsed JSON in full. When stdin is not JSON, `payload` is `{"raw": <the whole stdin>}`. Writing the whole input into `raw` as well would make the log grow about twice as fast.
+- **[Implementation Specs] audit.log `raw`**: in `{"ts", "hook", "raw", "payload"}`, `raw` is only the **first 4,096 characters** of stdin; `payload` is the parsed JSON in full. When stdin is not JSON, `payload` is `{"raw": <the whole stdin>}`. Writing the whole input into `raw` as well would make the log grow about twice as fast. The record is written with `json.dumps(record, ensure_ascii=True)` (with `ensure_ascii=False`, an input that contains a lone surrogate — for example one read from a JSON escape such as `"\ud83d"` — makes the write raise `UnicodeEncodeError`, and no line is kept).
 - **[Implementation Specs] Reading a config.json that was just created**: exclusive creation makes the file first and writes it a moment later, so a second hook that starts at the same time can read an empty file. `_read_config_file()` therefore reads again, every 0.05 seconds and at most 20 times, **only while the file's modification time is less than 2 seconds old**; an older file that does not parse fails at once (`config_unreadable`). Without this, the second hook of the very first turn reports `config_unreadable` and saves that turn under a temporary ID.
 - **[Implementation Specs] Exit status of the hook entry points**: `n3mc_hook.py` exits with the exit status of `--hook-submit`; `n3mc_stop_hook.py` exits with the exit status of `--save-claude-turn` (the result of `--stop` is not used).
 - **[Implementation Specs] `/buffer` answering 200 with an error**: when the record count did not grow after the INSERT, `/buffer` returns `{"status": "error", "message": "record count did not change after INSERT"}` with HTTP 200. The CLI treats a `status` of `error` like an HTTP failure and falls back to `_buffer_direct`.
@@ -1611,7 +1653,7 @@ If `embed_query` raises an exception (model not loaded, GPU failure, etc.), the 
 
 ### Top-K Chunk-Duplication Cap
 
-When a long Claude turn is split into many chunks, hybrid search can fill the entire Top-K with sibling chunks of one `turn_id`. To prevent this, the result-shaping stage of `hybrid_search` enforces **a per-`turn_id` cap of at most 2 chunks** in the Top-K list; subsequent siblings are dropped from Top-K (they remain available in the `pairs` Q-A section). Records with `turn_id` NULL (manual `--buffer` etc.) are exempt from the cap.
+When a long Claude turn is split into many chunks, hybrid search can fill the entire Top-K with sibling chunks of one `turn_id`. To prevent this, the result-shaping stage of `hybrid_search` enforces **a per-`turn_id` cap of at most 2 chunks** in the Top-K list; subsequent siblings are dropped from Top-K. A dropped chunk appears in the injected context only when its exchange is selected for `pairs` (the Q-A siblings; the top `pair_top_n` exchanges) and the chunk fits within `pair_max_chars` (§5 "Q-A Pairing Contract" 4). Otherwise it does not appear in the injected context, and the full exchange is read with `--show-turn <turn_id>` (for an exchange cut from `pairs`, the omission line shows this command). Records with `turn_id` NULL (manual `--buffer` etc.) are exempt from the cap.
 
 ### Search Result Filtering and Ordering
 
@@ -1623,7 +1665,7 @@ After computing scores, `hybrid_search` shapes the results in the following orde
 3. **Ordering versions of the same content (`_order_versions_newest_first`, when `version_order_enabled` is true)**: Recreating settings can surface both the old and new versions, with the old one ranked higher. Since Q-A injection fills from the top up to `pair_max_chars`, only the old version might get in. Therefore:
    - For each turn_id in the results, the representative is the embedding (already stored in `memories_vec`) of the exchange's "first `[claude` row whose content is at least `version_min_chars` (100) characters". Exchanges without a representative and results without a turn_id are excluded.
    - If the representatives of **different turn_ids** have cos similarity ≥ `version_sim_threshold` (0.98), treat them as versions of the same content and group them (linked transitively).
-   - Within each group, reorder the exchanges newest first (descending `(timestamp, id)` of each exchange's first row; `id` is UUIDv7, so the order is determined even within the same second). **The result positions and the scores at those positions stay as they are**; only the rows placed into those positions are swapped (the newest version inherits the group's highest score). The order of rows within the same exchange is not changed.
+   - Within each group, reorder the exchanges newest first (descending `(timestamp, id)` of each exchange's first row; `id` is UUIDv7, so the order is determined even within the same second). **The result positions and the scores at those positions stay as they are** (`filter_score` stays with its position, like `score`); only the rows placed into those positions are swapped (the newest version inherits the group's highest score). The order of rows within the same exchange is not changed.
    - Reordered rows are tagged with `_version_group`. **No record is deleted.**
    - Basis for 0.98 (measured with multilingual-e5-base): old vs. new version of the same settings 1.0; settings of the same shape but different content 0.88–0.91; different items within one reply up to 0.95. **Do not compare by the question text alone** ("create settings for X" vs. "create settings for Y" score 0.985).
    - Limitations: exchanges that share only their opening may be treated as versions. A new version that does not rewrite the whole text (the representative chunk unchanged) is not detected.
@@ -1652,7 +1694,7 @@ After implementation is complete, autonomously resolve the following tests and r
 > - Make only the data folder temporary. Even when `HOME` / `USERPROFILE` are changed, keep `HF_HOME` pointing at the real model cache (`~/.cache/huggingface`), so the model (about 1.1 GB) is not downloaded again.
 > - While fixing, run only the pytest files (§7) that concern the change; run the whole suite once, at the end.
 
-> **Definition of "implementation complete"**: Autonomously execute tests 1–6 below → run `n3mc --init` (displays "saving will start from the next session") → run test 7.1 (hook registration check) → report ⭐⭐⭐⭐⭐. Tests 7.2 and 7.3 need a new session opened outside the project, so they are checked after Claude Code is restarted (report them as "to be checked after restart", not as failures). Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All of these steps must finish before the implementation is considered done.
+> **Definition of "implementation complete"**: Autonomously execute tests 1–6 below → run `n3mc --init` (displays "saving will start from the next session") → run test 7.1 (hook registration check) → report ⭐⭐⭐⭐⭐. Tests 7.2 and 7.3 need a new session opened outside the project, so they are "checks after restart": they are not part of the conditions for completion, and are not counted as "unchecked" or as failures in the report (in the report, mention them only as 1–2 lines on what the user can look at after restarting). Tests 8–10 are verified automatically through live session activity (`--search` output, hook firing, conversation turns). All of these steps must finish before the implementation is considered done.
 
 > **Shape of the completion report**: so that the user does not miss the restart, write the completion report in this shape.
 > - At the **very top**, put the heading `## ⚠️ Claude Code must be restarted`, with the restart steps right below it. Test results and notes come after that. **The first line of the report must be this heading**; put nothing such as "Implementation complete" before it.
@@ -1675,10 +1717,12 @@ After implementation is complete, autonomously resolve the following tests and r
    ```
 
    - The columns are joined with a single tab (`\t`), not spaces.
-   - "First 80 characters of content" means `content[:80]` — the leading 80 characters of the **full content string**, NOT of the first line. Newlines (`\n`, `\r`) within those 80 characters MUST be replaced with a single space so the tab-separated layout stays on one line per record.
+   - "First 80 characters of content" means `content[:80]` — the leading 80 characters of the **full content string**, NOT of the first line. Newlines (`\n`, `\r`) within those 80 characters MUST be replaced with a single space so the tab-separated layout stays on one line per record. A tab (`\t`) within them is replaced with a single space as well, so every line keeps exactly four columns.
    - If `agent_name` is `NULL`, render it as `-`.
    - Records are printed in ascending `rowid` order (the order in which they were saved).
    - Output the total record count `Total: N records` at the end.
+   - `--format` takes `tsv` (the default, this format) or `jsonl` (§3.6 "`--format jsonl` keys").
+   - When there is no DB file, print `No DB found at <path>` to stderr (nothing to stdout) and exit with status 1.
    - Statically confirm during code review that `write_buffer`, `batch_insert`, asynchronous writes, and deferred COMMITs are absent.
 
 3. **Real Person Test (Historical Data)**: After saving text about a real historical figure, run `--search` with that person's name and confirm that the relevant record appears **within the top 3 results** as the pass criterion. Additionally, verify that `--search` results are **printed to stdout** (visible in the terminal). If stdout is empty, this test fails.
@@ -1694,15 +1738,15 @@ After implementation is complete, autonomously resolve the following tests and r
    - Japanese example: save `架空の惑星「アルファ9」の気温設定`, search with `アルファ9の気温`
    - Additionally, run `--search` with a query containing symbols (e.g. `C:\Users\test #tag = @a * $b % AND OR NOT "q"`) and confirm that it **does not error** (no `memory search unavailable` on stdout) and returns results (§3 "Quoting each term is mandatory").
 
-6. **--repair FTS Migration Test**: Delete the `fts_punct_cleaned` row of the `meta` table (`sqlite3 ~/.n3mc/.memory/n3memory.db "DELETE FROM meta WHERE key='fts_punct_cleaned'"`), then run `n3mc --repair` and verify the following:
+6. **--repair FTS Migration Test**: Delete the `fts_punct_cleaned` row of the `meta` table (`python -c "import os,sqlite3; c=sqlite3.connect(os.path.expanduser('~/.n3mc/.memory/n3memory.db')); c.execute('DELETE FROM meta WHERE key=?', ('fts_punct_cleaned',)); c.commit()"`), then run `n3mc --repair` and verify the following:
    - FTS cleaning is executed (if punctuated records exist, the count is reported)
    - The `meta` row `fts_punct_cleaned` is written again
    - Running `n3mc --repair` again skips FTS cleaning (full-table scan is avoided due to the key)
 
-7. **Hook integration test**: Verify the following within a Claude Code session:
+7. **Hook integration test**: Verify 7.1 within a Claude Code session. 7.2 and 7.3 are "checks after restart": the generating Claude does not run them (the user checks them in a new session after restarting; they are not part of the conditions for completion, and are not counted as "unchecked" or as failures in the report).
    1. **Global hook registration is in place** (mandatory gate — see §4 ① "Mandatory automated step"). Run:
       ```bash
-      python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); h=s.get('hooks',{}); assert any('n3memorycore.n3mc_hook' in c.get('command','').lower() or 'n3mc-hook' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3memorycore.n3mc_stop_hook' in c.get('command','').lower() or 'n3mc-stop-hook' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; assert 'Bash(python -m n3memorycore.n3memory --search *)' in s.get('permissions',{}).get('allow',[]), 'permission rules missing'; print('OK')"
+      python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'), encoding='utf-8')); h=s.get('hooks',{}); assert any('n3memorycore.n3mc_hook' in c.get('command','').lower() or 'n3mc-hook' in c.get('command','').lower() for e in h.get('UserPromptSubmit',[]) for c in e.get('hooks',[])), 'UserPromptSubmit hook missing'; assert any('n3memorycore.n3mc_stop_hook' in c.get('command','').lower() or 'n3mc-stop-hook' in c.get('command','').lower() for e in h.get('Stop',[]) for c in e.get('hooks',[])), 'Stop hook missing'; assert 'Bash(python -m n3memorycore.n3memory --search *)' in s.get('permissions',{}).get('allow',[]), 'permission rules missing'; print('OK')"
       ```
       Pass criterion: prints `OK` (the check looks for this package's entry point or module, so another edition's `n3mc_hook.py` does not satisfy it, and for the §4 ② permission rules). If this assertion fails, **the implementation is not complete** — run `n3mc --init` (Method B) or re-run the idempotent installer (Method A) in §4 ① before continuing. Without this gate, the next two sub-tests will appear to pass when run from inside the project directory (where local hooks may exist or developers run hooks manually) yet fail silently for any session the user opens elsewhere — exactly the cross-session RAG failure this gate exists to prevent.
    2. **UserPromptSubmit**: From a Claude Code session running **outside the n3mc-free project directory** (e.g. `~`), send a user message and confirm that `# Recalled Memory Context` is included in that turn's context (the hook's stdout). Confirm that both the preceding Claude response (read from the transcript when Stop did not save it, §4.5) and the user message are saved to the DB (check `n3mc --list` for records with `[claude]` and `[user]` prefixes). The "outside the project directory" stipulation is essential — running the test from inside the project would mask a missing global registration.
@@ -1711,7 +1755,7 @@ After implementation is complete, autonomously resolve the following tests and r
 8. **stdout output test (no memory_context.md)**: Run `--search` and confirm that results are **printed to stdout** and that `~/.n3mc/.memory/memory_context.md` is **not created**.
 
 9. **Complete-Recording Test**: Verify that the filters described below do not exist and that every non-empty input is recorded:
-    - Pass a 2-character string with `[claude]` prefix via `--hook-submit` and confirm the **record IS saved**. (There is no `len(text) >= 3` filter.)
+    - Pass a Stop-hook JSON whose `last_assistant_message` is a 2-character string to `--save-claude-turn` and confirm the **`[claude]` record IS saved**. (There is no `len(text) >= 3` filter. `--hook-submit` saves its prompt as `[user]`, so a `[claude]` record is checked through the Stop path.)
     - Pass a 5-character string with `[user]` prefix via `--hook-submit` and confirm the **record IS saved**. (There is no `len(text) >= 10` filter.)
     - Pass a routine response (e.g., `ok`, `yes`, `thanks`) as `[user]` and confirm the **record IS saved**. (There is no `_SKIP_PATTERNS` filter.)
     - Verify that an `audit.log` entry is written for every hook invocation, independent of whether the buffer write succeeds (the hook modules write this record, so check it through the `n3mc-hook` / `n3mc-stop-hook` entry points; calling `--hook-submit` directly does not write it).
@@ -1754,7 +1798,8 @@ n3mc-free/
     └── test_index_meta.py             # Layer 5: meta table, model mismatch notice, --reembed (no model needed)
 ```
 
-**Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520). **Replacing HOME also moves the Hugging Face cache, so `TestEmbedding` and the like would download the embedding model (about 1.1 GB) again into a temporary folder for every test.** Pin `HF_HOME` in the fixture to the real cache from before the replacement (the value of `HF_HOME` if it is set, otherwise `~/.cache/huggingface`).
+**Protect real data (mandatory)**: Put an autouse fixture in `conftest.py` that points `HOME_DIR`, `MEMORY_DIR`, `DB_PATH`, `PID_FILE`, `AUDIT_LOG`, `NOTICES_FILE`, `CONFIG_FILE`, `TURN_ID_FILE`, `SERVER_LOG` and the server-start marker of the `n3memory` module — **and the `AUDIT_LOG` of the hook modules** (`n3mc_hook`, `n3mc_stop_hook`) — to a temporary folder, point the user's `~/.claude/settings.json` used by `--init` to a temporary file (e.g. by setting `HOME` / `USERPROFILE` for the test), and replaces `_request_shutdown` and the HTTP senders (`_post`, `_get`) with fakes that never reach a real server. Tests must never write to `notices.json` or `audit.log` in the real `~/.n3mc`, nor send `/shutdown` to the real server (18520).
+ **Replacing HOME also moves the Hugging Face cache, so `TestEmbedding` and the like would download the embedding model (about 1.1 GB) again into a temporary folder for every test.** Pin `HF_HOME` in the fixture to the real cache from before the replacement (the value of `HF_HOME` if it is set, otherwise `~/.cache/huggingface`).
 
 Standard fixture import style:
 
@@ -1786,16 +1831,16 @@ python -m pytest tests/ -v
 
 **`test_dedup_concurrent.py` (3 tests; no model needed)**: `TestDedupConcurrent` — `concurrent_same_turn_saved_once` (two threads with a barrier call the `/buffer` handler with the same text and `turn_id`: one row, one `ok` and one `exact_duplicate`), `same_text_other_turn_still_saved` (the same text with another `turn_id` is saved twice), `insert_memory_once_returns_none_for_a_duplicate` (the second insert of the same text and `turn_id` returns `None`, leaves no open transaction, and the DB has one row).
 
-### Layer 2: `test_processor.py` (24 tests)
+### Layer 2: `test_processor.py` (26 tests)
 
 | Test Class | Tests | Coverage |
 |---|---|---|
 | `TestCosineSim` | `identical_vectors`, `orthogonal_vectors`, `negative_clamped`, `midpoint` | L2→cosine conversion |
 | `TestTimeDecay` | `current_time_is_one`, `half_life`, `floor_value`, `bad_timestamp_returns_one` | Half-life decay |
 | `TestKeywordRelevance` | `below_threshold_is_zero`, `full_relevance`, `partial_relevance`, `zero_max` | BM25 normalization |
-| `TestPurification` | `code_block_replaced`, `inline_code_preserved`, `multiple_blocks_replaced`, `no_code_block_unchanged` | Fenced code blocks → `[code omitted]`; inline code preserved |
+| `TestPurification` | `code_block_replaced`, `inline_code_preserved`, `multiple_blocks_replaced`, `no_code_block_unchanged`, `backticks_in_prose_are_not_a_fence`, `backticks_inside_code_do_not_close` | Fenced code blocks → `[code omitted]`; inline code preserved. Pairing of fences (§5.4 "Fence definition"): `"To start a block type ``` then the language\nSome explanation that matters.\n```python\nprint(1)\n```\nAfter."` becomes `"To start a block type ``` then the language\nSome explanation that matters.\n[code omitted]\nAfter."` (the explanation is kept, the code is not). `"First:\n```python\nprint(\"```\")\n```\nText between the blocks.\n```python\ny = 2\n```\nEnd."` becomes `"First:\n[code omitted]\nText between the blocks.\n[code omitted]\nEnd."` (the prose between the blocks is kept). A `` ``` `` line inside a block opened with 4 backticks does not close it |
 | `TestEmbedding` | `passage_embedding_shape`, `query_embedding_shape`, `same_text_similar` | Embedding model |
-| `TestRefresh` | `exact_duplicate_not_inserted`, `below_threshold_not_duplicate` | Duplicate handling (exact match only) |
+| `TestRefresh` | `exact_duplicate_not_inserted`, `near_identical_not_duplicate` | Duplicate handling (exact match only) |
 | `TestBiasScoring` | `session_match`, `session_mismatch_lower`, `full_score_formula` | Ranking formula (`b_session` only; Free has no `b_local`) |
 
 - `floor_value`: a record 3,650 days old (`half_life_days` 90) still has a `time_decay` above 0 (and below `1e-10`): there is no lower bound, and age never makes the weight 0.
@@ -1814,7 +1859,7 @@ python -m pytest tests/ -v
 | `TestGC` | `gc_returns_403`, `gc_detail_is_pro` | Pro-only endpoint → 403 |
 | `TestImport` | `import_returns_403`, `import_with_data_returns_403`, `import_detail_is_pro` | Pro-only endpoint → 403 |
 
-### Layer 4: `test_hooks.py` (23 tests) and `test_hooks_encoding.py` (10 tests)
+### Layer 4: `test_hooks.py` (23 tests) and `test_hooks_encoding.py` (12 tests)
 
 | Test Class | Tests | Coverage |
 |---|---|---|
@@ -1826,6 +1871,7 @@ python -m pytest tests/ -v
 | `TestSanitizerUnit` | `strips_lone_high_surrogate`, `strips_lone_low_surrogate`, `clean_japanese_unchanged`, `complete_emoji_pair_preserved`, `recursive_dict`, `recursive_list`, `none_passthrough` | Surrogate stripping (`test_hooks_encoding.py`) |
 | `TestSanitizedAcceptedBySQLite` | `sanitized_text_inserts_without_unicode_error` | 〃 |
 | `TestPurifyAppliesSanitization` | `purify_strips_surrogates_alongside_code_blocks`, `purify_handles_empty` | 〃 |
+| `TestAuditLogLoneSurrogate` | `hook_keeps_one_line`, `stop_hook_keeps_one_line` | With a lone surrogate in the prompt (the JSON escape `"\ud83d"`), `main()` of `n3mc_hook` and of `n3mc_stop_hook` still keeps one line in `audit.log`; the line parses as JSON and the prompt in `payload` is as given; no write failure on stderr (§5.4 "audit.log `raw`") |
 
 > The counts above cover Layers 1–4; the other tests are in Layer 5 only, so these tables stay valid; if a regenerated suite differs, the class and test names here are what to match, not the counts.
 
@@ -1837,9 +1883,6 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 |---|---|
 | `TestFtsQuoting` | Queries containing `\ / # = @ * $ %`, `AND/OR/NOT`, `"`, or control characters do not raise; terms containing symbols are hit; `hybrid_search` continues when `search_fts` raises; terms are joined with `OR` (a sentence-like query hits a record that contains only some of its words); terms under 3 characters (`AI`, `東京`) are dropped and a query of only such terms skips FTS; punctuation in the query splits terms (`「アルファ9」の気温は？` hits `架空の惑星「アルファ9」の気温設定`); at most 40 terms; CJK words of 4+ characters become 3-character grams |
 | `TestFtsIndexWords` | Words written by N3MC are not indexed. After `insert_memory` of `[user] 今日の天気は晴れでした`, `[claude] 晴れの日は散歩がおすすめです`, `[user] ログの調べ方を教えて`, `[claude] 次のコマンドを実行します\n[code omitted]`, `[user] 設定ファイルの場所は?`, `[claude] 設定は ~/.n3mc/config.json にあります`, `[user] ブラウザの拡張を作りたい` and `[claude] 白樺の記憶の設定です`, `search_fts` returns 0 rows for `code`, `omitted` and `user`, and for `Claude Code の設定` returns only the one row `白樺の記憶の設定です` (not the `散歩` answer and not the code-block row). The stored `content` keeps `[code omitted]` and the prefix. `[Alpha-9]` typed by the user and a `[claude]` in the middle of a sentence stay indexed and are hit by search |
-| `test_search_port.py` | A Japanese sentence without spaces hits a record containing its words; hiragana-only grams are dropped; symbol-only and 2-character queries do not raise; `bigram_text('N3MCの設定')` is `N3MC の設 設定`; `記憶` and `PR` hit through the bigram index (and through `hybrid_search`); a failing bigram search keeps the trigram results; `delete_memory` leaves no bigram row; `--repair` fills the bigram rows of an old DB once (two runs, one row per record); `<agent-message from=...>` and `<system-reminder>` prompts are neither saved nor searched and keep `turn_id`, while a user question starting with `<agent-message` or `<div>` is not skipped; the reply re-rank is off by default, moves the exchange with the closer reply up when on, and returns its input on a DB error. Rows `[claude] …` and `[user] …` do not match the questions `claude` / `user` in either FTS table, and a row containing `[code omitted]` does not match the question `code`; a `[claude]` in the middle of the text does match. |
-| `test_index_meta.py` | with `memories_vec` recreated as `float[384]` and the three `meta` rows deleted, `--reembed` with a 384-dimensional stand-in model succeeds, the vector count equals the record count and `embed_dim` is 384; a model whose dimension really differs changes nothing and exits 1; `init_db` creates `meta`; `/repair` writes `fts_punct_cleaned` / `fts_bigram` / `embed_model` / `embed_dim`; a restored older database (no `meta` keys) next to v1.7.0 marker files gets its bigram index filled; `embed_model` comes from `vec_model.txt` only when vectors exist; a mismatch emits `embed_model_mismatch` and a match clears it; `--reembed` replaces every vector with the configured model's, writes `embed_model`, clears the notice, resumes from `reembed_cursor`, and refuses a model of another dimension without changing anything. On a DB without `fts_text_rules`, `/repair` rebuilds old FTS rows that hold prefixed text with the text of `fts_index_text` and writes `fts_text_rules` (a second run changes nothing); calls with `max_records` continue from `fts_text_cursor` |
-| `test_chunk_and_hook_paths.py` | No chunk is longer than `max_chars` (paragraph and sentence paths, `max_chars` 400 and small values, Japanese text); `chunk_text('x' * 10 + '\n\n' + 'y' * 400)` keeps all 410 letters and returns chunks of at most 400; `is_own_hook` recognizes `C:\Tools\n3mc-hook.exe` and `C:\Tools\n3mc-stop-hook.exe` written with backslashes and no quotes, and `--init` then replaces such an entry instead of adding a second one |
 | `TestVectorFilter` | A search with `since` returns in-range records even if they are outside the global KNN top; falls back to exact computation when `rowid IN` is unavailable |
 | `TestNoSimilarityDedup` | Similar chunks (cos ≥ 0.95) are all saved; exact matches within the same `turn_id` are skipped; exact matches in a different `turn_id` are saved; without `turn_id`, exact matches are skipped globally |
 | `TestSearchShaping` | Candidates below `vector_min_cos` are discarded; relative cutoff; `_version_group` rows survive the cutoff; the newer version comes first; identical content is collapsed; `pair_top_n`, `pair_max_chars`, and `pairs_omitted`; a 30-day-old record from another session with high similarity survives the relative cutoff while a current-session record with lower similarity is present; a keyword-only hit from another session survives `min_score`; the order is still by the final score (current session first); a 400-day-old record with high similarity is returned even when it is the only candidate (`min_score` and the relative cutoff ignore `time_decay`); when a new and a 400-day-old record with the same similarity are both present, both are returned and the new one comes first |
@@ -1864,6 +1907,31 @@ Embeddings are replaced with deterministic fake vectors built from `zlib.crc32` 
 | `TestPackaging` | `psutil` is listed in `pyproject.toml` `dependencies` |
 | `TestRepairLocking` | `BUSY_TIMEOUT_SECONDS` is 10; while `/repair` embeds a batch (stand-in model 0.2 s per record), another connection gets `BEGIN IMMEDIATE` within 0.5 s; two repairs started together on the same unindexed rows both end without an error and leave one vector per row; `_start_server` does not use a server whose `/health` reports another folder (`port_conflict`, returns False) |
 | `TestWeakMatches` | With one result passing the floors and `min_results: 3`, two weak rows are added, ordered by `filter_score`, marked `"weak": true` in `/search` and placed after the normal row; a candidate below `vector_min_cos` is added with its actual cos (its `filter_score` uses that cos); `min_results: 0` adds nothing; nothing is added when enough results pass; `search_result_limit` smaller than `min_results` caps the total; a weak candidate identical to a result row, or from a `turn_id` that already has 2 rows, is skipped; a candidate with `filter_score` below `1e-6` (an orthogonal vector) is never added; weak rows are not used for `pairs`; an empty query returns no weak rows |
+
+### Layer 5: `test_search_port.py` (no model needed)
+
+| Test Class | Tests |
+|---|---|
+| `TestJapaneseFts` | A Japanese sentence without spaces hits a record containing its words; hiragana-only grams are dropped; symbol-only and 2-character queries do not raise |
+| `TestBigramIndex` | `bigram_text('N3MCの設定')` is `N3MC の設 設定`; `記憶` and `PR` hit through the bigram index (and through `hybrid_search`); a failing bigram search keeps the trigram results; `delete_memory` leaves no bigram row; `--repair` fills the bigram rows of an old DB once (two runs, one row per record) |
+| `TestSystemInputs` | `<agent-message from=...>` and `<system-reminder>` prompts are neither saved nor searched and keep `turn_id`, while a user question starting with `<agent-message` or `<div>` is not skipped |
+| `TestReplyRerank` | The reply re-rank is off by default, moves the exchange with the closer reply up when on, and returns its input on a DB error |
+| `TestRolePrefixNotIndexed` | Rows `[claude] …` and `[user] …` do not match the questions `claude` / `user` in either FTS table, and a row containing `[code omitted]` does not match the question `code`; a `[claude]` in the middle of the text does match |
+
+### Layer 5: `test_index_meta.py` (no model needed)
+
+| Test Class | Tests |
+|---|---|
+| `TestMetaTable` | `init_db` creates `meta`; `/repair` writes `fts_punct_cleaned` / `fts_bigram` / `embed_model` / `embed_dim`; a restored older database (no `meta` keys) next to v1.7.0 marker files gets its bigram index filled; `embed_model` comes from `vec_model.txt` only when vectors exist; a mismatch emits `embed_model_mismatch` and a match clears it |
+| `TestReembed` | With `memories_vec` recreated as `float[384]` and the three `meta` rows deleted, `--reembed` with a 384-dimensional stand-in model succeeds, the vector count equals the record count and `embed_dim` is 384; a model whose dimension really differs changes nothing and exits 1; `--reembed` replaces every vector with the configured model's, writes `embed_model` and clears the notice; it resumes from `reembed_cursor` |
+| `TestFtsTextRules` | On a DB without `fts_text_rules`, `/repair` rebuilds old FTS rows that hold prefixed text with the text of `fts_index_text` and writes `fts_text_rules` (a second run changes nothing); calls with `max_records` continue from `fts_text_cursor` |
+
+### Layer 5: `test_chunk_and_hook_paths.py` (no model needed)
+
+| Test Class | Tests |
+|---|---|
+| `TestChunkLimit` | No chunk is longer than `max_chars` (paragraph and sentence paths, `max_chars` 400 and small values, Japanese text); `chunk_text('x' * 10 + '\n\n' + 'y' * 400)` keeps all 410 letters and returns chunks of at most 400 |
+| `TestWindowsHookPaths` | `is_own_hook` recognizes `C:\Tools\n3mc-hook.exe` and `C:\Tools\n3mc-stop-hook.exe` written with backslashes and no quotes, and `--init` then replaces such an entry instead of adding a second one |
 
 ### Safe import path: `test_safe_path.py` (no model needed)
 
