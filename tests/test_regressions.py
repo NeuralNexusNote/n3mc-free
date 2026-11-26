@@ -2118,3 +2118,37 @@ class TestBackupInitRepairReembedNotices:
         os.utime(p, (old, old))
         n3memory._housekeeping()
         assert not os.path.exists(p)
+
+
+class TestTranscriptUnicodeLineBreaks:
+    """Transcript lines end at LF only: a reply with a raw U+2028 / U+2029 / U+0085 is recovered whole."""
+
+    def _raw(self, tmp_path, objs, newline="\n", prefix=b""):
+        p = tmp_path / "raw.jsonl"
+        body = newline.join(json.dumps(o, ensure_ascii=False) for o in objs) + newline
+        p.write_bytes(prefix + body.encode("utf-8"))
+        return str(p)
+
+    @pytest.mark.parametrize("sep", [" ", " ", "\u0085"])
+    def test_raw_separator(self, monkeypatch, tmp_path, capsys, sep):
+        n3memory._write_turn_id("s1", "T1")
+        reply = f"first part{sep}second part"
+        tr = self._raw(tmp_path, [_u("q1"), _a(_t(reply)), _u("q2")])
+        assert sep.encode("utf-8") in open(tr, "rb").read()
+        assert n3memory._read_prev_reply(tr, "q2") == (reply, None)
+        hooks = TestHookSubmit()
+        hooks._submit(monkeypatch, "q2", tr)
+        assert hooks._claude_rows() == [("[claude] " + reply, "T1")]
+
+    def test_lf_and_crlf(self, tmp_path):
+        tr = self._raw(tmp_path, [_u("q1"), _a(_t("line 1\nline 2")), _u("q2")])
+        assert n3memory._read_prev_reply(tr, "q2") == ("line 1\nline 2", None)
+        tr = self._raw(tmp_path, [_u("q1"), _a(_t("crlf reply")), _u("q2")], newline="\r\n")
+        assert n3memory._read_prev_reply(tr, "q2") == ("crlf reply", None)
+
+    def test_cut_first_line_and_broken_lines(self, monkeypatch, tmp_path):
+        prefix = (b'{"type": "assistant", "message": {"content": [{"type": "text", "text": "cut"}]}}\n'
+                  b"not json\n")
+        tr = self._raw(tmp_path, [_u("q1"), _a(_t("tail reply")), _u("q2")], prefix=prefix)
+        monkeypatch.setattr(n3memory, "TRANSCRIPT_TAIL", os.path.getsize(tr) - 10)
+        assert n3memory._read_prev_reply(tr, "q2") == ("tail reply", None)
