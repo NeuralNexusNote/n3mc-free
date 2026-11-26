@@ -2014,6 +2014,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 ## Appendix: Recommended Development Workflow
 
+> **Generate in the main session; do not delegate to subagents.** The AI that implements this specification writes the code, the tests and every change to them itself, in the session the user is watching. Do not hand the implementation, a regeneration, the fixes or the tests to subagents (background agents, the Task / Agent tools): a subagent sees only the brief it is given, not this whole specification and the user's intent, it cannot ask the user, and its report sounds equally sure whether it is right or wrong. Use subagents only for read-only work (searching, comparing, reviewing), and check their findings in the main session before anything is changed.
+
 > **This appendix is a guide for the human operator.** Copy the prompts inside ``` blocks and paste them into Claude Code. The AI will NOT automatically proceed to the next phase.
 
 | Phase | What you do | Model to use |
