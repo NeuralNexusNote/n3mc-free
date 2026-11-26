@@ -1853,7 +1853,9 @@ def _read_prev_reply(transcript_path, current_prompt):
     except OSError as e:
         return None, f"{type(e).__name__}"
     try:
-        lines = data.decode("utf-8", errors="replace").splitlines()
+        # JSONL lines end at LF (CRLF accepted). str.splitlines() would also cut at U+2028 / U+2029 /
+        # U+0085, which JSON keeps unescaped inside a string.
+        lines = [ln.decode("utf-8", errors="replace").rstrip("\r") for ln in data.split(b"\n")]
         if seeked and lines:
             lines = lines[1:]
         cur = (current_prompt or "").strip()

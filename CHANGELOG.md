@@ -7,6 +7,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.9.4] - Unreleased
 
 ### Fixed
+- **The previous reply is recovered from the transcript also when it contains a
+  raw U+2028, U+2029 or U+0085.** The transcript was split into lines with
+  `str.splitlines()`, which also cuts at these characters, so such a reply was
+  not found when the Stop hook had not saved it. Lines are now split at LF only
+  (CRLF accepted).
 - The specification adds rules that prevent faults found in sibling editions:
   - The full-text search text leaves out the role prefix and `[code omitted]`;
     existing rows are rebuilt once.
