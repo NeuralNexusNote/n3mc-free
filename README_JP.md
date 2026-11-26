@@ -173,7 +173,7 @@ AI が覚えていてくれるのは便利ですが、その記憶がどこに�
 - **入力の原文も、その隣に残る** — `~/.n3mc/.memory/audit.log` に、フックが受け取った原文（あなたの発言と Claude の返答。コードブロックも含む）が残ります。50 MB で入れ替わります。`n3mc --list` には出ません。DB と同じく、他人に見せない情報として扱ってください。
 - **検索は PC の中で動く** — 埋め込みモデルも検索も、手元で動きます。N3MC のサーバーは `127.0.0.1` だけで待ち受け、ほかのホスト名あての要求は断ります。同じネットワークのほかの機械からは使えません。
 - **利用状況を送らない** — N3MC は利用データをどこにも送りません。コードは公開されているので、ご自身で確かめられます。
-- **中身を見られる・消せる** — `n3mc --list` で保存された内容を表示できます。`~/.n3mc/` を消せば、すべて消えます([アンインストール](#アンインストール))。バックアップは 2 つのファイルをコピーするだけです([バックアップと復元](#バックアップと復元))。
+- **中身を見られる・消せる** — `n3mc --list` で保存された内容を表示できます。`~/.n3mc/` を消せば、すべて消えます([アンインストール](#アンインストール))。バックアップは、2 つのファイルを保存する 1 つのコマンドです([バックアップと復元](#バックアップと復元))。
 
 ネットワークを通るもの:
 
@@ -353,6 +353,20 @@ cat ~/.n3mc/.memory/audit.log | tail -3
 - `config.json` — `owner_id`・`local_id` のUUIDv4キー
 
 この 2 ファイルは、セットで保管してください。`config.json` には、DB の記録に付いている ID が入っています。
+
+**N3MC が動いている間に、`n3memory.db` をファイルとしてコピーしないでください。** DB は先行書き込みログ（WAL）を使うので、最新の記録がまだ `n3memory.db-wal` にしかないことがあります。`n3memory.db` だけの写しにはそれが入らず、写しはエラーなく開けるので、欠けに気づけません。SQLite のオンラインバックアップで取ってください。バックアップ用に作った空のフォルダで、次を実行します（Claude Code と記憶のサーバーは動いたままでかまいません。`N3MC_HOME` があれば、そのフォルダを読みます）:
+
+```bash
+python -c "import os,shutil,sqlite3; h=os.environ.get('N3MC_HOME') or os.path.expanduser('~/.n3mc'); s=sqlite3.connect(os.path.join(h,'.memory','n3memory.db')); d=sqlite3.connect('n3memory.db'); s.backup(d); d.close(); s.close(); shutil.copy2(os.path.join(h,'config.json'),'config.json')"
+```
+
+そのフォルダに、一貫した `n3memory.db` と、対応する `config.json` の写しができます。
+
+復元するとき:
+
+1. 記憶のサーバーを止め（コマンドラインに `n3memorycore.n3memory --run-server` を含むプロセスを終わらせる。PID は `.memory/n3mc.pid` にある）、Claude Code を閉じます。
+2. `~/.n3mc/.memory/` に `n3memory.db-wal` と `n3memory.db-shm` があれば消します（置き換える前の DB のものです）。
+3. バックアップの `n3memory.db` を `~/.n3mc/.memory/` に、`config.json` を `~/.n3mc/` に写します。
 
 ### アンインストール
 

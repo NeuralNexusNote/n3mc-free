@@ -20,6 +20,7 @@ if __name__ == "__main__":
         pass
 
 import argparse
+import contextlib
 import datetime as _datetime
 import hashlib
 import json
@@ -252,16 +253,56 @@ def _write_notices(d):
     _atomic_write_bytes(NOTICES_FILE, (json.dumps(d, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
+NOTICES_LOCK_WAIT = 2.0
+NOTICES_LOCK_STALE = 10.0
+
+
+@contextlib.contextmanager
+def _notices_lock():
+    """Serialise the read-modify-write of notices.json between processes and threads with a lock file
+    made by exclusive create; otherwise two hooks writing notices at the same time keep only one of
+    them. A lock older than NOTICES_LOCK_STALE seconds was left by a killed process and is removed;
+    after NOTICES_LOCK_WAIT seconds the write goes on without the lock rather than holding up a hook."""
+    lock = NOTICES_FILE + ".lock"
+    deadline = time.monotonic() + NOTICES_LOCK_WAIT
+    held = False
+    while True:
+        try:
+            os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            held = True
+            break
+        except OSError:
+            try:
+                if time.time() - os.path.getmtime(lock) > NOTICES_LOCK_STALE:
+                    os.remove(lock)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        if held:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+
 def _notify(key, message):
     """A notice a person has to act on: stderr, audit.log (once) and notices.json."""
     _err(f"N3MC notice: {message}")
     try:
-        d = _read_notices()
-        cur = d.get(key)
-        if isinstance(cur, dict) and cur.get("message") == message:
-            return
-        d[key] = {"message": message, "last_shown": None}
-        _write_notices(d)
+        with _notices_lock():
+            d = _read_notices()
+            cur = d.get(key)
+            if isinstance(cur, dict) and cur.get("message") == message:
+                return
+            d[key] = {"message": message, "last_shown": None}
+            _write_notices(d)
         _audit({"ts": _now_ts(), "hook": "notice", "key": key, "message": message})
     except Exception as e:  # noqa: BLE001
         _err(f"N3MC: notices.json could not be written ({type(e).__name__}: {e})")
@@ -269,10 +310,11 @@ def _notify(key, message):
 
 def _clear_notice(key):
     try:
-        d = _read_notices()
-        if key in d:
-            del d[key]
-            _write_notices(d)
+        with _notices_lock():
+            d = _read_notices()
+            if key in d:
+                del d[key]
+                _write_notices(d)
     except Exception as e:  # noqa: BLE001
         _err(f"N3MC: notices.json could not be written ({type(e).__name__}: {e})")
 
@@ -280,21 +322,22 @@ def _clear_notice(key):
 def _take_notices():
     """The notices to show now (each key at most once per 24 hours)."""
     try:
-        d = _read_notices()
-        now = time.time()
-        out, changed = [], False
-        for key, v in d.items():
-            if not isinstance(v, dict):
-                continue
-            last = v.get("last_shown")
-            if isinstance(last, bool) or not isinstance(last, (int, float)):
-                last = None
-            if last is None or now - last >= NOTICE_INTERVAL:
-                out.append(str(v.get("message", "")))
-                v["last_shown"] = now
-                changed = True
-        if changed:
-            _write_notices(d)
+        with _notices_lock():
+            d = _read_notices()
+            now = time.time()
+            out, changed = [], False
+            for key, v in d.items():
+                if not isinstance(v, dict):
+                    continue
+                last = v.get("last_shown")
+                if isinstance(last, bool) or not isinstance(last, (int, float)):
+                    last = None
+                if last is None or now - last >= NOTICE_INTERVAL:
+                    out.append(str(v.get("message", "")))
+                    v["last_shown"] = now
+                    changed = True
+            if changed:
+                _write_notices(d)
         return out
     except Exception as e:  # noqa: BLE001
         _err(f"N3MC: notices could not be read ({type(e).__name__}: {e})")
@@ -1138,9 +1181,10 @@ def _fts_rows(conn, rowid):
     return (a[0] if a else None), (b[0] if b else None)
 
 
-def run_repair(conn, cfg, max_records=None) -> int:
+def run_repair(conn, cfg, max_records=None, errors=None) -> int:
     """One-time FTS migrations and repair of records missing from memories_vec / memories_fts.
-    Returns the number of records actually changed."""
+    Returns the number of records actually changed. A batch whose write fails is rolled back and the
+    repair stops; the error is appended to `errors` (batches already committed stay)."""
     count = 0
     budget = max_records if max_records else None
 
@@ -1259,6 +1303,8 @@ def run_repair(conn, cfg, max_records=None) -> int:
         except Exception as e:  # noqa: BLE001
             conn.rollback()
             _err(f"N3MC: repair stopped ({type(e).__name__}: {e})")
+            if errors is not None:
+                errors.append(f"{type(e).__name__}: {e}")
             break
         count += changed
         if budget is not None:
@@ -1275,10 +1321,17 @@ def cmd_reembed() -> int:
     h = _health(port)
     if h and h.get("root") and _same_path(h["root"], HOME_DIR):
         try:
-            if _request_shutdown(port):
-                _wait_port_free(port)
-        except Exception as e:  # noqa: BLE001
-            _err(f"N3MC: the memory server could not be stopped ({type(e).__name__}: {e})")
+            stopped = bool(_request_shutdown(port)) and _wait_port_free(port)
+        except Exception:  # noqa: BLE001
+            stopped = False
+        if not stopped:
+            # refused, or still running after the wait; another call may have stopped it first
+            h = _health(port)
+            if h and h.get("root") and _same_path(h["root"], HOME_DIR):
+                _err("N3MC: --reembed: the memory server of this folder could not be stopped, so nothing was "
+                     "changed (it would go on saving with the old model). Stop it (see Uninstall in the "
+                     "README) and run --reembed again.")
+                return 1
     set_embed_model(model)
     conn = _connect_checked(None)
     try:
@@ -1539,10 +1592,13 @@ def api_search(req: SearchRequest):
 def api_repair(req: Optional[RepairRequest] = None):
     cfg = _server_cfg()
     conn = _open_db()
+    errors = []
     try:
-        n = run_repair(conn, cfg, max_records=(req.max_records if req else None))
+        n = run_repair(conn, cfg, max_records=(req.max_records if req else None), errors=errors)
     finally:
         conn.close()
+    if errors:
+        raise HTTPException(status_code=500, detail=f"repair stopped after {n} record(s): {errors[0]}")
     return {"status": "ok", "count": n}
 
 
@@ -1733,7 +1789,10 @@ def _user_prompt_text(text):
 
 def _turn_id_file(session_id):
     if session_id:
-        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(session_id))[:64]
+        sid = str(session_id)
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", sid)[:64]
+        if safe != sid:  # changed or cut: two ids could share the name, so add a hash of the whole id
+            safe += "-" + hashlib.sha256(sid.encode("utf-8", "surrogatepass")).hexdigest()[:16]
         return _mem(f"turn_id_{safe}.txt")
     return TURN_ID_FILE
 
@@ -2332,7 +2391,10 @@ def cmd_init() -> int:
         conn = _connect_checked(None)
         conn.close()
     except Exception as e:  # noqa: BLE001
-        _err(f"N3MC: the DB could not be created ({type(e).__name__}: {e})")
+        # hooks over a DB that cannot be opened would announce saving that cannot happen
+        _err(f"N3MC: the DB could not be created ({type(e).__name__}: {e}); the hooks were not registered. "
+             "Fix the cause, then run n3mc --init again.")
+        return 1
     register_hooks()
     print(f"N3MemoryCore data folder: {HOME_DIR} (server_port {cfg['server_port']})")
     print("Saving will start from the next session.")
@@ -2456,6 +2518,17 @@ def cmd_search(query, since=None, until=None) -> int:
     return 0
 
 
+def _http_error_detail(e) -> str:
+    """The `detail` of a FastAPI error answer, or the HTTP status."""
+    try:
+        d = json.loads(e.read().decode("utf-8", "replace")).get("detail")
+        if d:
+            return str(d)
+    except Exception:  # noqa: BLE001
+        pass
+    return f"HTTP {e.code}"
+
+
 def cmd_repair() -> int:
     cfg = _load_config()
     server_ok = ensure_server(cfg)
@@ -2467,6 +2540,9 @@ def cmd_repair() -> int:
         return 1
     try:
         r = _post("/repair", {}, timeout=None)
+    except urllib.error.HTTPError as e:
+        _err(f"N3MC: --repair failed ({_http_error_detail(e)})")
+        return 1
     except Exception as e:  # noqa: BLE001
         _err(f"N3MC: --repair failed ({type(e).__name__}: {e})")
         return 1

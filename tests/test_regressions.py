@@ -1448,7 +1448,24 @@ class TestInit:
         monkeypatch.setattr(n3memory, "_scripts_folders", lambda: [str(folder)])
         n3memory.register_hooks()
         cmd = self._cmds(settings, "UserPromptSubmit")[0]
-        assert cmd == (folder / "n3mc-hook.exe").as_posix() and not cmd.startswith('"')
+        # found in the scripts folder; quoted or not as shell_path decides for that path (the name of
+        # the temporary folder can hold shell characters)
+        assert cmd == n3memory.shell_path(folder / "n3mc-hook.exe")
+
+    @pytest.mark.parametrize("name,quoted", [("Scripts", False), ("#!sandbox.{x} y", True)])
+    def test_found_entry_point_quoted_by_its_path(self, settings, monkeypatch, tmp_path, name, quoted):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "n3mc-hook.exe").write_bytes(b"")
+        monkeypatch.setattr(n3memory, "_scripts_folders", lambda: [str(folder)])
+        cmd = n3memory.resolve_cmd("n3mc-hook")
+        assert cmd == n3memory.shell_path(folder / "n3mc-hook.exe")
+        if quoted:
+            assert cmd.startswith('"') and cmd.endswith('n3mc-hook.exe"')
+
+    def test_shell_path_plain_and_special_absolute_paths(self):
+        assert n3memory.shell_path("C:/Users/me/AppData/Python312/Scripts/n3mc-hook.exe") ==             "C:/Users/me/AppData/Python312/Scripts/n3mc-hook.exe"
+        assert n3memory.shell_path("C:/Temp/#!sandbox.{x}/n3mc-hook.exe") == '"C:/Temp/#!sandbox.{x}/n3mc-hook.exe"'
 
     @pytest.mark.parametrize("exe,quoted", [("C:/Python312/python.exe", False), ("C:/Program Files/Py/python.exe", True)])
     def test_dash_m_quoting(self, monkeypatch, exe, quoted):
@@ -1907,3 +1924,197 @@ class TestServerCheckAndArgs:
             ["--search", "--since", "2026-11-01"]
         with pytest.raises(SystemExit):
             n3memory.main(["--search", "--since", "2026-11-01"])
+
+
+# The backup command of the README and the specification ("Data Backup"); kept identical there.
+BACKUP_CMD = ("python -c \"import os,shutil,sqlite3; h=os.environ.get('N3MC_HOME') or os.path.expanduser('~/.n3mc'); "
+              "s=sqlite3.connect(os.path.join(h,'.memory','n3memory.db')); d=sqlite3.connect('n3memory.db'); "
+              "s.backup(d); d.close(); s.close(); shutil.copy2(os.path.join(h,'config.json'),'config.json')\"")
+
+
+class TestBackupInitRepairReembedNotices:
+    """Backup while the DB is open, --init without a DB, a failed /repair batch, --reembed with a server
+    that cannot be stopped, notices written at the same time, session ids that clean to one file name."""
+
+    def test_backup_command_is_the_one_in_the_documents(self):
+        for name in ("README.md", "README_JP.md", "N3MemoryCore_v1.9.4_Free_EN.md", "N3MemoryCore_v1.9.4_Free_JP.md"):
+            with open(os.path.join(REPO_ROOT, name), encoding="utf-8") as f:
+                assert BACKUP_CMD in f.read(), name
+
+    def test_backup_keeps_commits_still_in_the_wal(self, cfg, tmp_path):
+        c = get_connection(n3memory.DB_PATH)
+        init_db(c)
+        try:
+            for i in range(3):
+                add(c, f"[claude] row {i}", basis(i))
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            rid = add(c, "[claude] the newest zebra fact", basis(3))
+            new_id = c.execute("SELECT id FROM memories WHERE rowid = ?", (rid,)).fetchone()[0]
+            # the connection stays open: the 4th record is only in the WAL, so a plain copy misses it
+            naive = tmp_path / "naive.db"
+            shutil.copyfile(n3memory.DB_PATH, naive)
+            nc = sqlite3.connect(naive)
+            try:
+                assert nc.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 3
+            finally:
+                nc.close()
+            bk = tmp_path / "backup"
+            bk.mkdir()
+            code = BACKUP_CMD[len('python -c "'):-1]
+            subprocess.run([sys.executable, "-c", code], cwd=bk, check=True,
+                           env=dict(os.environ, N3MC_HOME=n3memory.HOME_DIR))
+        finally:
+            c.close()
+        b = get_connection(str(bk / "n3memory.db"))
+        try:
+            assert count_memories(b) == 4
+            row = b.execute("SELECT rowid, id, content FROM memories WHERE id = ?", (new_id,)).fetchone()
+            assert row[2] == "[claude] the newest zebra fact"
+            assert [r["rowid"] for r in search_fts(b, "zebra")] == [row[0]]
+            assert database.get_vector(b, row[0]) is not None
+        finally:
+            b.close()
+        with open(bk / "config.json", encoding="utf-8") as f:
+            saved = json.load(f)
+        assert saved["owner_id"] == cfg["owner_id"] and saved["local_id"] == cfg["local_id"]
+
+    def test_init_stops_when_the_db_cannot_be_opened(self, isolate, capsys):
+        settings = isolate["home"] / ".claude" / "settings.json"
+        os.makedirs(n3memory.DB_PATH)  # a folder where the DB file should be
+        assert n3memory.cmd_init() == 1
+        cap = capsys.readouterr()
+        assert "Saving will start" not in cap.out and "not registered" in cap.err
+        assert not settings.exists()
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text('{"model": "x"}', encoding="utf-8")
+        assert n3memory.cmd_init() == 1
+        assert settings.read_text(encoding="utf-8") == '{"model": "x"}'
+        os.rmdir(n3memory.DB_PATH)
+        capsys.readouterr()
+        assert n3memory.cmd_init() == 0
+        assert "Saving will start from the next session." in capsys.readouterr().out
+        assert "UserPromptSubmit" in json.loads(settings.read_text(encoding="utf-8"))["hooks"]
+
+    def test_repair_reports_a_failed_write(self, conn, cfg, monkeypatch):
+        add(conn, "[claude] no vector yet")
+        n3memory._SERVER_STATE["cfg"] = cfg
+        monkeypatch.setattr(n3memory, "embed_passage", lambda t, **k: [0.1] * 384)  # wrong dimension
+        with pytest.raises(n3memory.HTTPException) as e:
+            n3memory.api_repair()
+        assert e.value.status_code == 500 and "repair stopped after 0 record(s)" in str(e.value.detail)
+        assert len(find_unindexed_memories(conn, 10)) == 1
+        monkeypatch.setattr(n3memory, "embed_passage", lambda t, **k: basis(0))
+        assert n3memory.api_repair() == {"status": "ok", "count": 1}
+        assert n3memory.api_repair() == {"status": "ok", "count": 0}  # nothing left: a normal 0
+
+    def test_repair_command_exits_1_on_a_failed_repair(self, cfg, monkeypatch, capsys):
+        monkeypatch.setattr(n3memory, "ensure_server", lambda cfg=None: True)
+
+        def fail(path, body, **k):
+            raise urllib.error.HTTPError("http://127.0.0.1/repair", 500, "Internal Server Error", {},
+                                         io.BytesIO(b'{"detail": "repair stopped after 0 record(s): x"}'))
+        monkeypatch.setattr(n3memory, "_post", fail)
+        assert n3memory.cmd_repair() == 1
+        assert "repair stopped after 0 record(s)" in capsys.readouterr().err
+
+    def _reembed_setup(self, conn, monkeypatch, answers, shutdown):
+        rid = add(conn, "[claude] keep me", basis(0))
+        monkeypatch.setattr(n3memory, "_health", lambda port=None, timeout=5: answers.pop(0) if answers else None)
+        monkeypatch.setattr(n3memory, "_request_shutdown", shutdown)
+        monkeypatch.setattr(n3memory, "_wait_port_free", lambda port: False)
+        monkeypatch.setattr(n3memory, "embed_passage", lambda t, **k: basis(5))
+        return rid
+
+    def _own(self):
+        return {"status": "ok", "root": n3memory.HOME_DIR, "code_version": "x", "pid": 1}
+
+    def test_reembed_stops_when_the_own_server_cannot_be_stopped(self, conn, cfg, monkeypatch, capsys):
+        rid = self._reembed_setup(conn, monkeypatch, [self._own()] * 5, lambda port=None: False)
+        assert n3memory.cmd_reembed() == 1
+        assert "could not be stopped" in capsys.readouterr().err
+        assert database.get_vector(conn, rid)[0] == pytest.approx(1.0)
+        assert get_meta(conn, "reembed_model") is None and get_meta(conn, "reembed_cursor") is None
+
+    def test_reembed_stops_when_the_server_outlives_the_wait(self, conn, cfg, monkeypatch):
+        rid = self._reembed_setup(conn, monkeypatch, [self._own()] * 5, lambda port=None: True)
+        assert n3memory.cmd_reembed() == 1
+        assert database.get_vector(conn, rid)[0] == pytest.approx(1.0)
+
+    def test_reembed_goes_on_when_another_call_stopped_the_server(self, conn, cfg, monkeypatch):
+        def refused(port=None):
+            raise urllib.error.URLError("connection refused")
+        rid = self._reembed_setup(conn, monkeypatch, [self._own()], refused)
+        assert n3memory.cmd_reembed() == 0
+        assert database.get_vector(conn, rid)[5] == pytest.approx(1.0)
+
+    def test_reembed_leaves_another_folders_server_alone(self, conn, cfg, monkeypatch):
+        other = dict(self._own(), root=os.path.join(n3memory.HOME_DIR, "elsewhere"))
+        rid = self._reembed_setup(conn, monkeypatch, [other] * 5,
+                                  lambda port=None: pytest.fail("another folder's server was asked to stop"))
+        assert n3memory.cmd_reembed() == 0
+        assert database.get_vector(conn, rid)[5] == pytest.approx(1.0)
+
+    def _race(self, monkeypatch, *calls):
+        real = n3memory._read_notices
+        bar = threading.Barrier(len(calls), timeout=0.5)
+
+        def slow():
+            d = real()
+            try:
+                bar.wait()  # both read before either writes, unless the read-modify-write is locked
+            except threading.BrokenBarrierError:
+                pass
+            return d
+        monkeypatch.setattr(n3memory, "_read_notices", slow)
+        ts = [threading.Thread(target=f, args=a) for f, a in calls]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        monkeypatch.setattr(n3memory, "_read_notices", real)
+        return real()
+
+    def test_two_notices_at_once_are_both_kept(self, isolate, monkeypatch):
+        got = self._race(monkeypatch, (n3memory._notify, ("a", "first")), (n3memory._notify, ("b", "second")))
+        assert set(got) == {"a", "b"}
+
+    def test_clearing_one_notice_keeps_one_added_at_once(self, isolate, monkeypatch):
+        n3memory._notify("a", "first")
+        got = self._race(monkeypatch, (n3memory._clear_notice, ("a",)), (n3memory._notify, ("b", "second")))
+        assert set(got) == {"b"}
+
+    def test_showing_notices_keeps_one_added_at_once(self, isolate, monkeypatch):
+        n3memory._notify("a", "first")
+        got = self._race(monkeypatch, (n3memory._take_notices, ()), (n3memory._notify, ("b", "second")))
+        assert set(got) == {"a", "b"}
+
+    def test_session_ids_that_clean_to_one_name_get_their_own_files(self, isolate):
+        f = n3memory._turn_id_file
+        assert f("chat.alpha") != f("chat_alpha")
+        assert f("x" * 64 + "1") != f("x" * 64 + "2")
+        u = "0b7f2a3c-1d4e-4f5a-9b6c-7d8e9f0a1b2c"
+        assert os.path.basename(f(u)) == f"turn_id_{u}.txt"  # a plain session id keeps its plain name
+        assert f(None) == n3memory.TURN_ID_FILE and f("") == n3memory.TURN_ID_FILE
+
+    def test_reply_pairs_with_its_own_question_across_such_ids(self, cfg, monkeypatch):
+        monkeypatch.setattr(n3memory, "ensure_server", lambda cfg=None: False)
+        for sid, prompt in (("chat.alpha", "question A"), ("chat_alpha", "question B")):
+            monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": sid, "prompt": prompt})))
+            n3memory.cmd_hook_submit()
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "chat.alpha",
+                                                                   "last_assistant_message": "answer A"})))
+        n3memory.cmd_save_claude_turn()
+        c = get_connection(n3memory.DB_PATH)
+        try:
+            t = dict(c.execute("SELECT content, turn_id FROM memories").fetchall())
+        finally:
+            c.close()
+        assert t["[claude] answer A"] == t["[user] question A"] != t["[user] question B"]
+
+    def test_turn_files_with_the_long_name_are_cleaned_after_30_days(self, isolate):
+        p = n3memory._turn_id_file("chat.alpha")
+        n3memory._write_turn_id("chat.alpha", "t1")
+        old = time.time() - 31 * 86400
+        os.utime(p, (old, old))
+        n3memory._housekeeping()
+        assert not os.path.exists(p)
