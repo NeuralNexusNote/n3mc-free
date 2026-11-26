@@ -24,6 +24,7 @@ from .database import (
     fts_terms,
     bigram_terms,
     bigram_text,
+    fts_index_text,
 )
 
 DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-base"
@@ -313,8 +314,8 @@ _DEFAULTS = {
     "reply_sim_floor": 0.80, "reply_sim_span": 0.15,
     # Search improvements (CPU only, not in the specification). The specification's behaviour comes
     # back with n3memory.SPEC_SEARCH_SETTINGS (vector_min_cos 0.85, fts_stopwords false, 0 for the rest).
-    "fts_stopwords": True, "kw_only_min_terms": 3, "top_matches_max": 5, "cross_lang_min_cos": 0.80,
-    "semantic_rescue_min_cos": 0.80, "semantic_rescue_margin": 0.02,
+    "fts_stopwords": True, "kw_only_min_terms": 3, "top_matches_max": 5, "top_matches_session_max": 2,
+    "cross_lang_min_cos": 0.80, "semantic_rescue_min_cos": 0.80, "semantic_rescue_margin": 0.02,
 }
 
 def _cfg(cfg, key):
@@ -335,11 +336,19 @@ def _cos(a, b):
     return _dot(a, b) / (na * nb)
 
 
-def _matched_terms(content, terms):
-    """How many distinct question terms (trigram terms, bigram terms) occur in the record."""
+def _query_term_count(terms):
+    """How many distinct question terms there are (trigram and bigram terms, case ignored)."""
     tri, bi = terms
-    low = strip_fts_punctuation(content).lower()
-    toks = set(bigram_text(content).lower().split())
+    return len({t.lower() for t in tri} | {t.lower() for t in bi})
+
+
+def _matched_terms(content, terms):
+    """How many distinct question terms (trigram terms, bigram terms) occur in the record. The words
+    N3MC writes (the role prefix, `[code omitted]`) are left out, as in the FTS index."""
+    tri, bi = terms
+    text = fts_index_text(content)
+    low = strip_fts_punctuation(text).lower()
+    toks = set(bigram_text(text).lower().split())
     hit = {t.lower() for t in tri if t.lower() in low}
     hit |= {t.lower() for t in bi if t.lower() in toks}
     return len(hit)
@@ -493,18 +502,38 @@ def _collapse_identical_content(results):
     return out
 
 
-def _cap_per_turn(results, limit, cap=2):
-    counts, out = {}, []
-    for r in results:
+def _cap_per_turn(results, limit, cap=2, session_id=None, session_cap=0):
+    """At most `cap` rows per turn_id and `limit` rows in all, in the order given. With `session_id`
+    and `session_cap` (> 0), the rows of that session take at most `session_cap` places while rows of
+    other sessions can fill them; places still free afterwards go to the further rows of that session."""
+    counts, chosen, held = {}, set(), []
+    in_session = 0
+
+    def take(i, r):
         t = r.get("turn_id")
         if t is not None:
             if counts.get(t, 0) >= cap:
-                continue
+                return
             counts[t] = counts.get(t, 0) + 1
-        out.append(r)
-        if len(out) >= limit:
+        chosen.add(i)
+
+    for i, r in enumerate(results):
+        if len(chosen) >= limit:
             break
-    return out
+        t = r.get("turn_id")
+        if t is not None and counts.get(t, 0) >= cap:
+            continue
+        if session_id and session_cap > 0 and r.get("session_id") == session_id:
+            if in_session >= session_cap:
+                held.append((i, r))
+                continue
+            in_session += 1
+        take(i, r)
+    for i, r in held:
+        if len(chosen) >= limit:
+            break
+        take(i, r)
+    return [r for i, r in enumerate(results) if i in chosen]
 
 
 def _build_pairs(conn, results, cfg):
@@ -652,9 +681,12 @@ def hybrid_search(conn, query, cfg=None, session_id=None, since=None, until=None
             rescued = top_rid
     # kw_only_min_terms (not in the specification; 0 or 1 = off): a row found only by the keywords
     # goes to Top matches only when it holds that many distinct question terms; otherwise it can
-    # still be a weak match.
+    # still be a weak match. A question with fewer terms needs all of its terms ("Lincoln", "Lemon
+    # Squeezy"): otherwise no keyword row could ever reach Top matches.
     min_terms = int(_cfg(cfg, "kw_only_min_terms") or 0)
     q_terms = (fts_terms(query, stop), bigram_terms(query, stop)) if min_terms > 1 else None
+    if q_terms:
+        min_terms = min(min_terms, _query_term_count(q_terms))
 
     main, weak_pool = [], {}
     for rowid in rows_by_rowid:
@@ -697,7 +729,13 @@ def hybrid_search(conn, query, cfg=None, session_id=None, since=None, until=None
     main = _collapse_identical_content(main)  # 5
     # top_matches_max (not in the specification; 0 = none): a cap on Top matches only
     strong_cap = min(limit, int(_cfg(cfg, "top_matches_max") or 0) or limit)
-    main = _cap_per_turn(main, strong_cap)  # 6
+    # top_matches_session_max (not in the specification; 0 = none): the rows of the current session
+    # are already in Claude's context, so they take at most this many Top matches slots and the
+    # other sessions fill the rest; slots the other sessions leave free go back to the current
+    # session (its older part may have been compacted out of the context). A search without
+    # session_id has no current session.
+    session_cap = int(_cfg(cfg, "top_matches_session_max") or 0)
+    main = _cap_per_turn(main, strong_cap, session_id=session_id, session_cap=session_cap)  # 6
 
     target = min(int(_cfg(cfg, "min_results")), limit)  # 7
     weak_rows = []

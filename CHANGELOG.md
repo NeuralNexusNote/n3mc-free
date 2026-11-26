@@ -40,6 +40,51 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `C:/Users/O'Brien/...` gave a command that bash could not parse, and every
   hook failed. `shell_path` now quotes such a path and escapes `\`, `"`, `$`
   and `` ` ``; a plain path stays bare (specification `shell_path`).
+- **The backup procedure no longer misses the newest records.** The README and
+  the specification said to copy `n3memory.db`; while N3MC runs, the newest
+  records can still be only in `n3memory.db-wal`, so the copy missed them and
+  opened without an error. Backups are now made with SQLite's online backup
+  (one `python -c` command that also copies `config.json`), and restoring
+  deletes the old `-wal` / `-shm` files first.
+- **`--init` no longer registers the hooks when the DB cannot be opened.** It
+  printed the error, registered the hooks and said that saving would start;
+  it now leaves `settings.json` untouched and exits with status 1.
+- **A failed `/repair` write is reported.** A batch that could not be written
+  (for example a vector of the wrong dimension) was rolled back, but `/repair`
+  answered `{"status": "ok", "count": 0}` and `--repair` exited with 0. It now
+  answers HTTP 500 with the reason and `--repair` exits with 1; the hook still
+  goes on with the search and the save.
+- **`--reembed` stops when this folder's server cannot be stopped.** It went on
+  re-embedding while the old server could keep saving vectors of the old model;
+  it now changes nothing and exits with status 1 (a server another command had
+  already stopped is not a failure).
+- **Notices written at the same time are all kept.** Two hooks that wrote
+  notices together kept only one of them; reading and writing `notices.json`
+  now holds a lock file.
+- **Session ids that clean to the same file name get their own `turn_id` file.**
+  `chat.alpha` and `chat_alpha` (or two ids with the same first 64 characters)
+  shared one file, so a reply could be paired with the other session's
+  question; such ids now get a hash of the whole id in the name. A plain UUID
+  keeps its file name.
+- **A stale server another hook just stopped no longer gives a false
+  `stale_server` notice.** Right after `config.json` or the package changed, two
+  hooks could both find the old server; the second one's `/shutdown` was
+  refused because the server had already ended, so it reported a server it
+  could not stop and searched a server that was gone. `/health` is now asked
+  once more: no answer is "no server", a healthy answer is used (specification
+  "Server check and replacement").
+- **An exception in the server check no longer loses the prompt.** The hooks
+  now treat it as "no server" (one stderr line) and save directly; the PID-file
+  reservation treats any `OSError` (on Windows, a `PermissionError` for a file
+  being deleted) like an existing file.
+- **`--search` and `--buffer` take a value that starts with `-`.** `--search
+  "--force"` ended with `expected one argument`; such a value is now passed as
+  the option's value unless it is one of the options.
+- Search (code only, not in the spec): a question of 1 or 2 terms (`Lincoln`,
+  `Lemon Squeezy`) could never meet `kw_only_min_terms` 3, so a record that
+  holds those words was only a weak match; such a question now needs all of
+  its terms. The terms are counted without the role prefix and
+  `[code omitted]`, as in the full-text index.
 - The specification no longer says that chunks dropped by the per-`turn_id`
   cap of 2 always appear in `pairs`: they appear only when their exchange is
   selected for `pairs` and fits within `pair_max_chars`; otherwise the
@@ -60,6 +105,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - new: `semantic_rescue_min_cos` (0.80) and `semantic_rescue_margin` (0.02):
     the closest exchange is a Top match below `vector_min_cos` when it is at
     least 0.80 and ahead of every other exchange by 0.02
+  - new: `top_matches_session_max` (2): at most 2 Top matches from the current
+    session, whose records are already in Claude's context; the other slots go
+    to other sessions, and slots they leave free go back to the current session
+    (a search without a session is not capped)
 
   A `config.json` written before keeps its own `vector_min_cos`; missing keys
   are added with their defaults. `vector_min_cos` 0.85, `fts_stopwords` false

@@ -23,7 +23,7 @@
 - **使用許諾**: Apache License 2.0。詳細は LICENSE ファイルを参照してください。
 
 > **削除（アンインストール）**: N3MemoryCore を削除する場合は、フォルダを直接削除せず、Claude Code に「N3MemoryCore を削除してください」と依頼してください。フック設定の解除も含めて安全に処理されます。
-> **削除前のバックアップ**: 記憶を引き継ぐ場合は削除前に以下の2ファイルを保存してください。`n3memory.db`（記憶データ）と `config.json`（`owner_id`・`local_id` の UUIDv4 キーを含む）はセットで保管する必要があります。キーが一致しないと記憶の所有者検証や環境分類が正しく機能しません。
+> **削除前のバックアップ**: 記憶を引き継ぐ場合は削除前に以下の2ファイルを保存してください。`n3memory.db`（記憶データ）と `config.json`（`owner_id`・`local_id` の UUIDv4 キーを含む）はセットで保管する必要があります。キーが一致しないと記憶の所有者検証や環境分類が正しく機能しません。 DB はファイルをコピーせず、下の「データのバックアップ」のコマンドで保存してください。N3MC が動いている間は、最新の記録が `n3memory.db-wal` にしかないことがあります。
 
 > **実装上の疑問について**: 作者への問い合わせはできませんが、本指示書を Claude Code に読み込ませて質問することで、実装・カスタマイズの支援を受けることができます。
 > **カスタマイズについて**: カスタマイズする時は Claude Code に指示書の場所を教えて「指示書も直してください。」と言ってください。この指示書もそのようにして作成されました。
@@ -70,6 +70,20 @@ n3mc --init               # ~/.n3mc/ を作成し、Claude Code のフックを�
 ### データのバックアップ
 
 記憶データは `~/.n3mc/` 配下に集約されています。完全な保全には、`~/.n3mc/.memory/n3memory.db` に加えて `~/.n3mc/config.json`（`owner_id`・`local_id` の UUIDv4 キーを含む）も合わせてバックアップしてください。DB 単体でもデータ復旧は可能ですが、`config.json` がないと所有者検証や環境分類が正しく機能しません。データ位置は `N3MC_HOME=/path/to/dir` 環境変数で上書きできます。
+
+**N3MC が動いている間に、`n3memory.db` をファイルとしてコピーしないでください。** DB は先行書き込みログ（WAL）を使うので、最新の記録がまだ `n3memory.db-wal` にしかないことがあります。`n3memory.db` だけの写しにはそれが入らず、写しはエラーなく開けるので、欠けに気づけません。SQLite のオンラインバックアップで取ってください。バックアップ用に作った空のフォルダで、次を実行します（Claude Code と記憶のサーバーは動いたままでかまいません。`N3MC_HOME` があれば、そのフォルダを読みます）:
+
+```bash
+python -c "import os,shutil,sqlite3; h=os.environ.get('N3MC_HOME') or os.path.expanduser('~/.n3mc'); s=sqlite3.connect(os.path.join(h,'.memory','n3memory.db')); d=sqlite3.connect('n3memory.db'); s.backup(d); d.close(); s.close(); shutil.copy2(os.path.join(h,'config.json'),'config.json')"
+```
+
+そのフォルダに、一貫した `n3memory.db` と、対応する `config.json` の写しができます。
+
+復元するとき:
+
+1. 記憶のサーバーを止め（コマンドラインに `n3memorycore.n3memory --run-server` を含むプロセスを終わらせる。PID は `.memory/n3mc.pid` にある）、Claude Code を閉じます。
+2. `~/.n3mc/.memory/` に `n3memory.db-wal` と `n3memory.db-shm` があれば消します（置き換える前の DB のものです）。
+3. バックアップの `n3memory.db` を `~/.n3mc/.memory/` に、`config.json` を `~/.n3mc/` に写します。
 
 ### Pro 版へのアップグレード
 
@@ -423,7 +437,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 
 - **止め方（`_stop_stale_server`）**: まず `POST /shutdown`（本文 `{"root": "<自分の HOME_DIR>"}`）を頼む。v1.3.x のように `/shutdown` を持たないサーバーにだけ、psutil で確かめてからプロセスを終了する。**PID ファイルの番号では止めない**（別のプロセスに使い回されている可能性がある）。
 - **psutil での確かめ（`_is_own_server_process`）**: PID は `/health` の `pid`、それがなければポートで待ち受けているプロセス（`psutil.net_connections`）から得る。そのプロセスのコマンドラインに `n3memorycore.n3memory` と `--run-server` があり、環境変数 `N3MC_HOME` から解いたデータフォルダが自分の `HOME_DIR` と同じときだけ「自分のサーバー」とする。psutil が入っていない・権限がない・どれかが一致しない、のときは「確かめられない」。
-- 確かめられないときは止めず、「古いサーバーを止められない。同じ `server_port` を別の N3MC のフォルダが使っている可能性もある。各フォルダの `config.json` の `server_port` を確かめ、手で起動し直すこと」という知らせ（`stale_server`）を出す。自分の古いサーバー（`root` が同じ）を止められなかったときは、同じ DB を使っているので、そのまま使い続ける（`ensure_server` は True）。
+- 確かめられないときは止めず、「古いサーバーを止められない。同じ `server_port` を別の N3MC のフォルダが使っている可能性もある。各フォルダの `config.json` の `server_port` を確かめ、手で起動し直すこと」という知らせ（`stale_server`）を出す。自分の古いサーバー（`root` が同じ）を止められなかったときは、同じ DB を使っているので、そのまま使い続ける（`ensure_server` は True）。止められなかったと決める前に、`/health` をもう一度取る。こちらの `/shutdown` の直前に別のコマンドがサーバーを止めていれば（応答なし）、知らせを出さずに「応答なし」の扱いに進み、新しいサーバーがもう起動していれば（健全）、それを使う。
 - **PID ファイルの扱い**: `/health` が応答しないとき、PID ファイルの番号のプロセスが**このフォルダのサーバーだと確かめられたとき（起動中）だけ**、PID ファイルを残したまま `/health` を最大 60 秒（0.5 秒間隔）見て待つ。60 秒たってもまだ起動中なら（初回起動はモデルのダウンロードで 2〜10 分かかる）、**別のサーバーを起動せず、PID ファイルも消さない**。このコマンドはサーバーなしで進め（保存は `_buffer_direct` へ、検索は `_(memory search unavailable: the memory server is still starting)_` を出す）、次のコマンドでまた確かめる。この最大 60 秒の待ちはフックの中で起きるので、`--init` は 2 本のフックを `"timeout": 120` で登録する（§4「フックの制限時間」）。それ以外（番号のプロセスが死んでいる、別のプロセスに使い回されている）は、待たずに PID ファイルを消して起動する。
   - **サーバーが別のポートにいるとき**: 待つ前に、確かめたそのプロセスが、いまの `server_port` 以外のポートで待ち受けていないかを調べる（psutil で、その PID の `LISTEN` の接続）。サーバーが動いている間に利用者が `server_port` を変えると、こうなる。新しいポートの `/health` はずっと答えないので、この確認がないと、コマンドのたびに 60 秒待ち、サーバーはいつまでも起動しない。そうしたポートのうち `/health` がこのフォルダの `root` を返すものに `POST /shutdown`（本文 `{"root": "<自分の HOME_DIR>"}`）を送り、プロセスが終わるのを最大 15 秒待ち、PID ファイルがまだその PID を持っていれば消し、待たずにいまのポートでサーバーを起動する。`/health` が答えないポートや、別の `root` を返すポートには何もしない。PID ファイルの番号でプロセスを止めないことは変わらない。起動中のサーバーはまだどのポートでも待ち受けていないので、上の 60 秒の待ちはそのまま働く。
 - **psutil は必須**: 上の PID ファイルの確かめには psutil が要る。psutil がないと、起動中のサーバーを一度も確かめられず、モデルの読み込み中にコマンドのたびに PID ファイルを消して別のサーバーを起動してしまう（`open(..., 'x')` による防止はこの削除で効かなくなる）。それでも `import psutil` に失敗した場合（壊れたインストール）は、PID ファイルの更新時刻から 60 秒間は PID ファイルのプロセスをすべて「起動中」、それ以降は死んでいるものとして扱う。作られてから 60 秒未満の PID ファイルがある間は、2 つ目のサーバーを決して起動しない。
@@ -463,7 +477,7 @@ CLI は `/health` の応答を次のように判定する（`_health_decision(he
 2. `audit.log` に `{"ts", "hook": "notice", "key", "message"}` を記録する（同じ key・同じ文面は 1 回だけ）。
 3. `.memory/notices.json` に残し、検索結果の先頭（検索結果では `Search query:` の行の直後、それ以外の出力では見出し `# Recalled Memory Context` の直後）に **1 日 1 回**（前回出してから 24 時間たったら） `> ⚠️ N3MC notice: <message>` として出す（`_take_notices`）。
 4. 原因がなくなったら `_clear_notice(key)` で消す。
-5. `notices.json` は `config.json` と同じく（§3.5）アトミックに書く（同じフォルダの一時ファイル + `os.replace`）。
+5. `notices.json` は `config.json` と同じく（§3.5）アトミックに書く（同じフォルダの一時ファイル + `os.replace`）。読んで直して書く一連の処理（`_notify`、`_clear_notice`、`_take_notices`）は、ロックファイル `notices.json.lock` を持って行う。ロックは排他作成（`os.O_CREAT | os.O_EXCL`）で作り、20 ms ごとに最長 2 秒まで試し（取れなければ、フックを止めないようロックなしで書く）、終わったら消す。10 秒より古いロックは、止められたプロセスの残りなので消す。ロックがないと、2 つのフックが同時に知らせを書いたとき、片方だけが残り、もう片方は表示されない。
 
 テストでは `NOTICES_FILE` と `AUDIT_LOG` を必ず一時フォルダに向けること（本物の `~/.n3mc` に書かない）。
 - **応答目標**: 0.7s 前後（埋め込み生成 + DB検索の合計）。ハードウェア・OS・モデルキャッシュ状態に依存するため、達成目標として扱い厳密な要件とはしない。
@@ -946,6 +960,8 @@ db_path = base_dir + "\\data\\memory.db" # NG
 
 **フックからの呼び出しごとの上限**: `/repair` は省略可能な本文 `{"max_records": int}` を受け付ける。`--hook-submit` は `{"max_records": 200}`（1 バッチ）を送る。これにより、大量の未処理分（例: 別のフォルダのサーバーがポートを使っていた間に `_buffer_direct` で保存された多数の記録）は、1 つの質問を何分も止めるのではなく、1 ターンに 1 バッチずつ片付けられる。`n3mc --repair` は上限を送らず、すべてを処理する。一回限りのマイグレーション（FTS 句読点クリーニング、ベクトル再インデックス）も同じ上限に従い、マーカーはマイグレーションが終わったときにだけ書く。**上限の数え方**: `max_records` は 1 回の呼び出しで 1 つの枠で、FTS 句読点クリーニング、FTS の文の作り直し（§3「CJK バイグラムの索引」）、ベクトルの修復がこの順に分け合う。どの手順も、変えたかどうかにかかわらず、**読んだ**行の数だけ枠を使い、枠を使い切ったあとの手順は動かない。古い行のバイグラムの索引づけは上限を受けない（§3）。
 
+**書き込みに失敗したら修復を止めて伝える**: バッチの書き込みが失敗したら（例: 次元が `memories_vec` と違うベクトル）、そのバッチを巻き戻して止め、`/repair` は `detail` が `repair stopped after <n> record(s): <error>` の HTTP 500 で答える。コミット済みのバッチはそのまま残す。`--repair` はその `detail` を出して終了コード 1 で終わる。`--hook-submit` は、ほかの `/repair` の失敗と同じく stderr に 1 行出し、検索と保存に進む。`{"status": "ok", "count": 0}` と答えると、書けなかった修復が「残りがない」修復と見分けられない。
+
 ただし **FTS 句読点クリーニング**は、処理した行も結果から消えない（UPDATE するだけ）ため、`OFFSET 0` では終わらない。こちらは `WHERE rowid > <前のバッチの最後の rowid> ORDER BY rowid LIMIT 200` のキーセット方式で進める。**続きから始める**: 終えた最後の rowid を `meta` のキー `fts_punct_cursor` に、各回の書き直しと同じトランザクションで書く。次の呼び出しは rowid 0 からではなく、その次から始める（`max_records` 付きの呼び出しが続いても、プロセスを起動し直しても進む）。最後まで読み終えたら `fts_punct_cleaned` を書き、`fts_punct_cursor` を消す。（この位置がないと、上限付きの呼び出しが毎回 rowid 0 から始まり、201 行目に届かず、マーカーも書かれない。）**書き直す行**: 「句読点付きで登録されたもの」とは、`memories_fts` の行に、`_FTS_PUNCT_RE` に当たる文字が残っているものをいう。その行だけを `memories_fts` から消し、`strip_fts_punctuation(fts_index_text(content))` で入れ直し、書き直した行を `/repair` の `count` に数える。ほかの行は読むだけで（上限の件数は使う）、変えない。
 
 ### 索引の情報（`meta` 表）と `--reembed`
@@ -972,7 +988,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 - **`embed_model` がないとき**：`memories_vec` に行がなければ、設定の `embed_model`。そうでなければ、`.memory/vec_model.txt` があって空でなければその内容（v1.7.0 以前の印）。それもなければ、設定の `embed_model`。このファイルはこのためだけに読み、書き込みも削除もしない。
 - **モデルの食い違い**：`meta.embed_model` が設定の `embed_model` と違うとき、`/repair` は知らせ `embed_model_mismatch` を出す（§3「知らせ」）：`The stored vectors were made with <recorded>, but config.json sets embed_model to <configured>. Search quality is degraded until they are re-made: run n3mc --reembed (it re-embeds all <N> records with <configured>), or set embed_model back to <recorded>.` 一致すれば知らせを消す。
 - **`n3mc --reembed`** は、すべての記録を設定の `embed_model` で埋め込み直す。**CLI のプロセスの中で**行う（数分かかることがあり、HTTP の呼び出しでは時間切れになる）：
-  1. このフォルダーのサーバーを止める（古いサーバーと同じ `/shutdown` の要求、§3「サーバーの起動」）。次の CLI の呼び出しで、設定のモデルで起動し直される。ほかのフォルダーのサーバーには触れない。
+  1. このフォルダーのサーバーを止める（古いサーバーと同じ `/shutdown` の要求、§3「サーバーの起動」）。次の CLI の呼び出しで、設定のモデルで起動し直される。ほかのフォルダーのサーバーには触れない。そのあともこのフォルダーのサーバーが `/health` に答えるとき（要求を断られた、またはポートの空きを待ち終えても動いている）は、`N3MC: --reembed: the memory server of this folder could not be stopped, so nothing was changed ...` を出し、何も変えずに終了コード 1 で終わる。古いモデルのまま動くサーバーが、新しいベクトルの間に古いモデルのベクトルを保存するためである。`/health` が答えなくなっていれば（ほかのコマンドが先に止めた）、続ける。
   2. 設定のモデルを読み込み、試しの文を 1 つ埋め込む。その次元が `memories_vec` の次元（上のとおり表から読む）と違えば、`N3MC: --reembed: <model> makes <d>-dimensional vectors but memories_vec has <D>; a different dimension needs the manual procedure in §3 "Embeddings".` を出し、何も変えずに終了コード 1 で終わる。
   3. 再開の位置：`meta.reembed_model` が設定のモデルと同じなら、`meta.reembed_cursor`（`memories.rowid`）の次から始める。違えば最初から始め、`reembed_model` を書く。
   4. `rowid` の順に 200 行ずつ：その行を埋め込み（`"passage: " + content`、正規化）、1 つのトランザクションで、その行を `memories_vec` から消し、新しいベクトルを入れ、`reembed_cursor` を最後の rowid にする。1 回ごとに stderr に `Re-embedded <done> / <total>` を出す。
@@ -1055,6 +1071,8 @@ n3mc --init
 ```
 
 これにより `n3mc-hook` / `n3mc-stop-hook` の絶対パス(実行中の Python の scripts フォルダを先に探し、次に `shutil.which` で探す。下の「冪等フック登録アルゴリズム」の `resolve_cmd` 参照)で hook ブロックが `~/.claude/settings.json` に書き込まれ、§4 ② のパーミッションのルールが `permissions.allow` に足される。再実行は no-op（冪等 — **このパッケージの**エントリは重複追加せず置換する。ほかの N3MC の版のフックには触れない。下の「冪等フック登録アルゴリズム」参照）。
+
+その前に、`--init` はデータのフォルダ、`config.json`、DB を作る。DB を作れない・開けないとき（同じ名前のフォルダがある、書き込みの権限がない）は、理由を `the hooks were not registered` とともに出し、`settings.json` には触れず、保存開始の文を出さずに、終了コード 1 で終わる。開けない DB の上にフックを登録すると、できない保存を始めると告げることになる。原因を直して実行し直せば、ふだんどおり登録する。
 
 書き込まれる JSON はこんな形（パスはマシンによって異なる）:
 
@@ -1593,7 +1611,7 @@ N3MC は「完全保存」を謳う製品である。フックの書き込み経
   - 埋め込みサーバーへの HTTP POST 失敗時（サーバー停止・タイムアウト・非 2xx）: 書き込みは `_buffer_direct()` にフォールバックし、埋め込みベクトルなしで直接 SQLite に INSERT する。欠損した vec インデックスエントリは次回の `--repair` で修復される。**無言のドロップは禁止**：すべての失敗経路は `_buffer_direct` で成功するか、stderr へメッセージを出力する。Step 0 の監査ログと組み合わせて、ユーザー発言と、フックに届いた Claude の回答が失われないことを保証する。Claude の回答は Stop フックで、Stop が動かなかったときは次の質問でのトランスクリプトの読み取り（§4.5）でフックに届く。どちらのフックも動かない回答（例: Stop が飛ばされたまま Claude Code を閉じる前の最後の返答）は保存されない。
 - **【実装仕様】HTTP タイムアウト**: `_post()` はサーバーへの HTTP リクエストに 30 秒のタイムアウトを使用する。CPU での埋め込み推論が高負荷時に 4〜5 秒かかる場合に対応するため。
 - **【実装仕様】そのほかの待ち時間**: `/health` と `/shutdown` のリクエストは 5 秒でタイムアウトする。サーバーに停止を頼んだあとは、ポートが空くまで最大 15 秒、0.3 秒おきに確かめる。終わらせる必要のあるプロセスは `terminate()` し、5 秒待ってから `kill()` する。`/shutdown` は先に応答を返し、0.3 秒後にプロセスを終える。PID ファイルは、止めたプロセスの番号がまだ入っているときにだけ消す。uvicorn は `log_level='error'` で動かす。
-- **【実装仕様】`turn_id_<session>.txt` のファイル名**: `<session>` は、フックの `session_id` のうち `[a-zA-Z0-9_-]` 以外の文字をすべて `_` に替え、先頭 64 文字に切ったものである。この値はフックの JSON から来るので、そのままファイルシステムに渡してはならない（パスの区切りが入っていると `.memory/` の外に出る）。
+- **【実装仕様】`turn_id_<session>.txt` のファイル名**: `<session>` は、フックの `session_id` のうち `[a-zA-Z0-9_-]` 以外の文字をすべて `_` に替え、先頭 64 文字に切ったものである。この値はフックの JSON から来るので、そのままファイルシステムに渡してはならない（パスの区切りが入っていると `.memory/` の外に出る）。これで値が変わった、または切られたときは、`-` と、`session_id` 全体（UTF-8）の SHA-256 の 16 進の先頭 16 文字を後ろに足す。足さないと、同じ文字列になる 2 つの id（`chat.alpha` と `chat_alpha`、先頭 64 文字が同じ 2 つ）が 1 つのファイルを使い、返答がほかのセッションの質問と組まれる。その文字だけでできていて 64 文字以下の id（ふつうの UUID）は、これまでどおりの名前のままである。
 - **【実装仕様】audit.log の `raw`**: `{"ts", "hook", "raw", "payload"}` のうち、`raw` は stdin の**先頭 4,096 文字だけ**である。`payload` は、読み取った JSON の全体である（下の「audit.log の大きさと中身」が言う全文は、`payload` に入る）。stdin が JSON でないときは、`payload` を `{"raw": <stdin の全体>}` にする。`raw` にも全体を書くと、ログがほぼ 2 倍の速さで増える。記録は `json.dumps(record, ensure_ascii=True)` で書く（`ensure_ascii=False` だと、単独サロゲートを含む入力（JSON の `"\ud83d"` のようなエスケープから読み取られたものなど）で書き込みが `UnicodeEncodeError` になり、行が残らない）。
 - **【実装仕様】作られた直後の config.json の読み方**: 排他的な作成は、先にファイルを作り、少しあとで中身を書く。そのため、同時に始まった 2 つ目のフックが、空のファイルを読むことがある。`_read_config_file()` は、**ファイルの更新時刻が 2 秒以内のときに限り**、0.05 秒おきに最大 20 回読み直す。それより古いファイルが読めなければ、すぐに失敗にする（`config_unreadable`）。これがないと、最初のターンの 2 つ目のフックが `config_unreadable` を知らせ、そのターンを一時的な ID で保存する。
 - **【実装仕様】フックの入口の終了ステータス**: `n3mc_hook.py` は `--hook-submit` の終了ステータスで終わる。`n3mc_stop_hook.py` は `--save-claude-turn` の終了ステータスで終わる（`--stop` の結果は使わない）。

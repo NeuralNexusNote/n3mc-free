@@ -115,7 +115,7 @@ class TestRefresh:
         assert insert_memory_once(conn, "b", "[claude] same", ts_days_ago(0), "o", turn_id="t") is None
         assert count_memories(conn) == 1
 
-    def test_below_threshold_not_duplicate(self, conn):
+    def test_near_identical_not_duplicate(self, conn):
         # near-identical text is not a duplicate: only exactly the same text is skipped
         insert_memory_once(conn, "a", "The server port is 18520.", ts_days_ago(0), "o")
         assert not check_exact_duplicate(conn, "The server port is 18521.")

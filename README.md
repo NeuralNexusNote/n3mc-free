@@ -176,7 +176,7 @@ An AI that remembers you is convenient, but it is natural to ask where those mem
 - **The raw input is kept next to it** — `~/.n3mc/.memory/audit.log` holds the raw text of every hook call (your messages and Claude's replies, code blocks included). It is rotated at 50 MB, and `n3mc --list` does not show it. Treat it as private data, like the database.
 - **Search runs on your PC** — The embedding model and the search run locally. N3MC's server listens only on `127.0.0.1` and rejects requests for any other host name, so other machines on your network cannot reach it.
 - **No telemetry** — N3MC sends no usage data anywhere. The code is open, so you can check this yourself.
-- **You can see and remove everything** — `n3mc --list` shows what is stored. Deleting `~/.n3mc/` removes all of it (see [Uninstall](#uninstall)). Backing up is copying two files (see [Backup and restore](#backup-and-restore)).
+- **You can see and remove everything** — `n3mc --list` shows what is stored. Deleting `~/.n3mc/` removes all of it (see [Uninstall](#uninstall)). Backing up is one command that saves two files (see [Backup and restore](#backup-and-restore)).
 
 What does go over the network:
 
@@ -341,8 +341,9 @@ This code also turns on search settings that are **not in the specification**. T
 |---|---|---|
 | `vector_min_cos` | 0.82 (spec 0.85) | Lowest cosine for a vector match |
 | `fts_stopwords` | true | English function words (`the`, `is`, `of`, ...) are not keyword terms |
-| `kw_only_min_terms` | 3 | A record found only by the keywords needs this many question terms |
+| `kw_only_min_terms` | 3 | A record found only by the keywords needs this many question terms (all of them when the question has fewer) |
 | `top_matches_max` | 5 | At most this many Top matches |
+| `top_matches_session_max` | 2 | At most this many Top matches from the current session (already in Claude's context) while other sessions have matches; slots left free go back to the current session |
 | `cross_lang_min_cos` | 0.80 | The closest record in the other language can be a Top match |
 | `semantic_rescue_min_cos` / `semantic_rescue_margin` | 0.80 / 0.02 | The closest exchange can be a Top match when it is clearly ahead of the others |
 
@@ -356,6 +357,20 @@ from `~/.n3mc/`:
 - `config.json` — contains `owner_id` and `local_id` UUIDv4 keys
 
 Keep these 2 files together: `config.json` holds the IDs that are stamped on the records in the database.
+
+**Do not copy `n3memory.db` as a file while N3MC may be running.** The database uses a write-ahead log (WAL): the newest records can still be only in `n3memory.db-wal`, so a copy of `n3memory.db` alone misses them, and the copy opens without an error, so nothing shows that they are missing. Take the backup with SQLite's online backup instead. In an empty folder made for the backup, run (Claude Code and the memory server may keep running; with `N3MC_HOME` set, that folder is read):
+
+```bash
+python -c "import os,shutil,sqlite3; h=os.environ.get('N3MC_HOME') or os.path.expanduser('~/.n3mc'); s=sqlite3.connect(os.path.join(h,'.memory','n3memory.db')); d=sqlite3.connect('n3memory.db'); s.backup(d); d.close(); s.close(); shutil.copy2(os.path.join(h,'config.json'),'config.json')"
+```
+
+It writes a consistent `n3memory.db` and a copy of the matching `config.json` into that folder.
+
+To restore:
+
+1. Stop the memory server (end the process whose command line contains `n3memorycore.n3memory --run-server`; its PID is in `.memory/n3mc.pid`) and close Claude Code.
+2. Delete `n3memory.db-wal` and `n3memory.db-shm` in `~/.n3mc/.memory/` if they are there (they belong to the database being replaced).
+3. Copy the backed-up `n3memory.db` into `~/.n3mc/.memory/` and `config.json` into `~/.n3mc/`.
 
 ### Uninstall
 

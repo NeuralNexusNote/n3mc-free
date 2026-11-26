@@ -173,7 +173,7 @@ AI が覚えていてくれるのは便利ですが、その記憶がどこに�
 - **入力の原文も、その隣に残る** — `~/.n3mc/.memory/audit.log` に、フックが受け取った原文（あなたの発言と Claude の返答。コードブロックも含む）が残ります。50 MB で入れ替わります。`n3mc --list` には出ません。DB と同じく、他人に見せない情報として扱ってください。
 - **検索は PC の中で動く** — 埋め込みモデルも検索も、手元で動きます。N3MC のサーバーは `127.0.0.1` だけで待ち受け、ほかのホスト名あての要求は断ります。同じネットワークのほかの機械からは使えません。
 - **利用状況を送らない** — N3MC は利用データをどこにも送りません。コードは公開されているので、ご自身で確かめられます。
-- **中身を見られる・消せる** — `n3mc --list` で保存された内容を表示できます。`~/.n3mc/` を消せば、すべて消えます([アンインストール](#アンインストール))。バックアップは 2 つのファイルをコピーするだけです([バックアップと復元](#バックアップと復元))。
+- **中身を見られる・消せる** — `n3mc --list` で保存された内容を表示できます。`~/.n3mc/` を消せば、すべて消えます([アンインストール](#アンインストール))。バックアップは、2 つのファイルを保存する 1 つのコマンドです([バックアップと復元](#バックアップと復元))。
 
 ネットワークを通るもの:
 
@@ -338,8 +338,9 @@ cat ~/.n3mc/.memory/audit.log | tail -3
 |---|---|---|
 | `vector_min_cos` | 0.82(指示書は 0.85) | ベクトルで一致とみなす cos の下限 |
 | `fts_stopwords` | true | 英語の機能語(`the`、`is`、`of` など)をキーワード検索の語にしない |
-| `kw_only_min_terms` | 3 | キーワードだけで見つかった記録は、質問の語をこの数だけ含むときに採る |
+| `kw_only_min_terms` | 3 | キーワードだけで見つかった記録は、質問の語をこの数だけ含むときに採る(質問の語がそれより少ないときは、そのすべて) |
 | `top_matches_max` | 5 | Top matches の件数の上限 |
+| `top_matches_session_max` | 2 | Top matches のうち、今のセッション(すでに Claude の文脈にある)の記録の上限。残りはほかのセッションの記録で、足りずに空いた枠は今のセッションの記録で埋める |
 | `cross_lang_min_cos` | 0.80 | 質問と違う言語の記録のうち、最も近いものを Top matches に入れられる |
 | `semantic_rescue_min_cos` / `semantic_rescue_margin` | 0.80 / 0.02 | 最も近い往復が、ほかよりはっきり近いときは Top matches に入れる |
 
@@ -352,6 +353,20 @@ cat ~/.n3mc/.memory/audit.log | tail -3
 - `config.json` — `owner_id`・`local_id` のUUIDv4キー
 
 この 2 ファイルは、セットで保管してください。`config.json` には、DB の記録に付いている ID が入っています。
+
+**N3MC が動いている間に、`n3memory.db` をファイルとしてコピーしないでください。** DB は先行書き込みログ（WAL）を使うので、最新の記録がまだ `n3memory.db-wal` にしかないことがあります。`n3memory.db` だけの写しにはそれが入らず、写しはエラーなく開けるので、欠けに気づけません。SQLite のオンラインバックアップで取ってください。バックアップ用に作った空のフォルダで、次を実行します（Claude Code と記憶のサーバーは動いたままでかまいません。`N3MC_HOME` があれば、そのフォルダを読みます）:
+
+```bash
+python -c "import os,shutil,sqlite3; h=os.environ.get('N3MC_HOME') or os.path.expanduser('~/.n3mc'); s=sqlite3.connect(os.path.join(h,'.memory','n3memory.db')); d=sqlite3.connect('n3memory.db'); s.backup(d); d.close(); s.close(); shutil.copy2(os.path.join(h,'config.json'),'config.json')"
+```
+
+そのフォルダに、一貫した `n3memory.db` と、対応する `config.json` の写しができます。
+
+復元するとき:
+
+1. 記憶のサーバーを止め（コマンドラインに `n3memorycore.n3memory --run-server` を含むプロセスを終わらせる。PID は `.memory/n3mc.pid` にある）、Claude Code を閉じます。
+2. `~/.n3mc/.memory/` に `n3memory.db-wal` と `n3memory.db-shm` があれば消します（置き換える前の DB のものです）。
+3. バックアップの `n3memory.db` を `~/.n3mc/.memory/` に、`config.json` を `~/.n3mc/` に写します。
 
 ### アンインストール
 
