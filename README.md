@@ -341,8 +341,9 @@ This code also turns on search settings that are **not in the specification**. T
 |---|---|---|
 | `vector_min_cos` | 0.82 (spec 0.85) | Lowest cosine for a vector match |
 | `fts_stopwords` | true | English function words (`the`, `is`, `of`, ...) are not keyword terms |
-| `kw_only_min_terms` | 3 | A record found only by the keywords needs this many question terms |
+| `kw_only_min_terms` | 3 | A record found only by the keywords needs this many question terms (all of them when the question has fewer) |
 | `top_matches_max` | 5 | At most this many Top matches |
+| `top_matches_session_max` | 2 | At most this many Top matches from the current session (already in Claude's context) while other sessions have matches; slots left free go back to the current session |
 | `cross_lang_min_cos` | 0.80 | The closest record in the other language can be a Top match |
 | `semantic_rescue_min_cos` / `semantic_rescue_margin` | 0.80 / 0.02 | The closest exchange can be a Top match when it is clearly ahead of the others |
 

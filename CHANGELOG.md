@@ -40,6 +40,25 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `C:/Users/O'Brien/...` gave a command that bash could not parse, and every
   hook failed. `shell_path` now quotes such a path and escapes `\`, `"`, `$`
   and `` ` ``; a plain path stays bare (specification `shell_path`).
+- **A stale server another hook just stopped no longer gives a false
+  `stale_server` notice.** Right after `config.json` or the package changed, two
+  hooks could both find the old server; the second one's `/shutdown` was
+  refused because the server had already ended, so it reported a server it
+  could not stop and searched a server that was gone. `/health` is now asked
+  once more: no answer is "no server", a healthy answer is used (specification
+  "Server check and replacement").
+- **An exception in the server check no longer loses the prompt.** The hooks
+  now treat it as "no server" (one stderr line) and save directly; the PID-file
+  reservation treats any `OSError` (on Windows, a `PermissionError` for a file
+  being deleted) like an existing file.
+- **`--search` and `--buffer` take a value that starts with `-`.** `--search
+  "--force"` ended with `expected one argument`; such a value is now passed as
+  the option's value unless it is one of the options.
+- Search (code only, not in the spec): a question of 1 or 2 terms (`Lincoln`,
+  `Lemon Squeezy`) could never meet `kw_only_min_terms` 3, so a record that
+  holds those words was only a weak match; such a question now needs all of
+  its terms. The terms are counted without the role prefix and
+  `[code omitted]`, as in the full-text index.
 - The specification no longer says that chunks dropped by the per-`turn_id`
   cap of 2 always appear in `pairs`: they appear only when their exchange is
   selected for `pairs` and fits within `pair_max_chars`; otherwise the
@@ -60,6 +79,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - new: `semantic_rescue_min_cos` (0.80) and `semantic_rescue_margin` (0.02):
     the closest exchange is a Top match below `vector_min_cos` when it is at
     least 0.80 and ahead of every other exchange by 0.02
+  - new: `top_matches_session_max` (2): at most 2 Top matches from the current
+    session, whose records are already in Claude's context; the other slots go
+    to other sessions, and slots they leave free go back to the current session
+    (a search without a session is not capped)
 
   A `config.json` written before keeps its own `vector_min_cos`; missing keys
   are added with their defaults. `vector_min_cos` 0.85, `fts_stopwords` false

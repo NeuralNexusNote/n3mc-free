@@ -338,8 +338,9 @@ cat ~/.n3mc/.memory/audit.log | tail -3
 |---|---|---|
 | `vector_min_cos` | 0.82(指示書は 0.85) | ベクトルで一致とみなす cos の下限 |
 | `fts_stopwords` | true | 英語の機能語(`the`、`is`、`of` など)をキーワード検索の語にしない |
-| `kw_only_min_terms` | 3 | キーワードだけで見つかった記録は、質問の語をこの数だけ含むときに採る |
+| `kw_only_min_terms` | 3 | キーワードだけで見つかった記録は、質問の語をこの数だけ含むときに採る(質問の語がそれより少ないときは、そのすべて) |
 | `top_matches_max` | 5 | Top matches の件数の上限 |
+| `top_matches_session_max` | 2 | Top matches のうち、今のセッション(すでに Claude の文脈にある)の記録の上限。残りはほかのセッションの記録で、足りずに空いた枠は今のセッションの記録で埋める |
 | `cross_lang_min_cos` | 0.80 | 質問と違う言語の記録のうち、最も近いものを Top matches に入れられる |
 | `semantic_rescue_min_cos` / `semantic_rescue_margin` | 0.80 / 0.02 | 最も近い往復が、ほかよりはっきり近いときは Top matches に入れる |
 

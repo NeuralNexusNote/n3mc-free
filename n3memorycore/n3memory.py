@@ -107,6 +107,7 @@ DEFAULT_CONFIG = {
     "fts_stopwords": True,
     "kw_only_min_terms": 3,
     "top_matches_max": 5,
+    "top_matches_session_max": 2,
     "cross_lang_min_cos": 0.80,
     "semantic_rescue_min_cos": 0.80,
     "semantic_rescue_margin": 0.02,
@@ -115,7 +116,8 @@ DEFAULT_CONFIG = {
 # The specification's values for the search settings above that differ from it. Writing these into
 # config.json gives the search of the specification.
 SPEC_SEARCH_SETTINGS = {"vector_min_cos": 0.85, "fts_stopwords": False, "kw_only_min_terms": 0,
-                        "top_matches_max": 0, "cross_lang_min_cos": 0, "semantic_rescue_min_cos": 0}
+                        "top_matches_max": 0, "top_matches_session_max": 0, "cross_lang_min_cos": 0,
+                        "semantic_rescue_min_cos": 0}
 
 # key -> (kind, low, low_inclusive, high)   kind: "int" (JSON integer only) or "num" (int or float)
 _CONFIG_RANGES = {
@@ -137,6 +139,7 @@ _CONFIG_RANGES = {
     "reply_sim_span": ("num", 0, False, None),
     "kw_only_min_terms": ("int", 0, True, None),
     "top_matches_max": ("int", 0, True, None),
+    "top_matches_session_max": ("int", 0, True, None),
     "cross_lang_min_cos": ("num", 0, True, 1),
     "semantic_rescue_min_cos": ("num", 0, True, 1),
     "semantic_rescue_margin": ("num", 0, True, 1),
@@ -851,7 +854,9 @@ def _reserve_pid_file() -> bool:
         fd = os.open(PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.close(fd)
         return True
-    except FileExistsError:
+    except OSError:
+        # FileExistsError, or on Windows a PermissionError for a PID file that is being deleted:
+        # another process starts or stops the server, follow "PID file handling"
         return False
 
 
@@ -959,6 +964,21 @@ def ensure_server(cfg=None) -> bool:
     if d == "stale":
         if _stop_stale_server(h, port):
             return _start_server(cfg)
+        # Another command may have stopped the server first (its /shutdown came before ours): that is
+        # no server, not a server that cannot be stopped.
+        h = _health(port)
+        d = _health_decision(h)
+        if d == "none":
+            return _no_health_path(cfg)
+        if d == "ok":
+            _server_responded()
+            return True
+        if d == "foreign":
+            _set_foreign(h["root"], port)
+            return False
+        if d == "legacy":
+            _set_foreign(LEGACY_ROOT, port)
+            return False
         _notify("stale_server", "An old N3MC memory server could not be stopped. Another N3MC folder may use "
                                 f"the same server_port ({port}). Check server_port in the config.json of each "
                                 "folder and restart the server by hand.")
@@ -1503,6 +1523,10 @@ def api_search(req: SearchRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     query = sanitize_surrogates(req.query or "")[: int(cfg["search_query_max_chars"])]
+    if not req.session_id:
+        # a search without a session (manual --search): no row is in the caller's context, so the
+        # cap on current-session rows (not in the specification) does not apply
+        cfg = dict(cfg, top_matches_session_max=0)
     conn = _open_db()
     try:
         return hybrid_search(conn, query, cfg, session_id=req.session_id or _SERVER_STATE["session_id"],
@@ -1841,6 +1865,18 @@ def _read_stdin_json():
     return raw, sanitize_surrogates(payload)
 
 
+def _ensure_server_or_none(cfg) -> bool:
+    """ensure_server for the hooks: an unexpected exception means no server (direct save), never a
+    lost message."""
+    global _NO_SERVER_REASON
+    try:
+        return ensure_server(cfg)
+    except Exception as e:  # noqa: BLE001
+        _err(f"N3MC: the memory server check failed ({type(e).__name__}: {e}); saving without the server")
+        _NO_SERVER_REASON = f"the memory server check failed ({type(e).__name__})"
+        return False
+
+
 def cmd_hook_submit() -> int:
     """UserPromptSubmit: repair -> save the previous reply -> search -> save the user message."""
     _, payload = _read_stdin_json()
@@ -1856,7 +1892,7 @@ def cmd_hook_submit() -> int:
         return 0
     prev_turn = _read_turn_id(session_id)
     cfg = _load_config()
-    server_ok = ensure_server(cfg)
+    server_ok = _ensure_server_or_none(cfg)
     if server_ok and _FOREIGN_SERVER_ROOT is None:
         try:
             r = _post("/repair", {"max_records": HOOK_REPAIR_MAX})
@@ -1908,7 +1944,7 @@ def cmd_save_claude_turn() -> int:
         return 0
     turn_id = turn_id or str(uuid.uuid4())
     cfg = _load_config()
-    server_ok = ensure_server(cfg)
+    server_ok = _ensure_server_or_none(cfg)
     results = _save_chunks(text, "claude", cfg, server_ok, session_id, turn_id)
     return 1 if "error" in results else 0
 
@@ -2467,6 +2503,27 @@ def _build_parser():
     return p
 
 
+_VALUE_OPTIONS = ("--search", "--buffer")
+
+
+def _normalize_value_args(argv):
+    """`--search -x` -> `--search=-x`: argparse would take a value that starts with '-' and has no
+    space for an option. A value that is one of our own options is left alone (a missing value)."""
+    known = {s for a in _build_parser()._actions for s in a.option_strings}
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _VALUE_OPTIONS and i + 1 < len(argv):
+            v = argv[i + 1]
+            if v.startswith("-") and v != "-" and v.split("=", 1)[0] not in known:
+                out.append(f"{a}={v}")
+                i += 2
+                continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def main(argv=None) -> int:
     for _stream_name in ("stdin", "stdout", "stderr"):
         _s = getattr(sys, _stream_name, None)
@@ -2475,7 +2532,7 @@ def main(argv=None) -> int:
                 _s.reconfigure(encoding='utf-8')
             except Exception:
                 pass
-    args = _build_parser().parse_args(argv)
+    args = _build_parser().parse_args(_normalize_value_args(sys.argv[1:] if argv is None else list(argv)))
     if args.run_server:
         return run_server()
     if args.hook_submit:
